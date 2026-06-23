@@ -14,6 +14,7 @@ export async function getLatestNode(): Promise<NodeVersion> {
   try {
     const res = await fetch('https://nodejs.org/dist/index.json', {
       next: { revalidate: 86400 },
+      signal: AbortSignal.timeout(4000),
     });
     if (!res.ok) return FALLBACK;
     const all = (await res.json()) as { version: string }[];

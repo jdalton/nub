@@ -7,6 +7,7 @@ import {
 import { z } from 'zod';
 import { rehypeCodeDefaultOptions } from 'fumadocs-core/mdx-plugins';
 import { transformerConsole } from './src/lib/shiki-console';
+import { remarkNodeVersion } from './src/lib/remark-node-version';
 
 export const docs = defineDocs({
   dir: 'content/docs',
@@ -42,6 +43,10 @@ export const blog = defineCollections({
 
 export default defineConfig({
   mdxOptions: {
+    // Substitute the live latest-Node version into `{{NODE_VERSION}}` /
+    // `{{NODE_MAJOR}}` tokens in code samples on each rebuild. Callback form so
+    // fumadocs' default remark plugins are preserved, not replaced.
+    remarkPlugins: (v) => [...v, remarkNodeVersion],
     // Warm `vesper` theme (matches the homepage `<Source>` cards), plus a
     // transformer that gives ```console fences a terminal look — ember `$`
     // prompt, bright commands, dimmed output. See `src/lib/shiki-console.ts`.

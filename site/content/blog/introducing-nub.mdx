@@ -15,7 +15,7 @@ $ nub watch src/server.ts  # restart on file changes
 $ nubx prisma generate     # run a CLI from node_modules/.bin
 $ nub install              # install dependencies, pnpm-compatible
 $ nub pm shim              # Corepack-style package-manager shims
-$ nub node install 26      # manage Node.js versions
+$ nub node install {{NODE_MAJOR}}      # manage Node.js versions
 ```
 
 ## Why?
@@ -41,7 +41,7 @@ $ nub run build            # script runner — 24× faster than pnpm run
 $ nubx prisma generate     # bin runner — 19× faster than npx
 $ nub watch src/server.ts  # watcher — driven by the dependency graph
 $ nub install              # package manager — pnpm-compatible, your lockfile
-$ nub node install 26      # version manager — installs Node on demand
+$ nub node install {{NODE_MAJOR}}      # version manager — installs Node on demand
 ```
 
 ## `nub <file>`: a TypeScript-first Node.js
@@ -182,9 +182,9 @@ $ nub server.ts
 Nub resolves the right Node for every project implicitly — from `.node-version`, `.nvmrc`, or `package.json#engines` — every time it runs a file. If that version isn't installed, it's downloaded from nodejs.org (checksum-verified, cached under `~/.cache/nub`) and your code runs on it. No pin? The `node` on your `PATH` is used, however you manage it. It's the [uv](https://docs.astral.sh/uv/) experience, for Node.
 
 ```console
-$ echo 26 > .node-version
+$ echo {{NODE_MAJOR}} > .node-version
 $ nub hello.ts
-Using Node.js 26.3.0 (resolved from .node-version)
+Using Node.js {{NODE_VERSION}} (resolved from .node-version)
 Installing from nodejs.org... (29 MB)
 Installed in 9.8s
 Hello world!
@@ -193,9 +193,9 @@ Hello world!
 The explicit commands exist too — no shell hooks, no `PATH` munging:
 
 ```bash
-nub node install 26     # install a version
+nub node install {{NODE_MAJOR}}     # install a version
 nub node ls             # what's installed
-nub node pin 26         # write .node-version
+nub node pin {{NODE_MAJOR}}         # write .node-version
 nub node uninstall 22   # remove a version
 ```
 

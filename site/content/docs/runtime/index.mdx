@@ -98,9 +98,9 @@ Like Corepack's shims, `nub` itself auto-installs Node versions as needed. When 
 This resolved Node version is auto-installed and cached for future runs.
 
 ```sh
-$ echo 22 > .node-version
+$ echo {{NODE_MAJOR}} > .node-version
 $ nub hello.ts
-Using Node.js 22.15.0 (resolved from .node-version)
+Using Node.js {{NODE_VERSION}} (resolved from .node-version)
 Installed in 9.8s
 Hello world!
 ```

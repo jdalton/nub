@@ -76,7 +76,7 @@ Front a specific version on PATH for this run instead of the project pin. The ac
 ```yaml
 - uses: nubjs/setup-nub@v0
   with:
-    node-version: 22.15.0
+    node-version: {{NODE_VERSION}}
 ```
 
 Nub still runs the project's declared pin when invoked as `nub`, so the action warns if this input differs from that pin. Omit it to let Nub resolve and provision the project pin automatically.

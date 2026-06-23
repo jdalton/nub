@@ -10,9 +10,9 @@ Nub runs your code on stock Node and provisions the right version for you. Pin a
 Drop a `.node-version` or `.nvmrc` in your project (or an `engines.node` range in `package.json`) and run `nub`. If that Node is already on your machine it's used as-is; if not, Nub downloads the matching stock build from nodejs.org — SHA-256 verified and cached under `~/.cache/nub/node` — then runs your code. Nub provisions the pinned version itself rather than handing off to `nvm`, `fnm`, or `mise`; with nothing pinned anywhere up the tree, it uses whatever `node` is already on your `PATH`.
 
 ```console
-$ echo 22.15.0 > .node-version
+$ echo {{NODE_VERSION}} > .node-version
 $ nub index.ts
-Using Node.js 22.15.0 (resolved from .node-version)
+Using Node.js {{NODE_VERSION}} (resolved from .node-version)
 Installing from nodejs.org... (24 MB)
 Installed in 8.0s
 # ...your script runs, on exactly the Node you pinned
@@ -38,9 +38,9 @@ Like Corepack's shims, `nub` itself auto-installs Node versions as needed. When 
 This resolved Node version is auto-installed and cached for future runs.
 
 ```sh
-$ echo 22 > .node-version
+$ echo {{NODE_MAJOR}} > .node-version
 $ nub hello.ts
-Using Node.js 22.15.0 (resolved from .node-version)
+Using Node.js {{NODE_VERSION}} (resolved from .node-version)
 Installed in 9.8s
 Hello world!
 ```
@@ -61,13 +61,13 @@ Once a version is pinned, Nub finds a binary for it in order:
 Provision a version into the cache *now*, instead of on the next `nub <file>`. The use cases are warming a CI cache in a setup step (the [GitHub Action](/docs/setup-nub) does this for you), or fetching a Node before you go offline.
 
 ```bash
-nub node install 22          # newest 22.x
+nub node install {{NODE_MAJOR}}          # newest {{NODE_MAJOR}}.x
 nub node install lts         # newest LTS line
 nub node install 20.11.0     # an exact version
 nub node install 20 22       # several at once
 ```
 
-Aliases and ranges resolve the same way pins do — `lts`, `latest`, `lts/<codename>`, a bare major (`22`) or `major.minor` (`22.13`), or an exact version. With no argument, `nub node install` reads your project's pin and provisions that:
+Aliases and ranges resolve the same way pins do — `lts`, `latest`, `lts/<codename>`, a bare major (`{{NODE_MAJOR}}`) or `major.minor` (`22.13`), or an exact version. With no argument, `nub node install` reads your project's pin and provisions that:
 
 ```bash
 nub node install             # installs whatever .node-version / .nvmrc / engines.node names
@@ -76,8 +76,8 @@ nub node install             # installs whatever .node-version / .nvmrc / engine
 A version already in the cache is a no-op; a version already available on your `PATH` (a system install, `nvm`, `fnm`, …) is reported and **skipped** rather than re-downloaded.
 
 ```console
-$ nub node install 22.15.0
-Node 22.15.0 is already available on PATH — skipped
+$ nub node install {{NODE_VERSION}}
+Node {{NODE_VERSION}} is already available on PATH — skipped
 ```
 
 ## `nub node ls`
@@ -86,7 +86,7 @@ List the versions in Nub's cache, newest first. The version your current directo
 
 ```console
 $ nub node ls
-→ 22.15.0
+→ {{NODE_VERSION}}
   22.13.0
   20.11.0
 ```
@@ -109,8 +109,8 @@ Like `ls`, this operates on Nub's cache only.
 Write a `.node-version` for the project so every later `nub` in that tree uses it. This is the explicit form of creating the pin file by hand.
 
 ```console
-$ nub node pin 22
-pinned Node 22 → /path/to/project/.node-version
+$ nub node pin {{NODE_MAJOR}}
+pinned Node {{NODE_MAJOR}} → /path/to/project/.node-version
 ```
 
 A few deliberate behaviors:
@@ -127,17 +127,17 @@ Resolve which Node runs here and where it lives. The binary path goes to stdout;
 
 ```console
 $ nub node which
-/Users/you/.nvm/versions/node/v22.15.0/bin/node
-» resolved from .node-version (22.15.0)
+/Users/you/.nvm/versions/node/v{{NODE_VERSION}}/bin/node
+» resolved from .node-version ({{NODE_VERSION}})
 ```
 
 The stdout/stderr split means `nub node which` composes in a shell — capture the path and the explainer stays out of the variable:
 
 ```console
 $ NODE=$(nub node which)
-» resolved from .node-version (22.15.0)
+» resolved from .node-version ({{NODE_VERSION}})
 $ echo "$NODE"
-/Users/you/.nvm/versions/node/v22.15.0/bin/node
+/Users/you/.nvm/versions/node/v{{NODE_VERSION}}/bin/node
 ```
 
 With no pin the explainer reads `» resolved from node on PATH`. Bare `nub node` prints a status block instead — the version, path, and resolution source on separate lines.
