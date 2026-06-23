@@ -32,10 +32,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
         println!("cargo:rerun-if-changed={}", git_dir.join("index").display());
         // Packed/loose ref updates (e.g. a branch move) also shift the short SHA.
-        println!(
-            "cargo:rerun-if-changed={}",
-            git_dir.join("refs").display()
-        );
+        println!("cargo:rerun-if-changed={}", git_dir.join("refs").display());
         println!(
             "cargo:rerun-if-changed={}",
             git_dir.join("packed-refs").display()
