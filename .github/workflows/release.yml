@@ -280,7 +280,8 @@ jobs:
       # so the test job exercises the real loaders. (linux-x64-glibc runner = native.)
       - name: Build nub-native addon (for data-format loader tests)
         run: |
-          cargo build --release -p nub-native
+          # nub-native is its own workspace (panic=unwind cdylib); build from inside the crate.
+          (cd crates/nub-native && cargo build --release)
           mkdir -p runtime/addons
           cp target/release/libnub_native.so runtime/addons/nub-native.node
       - run: cargo test
@@ -444,10 +445,10 @@ jobs:
               # musl recipe (what oxc/swc ship); `cross` forwards RUSTFLAGS by
               # default (Cross.toml makes the passthrough explicit). Verified in
               # Docker: builds + loads under node:alpine, exporting parseYaml/etc.
-              RUSTFLAGS="-C target-feature=-crt-static" $CMD build --release -p nub-native --target ${{ matrix.target }}
+              (cd crates/nub-native && RUSTFLAGS="-C target-feature=-crt-static" $CMD build --release -p nub-native --target ${{ matrix.target }})
               ;;
             *)
-              $CMD build --release -p nub-native --target ${{ matrix.target }}
+              (cd crates/nub-native && $CMD build --release -p nub-native --target ${{ matrix.target }})
               ;;
           esac
         shell: bash

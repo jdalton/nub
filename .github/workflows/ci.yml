@@ -272,7 +272,10 @@ jobs:
       - name: Build nub-native addon (for data-format loader tests)
         shell: bash
         run: |
-          cargo build -p nub-native
+          # nub-native is its own workspace (split so the CLI uses panic=abort while
+          # the cdylib keeps panic=unwind); build it from inside the crate. Its local
+          # .cargo/config.toml routes output into the shared root target/.
+          (cd crates/nub-native && cargo build)
           mkdir -p runtime/addons
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             cp target/debug/nub_native.dll runtime/addons/nub-native.node
@@ -341,7 +344,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build -p nub-cli -p nub-native
+          cargo build -p nub-cli
+          # nub-native is its own workspace (split so the CLI uses panic=abort while
+          # the cdylib keeps panic=unwind); build it from inside the crate. Its local
+          # .cargo/config.toml routes output into the shared root target/.
+          (cd crates/nub-native && cargo build)
           mkdir -p runtime/addons
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             cp target/debug/nub_native.dll runtime/addons/nub-native.node
