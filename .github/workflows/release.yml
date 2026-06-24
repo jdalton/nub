@@ -442,13 +442,17 @@ jobs:
               # untouched and stays portable. The resulting .node dyn-links
               # libgcc_s.so.1 (Rust's musl unwinder) — present on node:*-alpine
               # (pulled via libstdc++), so it loads. This is napi-rs's canonical
-              # musl recipe (what oxc/swc ship); `cross` forwards RUSTFLAGS by
-              # default (Cross.toml makes the passthrough explicit). Verified in
-              # Docker: builds + loads under node:alpine, exporting parseYaml/etc.
-              (cd crates/nub-native && RUSTFLAGS="-C target-feature=-crt-static" $CMD build --release -p nub-native --target ${{ matrix.target }})
+              # musl recipe (what oxc/swc ship). The addon builds from inside its
+              # own workspace (`cd crates/nub-native`; it is excluded from the root
+              # workspace), so `cross` reads crates/nub-native/Cross.toml — NOT the
+              # repo-root one — for its RUSTFLAGS passthrough; that crate-local
+              # Cross.toml carries the passthrough so -C target-feature=-crt-static
+              # reaches the cross container. Verified in Docker: builds + loads
+              # under node:alpine, exporting parseYaml/etc.
+              (cd crates/nub-native && RUSTFLAGS="-C target-feature=-crt-static" $CMD build --release --target ${{ matrix.target }})
               ;;
             *)
-              (cd crates/nub-native && $CMD build --release -p nub-native --target ${{ matrix.target }})
+              (cd crates/nub-native && $CMD build --release --target ${{ matrix.target }})
               ;;
           esac
         shell: bash

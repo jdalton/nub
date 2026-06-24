@@ -153,6 +153,12 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # nub-native is its OWN workspace (split so the CLI uses panic=abort while
+      # the cdylib stays panic=unwind), `exclude`d from the root workspace — so the
+      # root clippy above does NOT cover it. Lint it from inside the crate so its
+      # own dbg_macro/todo/unimplemented lints (Cargo.toml [workspace.lints]) are
+      # still enforced. (No --all-targets: the cdylib sets test=false/doctest=false.)
+      - run: cd crates/nub-native && cargo clippy --all-features -- -D warnings
       # Static brand-boundary gate: no AUBE_*-branded env-var READS in nub crate
       # source (the embedded engine's brand is never nub's config surface). Cheap
       # grep, no build — runs alongside clippy on the same run_rust gate.
@@ -387,6 +393,9 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+      # nub-native is its own workspace (excluded from the root one), so the root
+      # `cargo fmt --check` above skips it — check it from inside the crate.
+      - run: cd crates/nub-native && cargo fmt --check
 
   types-fixtures:
     name: "@nubjs/types typecheck fixtures"

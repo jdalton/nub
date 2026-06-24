@@ -78,7 +78,11 @@ cargo test -p nub-cli -- --exact <full::module::path::to::test>
 
 # A core/native crate's tests:
 cargo test -p nub-core
-cargo test -p nub-native
+# nub-native is its OWN workspace (excluded from the root one), so `-p nub-native`
+# from the repo root fails — run it from inside the crate. (The cdylib sets
+# `test = false`, so this just compiles the addon; its unit-testable logic lives
+# in the napi-free nub-cache-key crate, covered by `cargo test -p nub-cache-key`.)
+(cd crates/nub-native && cargo test)
 
 # Everything (slow):
 cargo test          # or `make test`
