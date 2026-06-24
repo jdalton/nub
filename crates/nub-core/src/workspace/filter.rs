@@ -1330,8 +1330,7 @@ mod tests {
 
     /// A cycle keeps the cyclic nodes out of every wave (they never reach
     /// zero in-degree), so the leftover branch dumps them in ONE final chunk
-    /// after the acyclic prefix waves out normally — the cycle-handling
-    /// contract the Kahn's-algorithm rewrite preserves. No node is dropped or
+    /// after the acyclic prefix waves out normally. No node is dropped or
     /// duplicated even when the graph isn't a DAG.
     #[test]
     fn topological_chunks_cycle_dumps_remainder_in_one_chunk() {
