@@ -125,6 +125,11 @@ impl<V> MtimeCache<V> {
 
 /// The file's freshness stamp `(mtime, size)`, or `None` when it can't be
 /// stat'd (missing / inaccessible) or the platform reports no mtime.
+///
+/// Cache keys are the literal, un-canonicalized paths the callers pass in, and
+/// `fs::metadata` follows symlinks to stamp the TARGET. So two distinct keys
+/// that alias one file (e.g. a symlinked config path) cache independently but
+/// each stamps the real target — at worst a redundant read, never a stale one.
 fn current_stamp(path: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(path).ok()?;
     Some(Stamp {
