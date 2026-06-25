@@ -2649,6 +2649,18 @@ fn run_workspace_target(
     let mut ran_count = 0usize;
     let bail = ws.bail;
 
+    // Share the discovered members read-only across all chunks/workers via a
+    // single refcount bump, instead of structurally cloning every chunk member
+    // into every worker (`num_workers × chunk_len` clones of a
+    // `WorkspacePackage`, whose `manifest` is a 10–50 KB `serde_json::Value`).
+    // Built ONCE here, above the chunk loop: topological chunking produces
+    // MANY chunks, so constructing it inside the loop would deep-clone the
+    // whole member set per chunk (`O(num_chunks × members.len())`). Both run
+    // paths index it by the global member index — the sequential branch
+    // directly (`&members[idx]`), each concurrent worker via an `Arc::clone`.
+    let members: std::sync::Arc<[nub_core::workspace::filter::WorkspacePackage]> =
+        std::sync::Arc::from(members.as_slice());
+
     for chunk in &chunks {
         if bail && total_failed > 0 {
             break;
@@ -2692,16 +2704,6 @@ fn run_workspace_target(
             let ran = Arc::new(AtomicUsize::new(0));
             let (tx, rx) = mpsc::channel::<usize>();
             let rx = Arc::new(std::sync::Mutex::new(rx));
-
-            // Share the discovered members read-only across all workers via a
-            // single refcount bump per worker, instead of structurally cloning
-            // every chunk member into every worker (`num_workers × chunk_len`
-            // clones of a `WorkspacePackage`, whose `manifest` is a 10–50 KB
-            // `serde_json::Value`). The channel hands each worker a global index
-            // straight into `members`, so the worker indexes by it directly —
-            // no per-worker snapshot and no linear lookup.
-            let members: Arc<[nub_core::workspace::filter::WorkspacePackage]> =
-                Arc::from(members.as_slice());
 
             // The per-worker loop body, factored out so it backs BOTH a spawned
             // worker thread and the inline fallback (when thread creation fails
