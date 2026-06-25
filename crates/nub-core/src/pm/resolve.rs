@@ -517,18 +517,44 @@ fn raw_pin_name_version(manifest: &serde_json::Value) -> Option<(String, Option<
     Some((name.to_string(), version))
 }
 
+/// Per-process, mtime-validated cache of the root manifest keyed by the
+/// resolved manifest FILE path. `declared_pm_raw` is called several times per PM
+/// command (config-scoping, the lifecycle UA, the install-signals re-read) and
+/// each call walked + read + parsed the same `package.json`; this collapses
+/// those to one read per `(path, mtime)`. mtime validation makes it stale-proof:
+/// any rewrite of the manifest (the in-process engine mid-command) bumps the
+/// mtime, the next lookup misses, and the file is re-read.
+static ROOT_MANIFEST_CACHE: crate::config_cache::MtimeCache<serde_json::Value> =
+    crate::config_cache::MtimeCache::new();
+
 /// The `package.json` value at [`pin_target_dir`] — the workspace root if one is
-/// above `cwd`, else the nearest project root. The detected project already parsed
-/// the nearest manifest; only a distinct workspace root needs a second read.
-fn root_manifest(cwd: &Path) -> Option<serde_json::Value> {
+/// above `cwd`, else the nearest project root.
+///
+/// The path is resolved via [`detect_project`] (a directory walk), then the
+/// chosen manifest is read through [`ROOT_MANIFEST_CACHE`] keyed on that path so
+/// repeated callers within one command share a single read + parse. Returns an
+/// `Arc` so a cache hit is a pointer clone, not a deep manifest copy.
+fn root_manifest(cwd: &Path) -> Option<std::sync::Arc<serde_json::Value>> {
     let project = detect_project(cwd)?;
-    match &project.workspace_root {
-        Some(ws) if *ws != project.root => {
-            let content = std::fs::read_to_string(ws.join("package.json")).ok()?;
-            serde_json::from_str(&content).ok()
+    // The manifest path the value is read from — keys (and mtime-validates) the
+    // cache. A distinct workspace root reads the workspace manifest; otherwise
+    // the project root's own manifest.
+    let manifest_path = match &project.workspace_root {
+        Some(ws) if *ws != project.root => ws.join("package.json"),
+        _ => project.root.join("package.json"),
+    };
+    ROOT_MANIFEST_CACHE.get_or_read(&manifest_path, || {
+        // `detect_project` already parsed the project-root manifest; reuse it on
+        // the common (no distinct workspace root) path to avoid a second parse on
+        // a cache miss. A distinct workspace root needs its own read.
+        match &project.workspace_root {
+            Some(ws) if *ws != project.root => {
+                let content = std::fs::read_to_string(ws.join("package.json")).ok()?;
+                serde_json::from_str(&content).ok()
+            }
+            _ => Some(project.manifest),
         }
-        _ => Some(project.manifest),
-    }
+    })
 }
 
 /// The result of [`write_declared_pm`]: the manifest written, and the

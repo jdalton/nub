@@ -730,6 +730,29 @@ pub(crate) fn session_role_root(
     Some((role, detected.dir.clone()))
 }
 
+/// Per-process, mtime-validated cache of parsed `aube_manifest::PackageJson`
+/// keyed by file path. The PM-engine config phase parses the root manifest
+/// through aube's parser several times per command — `apply_config_scope`, the
+/// scan's `manifest_has_pnpm_overrides`, and `injected_deps_present`'s
+/// `manifest_has_injected` — and `first_catalog_specifier` parses every member
+/// manifest. This collapses repeat parses of one path to a single read. mtime
+/// validation keeps it stale-proof (a mid-command engine rewrite re-reads).
+///
+/// A parse ERROR (or missing file) yields `None` and is NOT cached, matching
+/// every call site's existing `let Ok(..) = .. else { skip }` handling exactly.
+static AUBE_MANIFEST_CACHE: nub_core::config_cache::MtimeCache<aube_manifest::PackageJson> =
+    nub_core::config_cache::MtimeCache::new();
+
+/// Read + parse `path` as an `aube_manifest::PackageJson` through
+/// [`AUBE_MANIFEST_CACHE`]. `None` on a missing/unparseable manifest (never
+/// cached) — behavior-identical to a direct `PackageJson::from_path(path).ok()`,
+/// just deduplicated across the repeat parses one command makes of the same path.
+pub(crate) fn cached_aube_manifest(
+    path: &Path,
+) -> Option<std::sync::Arc<aube_manifest::PackageJson>> {
+    AUBE_MANIFEST_CACHE.get_or_read(path, || aube_manifest::PackageJson::from_path(path).ok())
+}
+
 /// Apply the config-scoping policy for one verb invocation: resolve the
 /// active-PM role, scope the manifest's graph-shaping override fields to
 /// that role's dialect, register the scoped source + trusted-deps toggle on
@@ -751,7 +774,7 @@ fn apply_config_scope(
 
     let root = detected.map(|d| d.dir.as_path()).unwrap_or(cwd);
     let manifest_path = root.join("package.json");
-    let Ok(manifest) = aube_manifest::PackageJson::from_path(&manifest_path) else {
+    let Some(manifest) = cached_aube_manifest(&manifest_path) else {
         return Ok(());
     };
 
@@ -873,8 +896,7 @@ fn first_catalog_specifier(manifest: &aube_manifest::PackageJson, root: &Path) -
     // independently, so a member-only `catalog:` ref must refuse too.
     if let Ok(members) = aube_workspace::find_workspace_packages(root) {
         for dir in members {
-            let Ok(member) = aube_manifest::PackageJson::from_path(&dir.join("package.json"))
-            else {
+            let Some(member) = cached_aube_manifest(&dir.join("package.json")) else {
                 continue;
             };
             if let Some(hit) = first_catalog_in_dep_maps(&member) {
