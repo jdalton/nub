@@ -41,6 +41,20 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+# Profile-guided-optimization ship profile. Driven by `benchmarks/pgo.mts`
+# (instrument → train against the hot CPU paths → `llvm-profdata merge` →
+# rebuild with `-Cprofile-use`); the `-C` flags live in RUSTFLAGS set by that
+# script, NOT here, so a plain `cargo build --profile release-pgo` with no
+# RUSTFLAGS just produces an un-instrumented binary identical to `release`
+# plus fat LTO. ADDITIVE: the existing `release` profile (above) is the
+# untouched fallback the release pipeline still uses for every platform that
+# does not opt into PGO. `inherits = "release"` keeps panic=abort + strip; the
+# only deltas are fat LTO (PGO's IR-level cross-module inlining wants the whole
+# program) — `release`'s thin LTO would leave inter-crate hot edges un-inlined.
+[profile.release-pgo]
+inherits = "release"
+lto = "fat"
+
 # Fast local-iteration profile for `nub-dev` / `make install-dev`. NOT a ship
 # profile — the release block above is untouched. Inherits `dev` (debug
 # assertions + overflow checks stay on), but drops everything the release build
