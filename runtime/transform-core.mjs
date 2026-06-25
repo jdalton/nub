@@ -342,7 +342,7 @@ export function resolveSpec(specifier, parentURL) {
   // from a nub-dependency ESM entry) delegated to a strict user loader is exactly
   // the R11 leak. See isNubInternalParent.
   if (isNubInternalParent(parentURL)) {
-    if (specifier.startsWith("node:") || module.builtinModules.includes(specifier)) {
+    if (specifier.startsWith("node:") || module.isBuiltin(specifier)) {
       const url = specifier.startsWith("node:") ? specifier : `node:${specifier}`;
       return { url, shortCircuit: true };
     }
@@ -363,7 +363,7 @@ export function resolveSpec(specifier, parentURL) {
 
   // node: and data: protocols, and bare Node built-ins, are never ours.
   if (specifier.startsWith("node:") || specifier.startsWith("data:")) return null;
-  if (module.builtinModules.includes(specifier)) return null;
+  if (module.isBuiltin(specifier)) return null;
 
   // 1. Built-in modules provided by Nub.
   if (BUILTIN_MODULES.has(specifier)) {
@@ -406,7 +406,7 @@ export function resolveSpec(specifier, parentURL) {
 // file's absolute path (from the CJS parent Module), or null for the entry.
 export function resolveCjsPath(request, parentPath) {
   if (request.startsWith("node:") || request.startsWith("data:") ||
-      module.builtinModules.includes(request)) {
+      module.isBuiltin(request)) {
     return null;
   }
   // The SAME native additive resolver as resolveSpec, returning an absolute path
@@ -469,12 +469,25 @@ function detectModuleInfo(filePath, source, lang) {
 // `.mjs`→module / `.cjs`→commonjs are explicit (mirroring `.mts`/`.cts`), so the
 // plain-JS gate gets the right format without a needless detect.
 export function moduleFormatFor(ext, pkgType, filePath, source) {
-  if (ext === ".mts" || ext === ".mjs") return "module";
-  if (ext === ".cts" || ext === ".cjs") return "commonjs";
-  if (pkgType === "module") return "module";
-  if (pkgType === "commonjs") return "commonjs";
+  return moduleFormatWithInfo(ext, pkgType, filePath, source).format;
+}
+
+// Same format decision as moduleFormatFor, but ALSO returns the `ModuleInfo`
+// (`detectModuleInfo`) result when a parse was needed — `{ format, info }`, with
+// `info` null on the no-parse short-circuits (`.mts`/`.mjs`/`.cts`/`.cjs`, explicit
+// `type`). loadTranspile uses this so its ONE parse serves BOTH readers — the
+// format decision (`hasValueEsmSyntax`) and the Stage-3 decorator guard
+// (`hasDecorators`) — instead of `moduleFormatFor` + `hasDecoratorSyntax` each
+// parsing the same source. On a short-circuit (`info` null) no parse happened, so
+// the decorator guard runs its own single parse: still ≤1 detect per file.
+function moduleFormatWithInfo(ext, pkgType, filePath, source) {
+  if (ext === ".mts" || ext === ".mjs") return { format: "module", info: null };
+  if (ext === ".cts" || ext === ".cjs") return { format: "commonjs", info: null };
+  if (pkgType === "module") return { format: "module", info: null };
+  if (pkgType === "commonjs") return { format: "commonjs", info: null };
   const lang = ext === ".tsx" ? "tsx" : ext === ".jsx" ? "jsx" : "ts";
-  return detectModuleInfo(filePath, source, lang).hasValueEsmSyntax ? "module" : "commonjs";
+  const info = detectModuleInfo(filePath, source, lang);
+  return { format: info.hasValueEsmSyntax ? "module" : "commonjs", info };
 }
 
 // The Stage-3-decorator rejection diagnostic. oxc does not lower TC39 Stage 3
@@ -586,7 +599,10 @@ export function loadTranspile(url, ext) {
   // (.ts/.tsx/.jsx); .mts/.cts are explicit so its lookup is skipped. The chosen
   // format is folded into the cache key (and the entry's leading byte) by native.
   const pkgType = ext === ".mts" || ext === ".cts" ? undefined : getPackageType(dir);
-  const format = moduleFormatFor(ext, pkgType, filePath, source);
+  // ONE detectModuleInfo parse for both the format decision and the decorator
+  // guard below: `moduleInfo` is the parsed ModuleInfo when the format needed a
+  // parse (ambiguous ext, no explicit `type`), else null (a no-parse short-circuit).
+  const { format, info: moduleInfo } = moduleFormatWithInfo(ext, pkgType, filePath, source);
 
   const lang = ext === ".tsx" ? "tsx" : ext === ".jsx" ? "jsx" : "ts";
 
@@ -623,9 +639,12 @@ export function loadTranspile(url, ext) {
   // SyntaxError. When legacy mode is off and decorator syntax is present, reject
   // with the documented Option-A diagnostic instead. (Cheap `source.includes("@")`
   // pre-filter keeps decorator-free files off the native parser; runs BEFORE the
-  // cache so the diagnostic surfaces even on what would be a warm hit.)
+  // cache so the diagnostic surfaces even on what would be a warm hit.) Reuse the
+  // `hasDecorators` flag from the format parse above when it ran (`moduleInfo`
+  // non-null), so the ambiguous-ext + `@` path detects ONCE; on a no-parse
+  // short-circuit (`.mts`/`.cts`/explicit `type`) it does its own single parse.
   if (co?.experimentalDecorators !== true && source.includes("@") &&
-      hasDecoratorSyntax(filePath, source, lang)) {
+      (moduleInfo ? moduleInfo.hasDecorators : hasDecoratorSyntax(filePath, source, lang))) {
     throw stage3DecoratorError(filePath);
   }
 
