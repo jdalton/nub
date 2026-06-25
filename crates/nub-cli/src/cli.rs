@@ -2693,6 +2693,16 @@ fn run_workspace_target(
             let (tx, rx) = mpsc::channel::<usize>();
             let rx = Arc::new(std::sync::Mutex::new(rx));
 
+            // Share the discovered members read-only across all workers via a
+            // single refcount bump per worker, instead of structurally cloning
+            // every chunk member into every worker (`num_workers × chunk_len`
+            // clones of a `WorkspacePackage`, whose `manifest` is a 10–50 KB
+            // `serde_json::Value`). The channel hands each worker a global index
+            // straight into `members`, so the worker indexes by it directly —
+            // no per-worker snapshot and no linear lookup.
+            let members: Arc<[nub_core::workspace::filter::WorkspacePackage]> =
+                Arc::from(members.as_slice());
+
             // The per-worker loop body, factored out so it backs BOTH a spawned
             // worker thread and the inline fallback (when thread creation fails
             // under resource pressure). Each invocation pulls indices from the
@@ -2702,11 +2712,7 @@ fn run_workspace_target(
             let run_worker = |rx: Arc<std::sync::Mutex<mpsc::Receiver<usize>>>,
                               failed: Arc<AtomicUsize>,
                               ran: Arc<AtomicUsize>| {
-                let members_snapshot: Vec<(usize, nub_core::workspace::filter::WorkspacePackage)> =
-                    chunk
-                        .iter()
-                        .map(|&idx| (idx, members[idx].clone()))
-                        .collect();
+                let members = Arc::clone(&members);
                 let ws_root_buf = ws_root.to_path_buf();
                 let target = OwnedTarget::from(target);
                 let ignore_scripts = exec.ignore_scripts;
@@ -2729,9 +2735,7 @@ fn run_workspace_target(
                         if bail && failed.load(AtomicOrdering::Relaxed) > 0 {
                             continue;
                         }
-                        let Some((_, member)) =
-                            members_snapshot.iter().find(|(i, _)| *i == work_idx)
-                        else {
+                        let Some(member) = members.get(work_idx) else {
                             continue;
                         };
                         let leaf = MemberLeaf {
