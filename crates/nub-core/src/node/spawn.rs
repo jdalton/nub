@@ -451,10 +451,11 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         .as_deref()
         .map(|p| preload_injection(p, &config.node.version));
     let reentrancy_key = injection.as_ref().map(|i| i.node_options_token());
-    let is_reentrant = is_reentrant_in(
-        env::var("NODE_OPTIONS").ok().as_deref(),
-        reentrancy_key.as_deref(),
-    );
+    // Read the inherited NODE_OPTIONS once and reuse it for both the re-entrancy
+    // check and the flag-injection block below — the env value is constant across
+    // a single spawn.
+    let node_options = env::var("NODE_OPTIONS").ok();
+    let is_reentrant = is_reentrant_in(node_options.as_deref(), reentrancy_key.as_deref());
 
     // Augment only when we can locate our own preload. If `find_preload` fails —
     // a broken install, or (Windows, A-WIN2) the PATH-shim `node.exe` running
@@ -467,7 +468,6 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // wiki/runtime/hijack-by-default.md.
     if !config.compat_mode && !is_reentrant && preload.is_some() {
         // Flag injection.
-        let node_options = env::var("NODE_OPTIONS").ok();
         let inject = flags::compute_inject_flags(
             config.node.version.clone(),
             config.user_args,
@@ -669,8 +669,12 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // re-entrant — i.e. NODE_OPTIONS does not already carry our preload — so
         // always (re)build it, appending any pre-existing NODE_OPTIONS. (The old
         // `already_injected` guard checked the same full path and is subsumed by
-        // `is_reentrant` above.)
-        let existing_opts = env::var("NODE_OPTIONS").ok().filter(|s| !s.is_empty());
+        // `is_reentrant` above.) Reuses the NODE_OPTIONS read at the top of the
+        // function rather than re-reading the (constant) env value.
+        let existing_opts = node_options
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let mut node_opts_parts: Vec<String> = Vec::new();
         for flag in &inject {
             node_opts_parts.push(flag.to_string());
@@ -1000,10 +1004,10 @@ pub fn compute_augmentation_env(
         .as_deref()
         .map(|p| preload_injection(p, &node_version));
     let reentrancy_key = injection.as_ref().map(|i| i.node_options_token());
-    if is_reentrant_in(
-        env::var("NODE_OPTIONS").ok().as_deref(),
-        reentrancy_key.as_deref(),
-    ) {
+    // Read the inherited NODE_OPTIONS once and reuse it for both the re-entrancy
+    // check and the NODE_OPTIONS rebuild below — the env value is constant here.
+    let node_options = env::var("NODE_OPTIONS").ok();
+    if is_reentrant_in(node_options.as_deref(), reentrancy_key.as_deref()) {
         return None;
     }
     // Nothing to inject if we can't locate our preload (broken install, or a
@@ -1012,7 +1016,7 @@ pub fn compute_augmentation_env(
     let preload = preload?;
     let injection = injection.expect("injection is Some when preload is Some");
 
-    let existing_node_options = env::var("NODE_OPTIONS").ok().filter(|s| !s.is_empty());
+    let existing_node_options = node_options.filter(|s| !s.is_empty());
 
     // Build NODE_OPTIONS. Unlike the direct-spawn path (which passes flags as
     // argv to `node`), scripts run under a shell, so EVERY flag must travel via
