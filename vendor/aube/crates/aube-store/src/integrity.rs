@@ -197,6 +197,14 @@ pub fn sha512_integrity(data: &[u8]) -> String {
         hasher.update(data);
         hasher.finalize_reset()
     });
+    let mut digest_buf = [0u8; 64];
+    digest_buf.copy_from_slice(&digest);
+    sha512_integrity_from_digest(&digest_buf)
+}
+
+/// Return the npm Subresource Integrity string for a precomputed
+/// SHA-512 digest.
+pub fn sha512_integrity_from_digest(digest: &[u8; 64]) -> String {
     use base64::Engine;
     format!(
         "{SHA512_INTEGRITY_PREFIX}{}",
@@ -298,6 +306,15 @@ pub fn validate_pkg_content(
         .strip_prefix('v')
         .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
         .unwrap_or(actual_version);
+    // npm registry metadata may omit semver build metadata that is
+    // still present in the tarball's own package.json. Treat that as
+    // the same version for the tarball-side normalization path: build
+    // metadata does not affect semver precedence, and pnpm accepts
+    // packages such as @trpc/react-query@11.0.0-rc.747 whose manifest
+    // declares 11.0.0-rc.747+64714681c.
+    let actual_version_without_build = actual_version_normalized
+        .split_once('+')
+        .map(|(base, _)| base);
     // pnpm v9 lockfiles key git-hosted deps by the codeload tarball URL
     // (or a `git+<url>#<commit>` form) in the `version` slot of the
     // dep_path — that URL is what the resolver hands us as
@@ -309,7 +326,9 @@ pub fn validate_pkg_content(
     let expected_is_url_or_ref = expected_version.contains("://")
         || expected_version.starts_with("git+")
         || expected_version.starts_with("file:");
-    let version_matches = expected_is_url_or_ref || actual_version_normalized == expected_version;
+    let version_matches = expected_is_url_or_ref
+        || actual_version_normalized == expected_version
+        || actual_version_without_build == Some(expected_version);
     if actual_name != expected_name || !version_matches {
         // Only carry the *actual* coordinate the tarball declared.
         // Every caller wraps the error with the expected

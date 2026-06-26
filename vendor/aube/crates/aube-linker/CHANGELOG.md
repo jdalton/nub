@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.25.1](https://github.com/jdx/aube/compare/aube-linker-v1.25.0...aube-linker-v1.25.1) - 2026-06-25
+
+### Fixed
+
+- *(linker)* make aube dir materialization atomic ([#950](https://github.com/jdx/aube/pull/950))
+
+### Other
+
+- refresh benchmarks for v1.25.0 ([#947](https://github.com/jdx/aube/pull/947))
+
+## [1.25.0](https://github.com/jdx/aube/compare/aube-linker-v1.24.0...aube-linker-v1.25.0) - 2026-06-25
+
+### Added
+
+- *(runtime)* add shell-activated tool shims ([#945](https://github.com/jdx/aube/pull/945))
+
+### Other
+
+- *(linker)* hoist redundant per-package dep-path encode ([#943](https://github.com/jdx/aube/pull/943))
+- *(linker)* OS-gate packageImportMethod=auto (reflink on macOS), with the auto-only hardlink fallback scoped to auto ([#944](https://github.com/jdx/aube/pull/944))
+- refresh benchmarks for v1.24.0 ([#937](https://github.com/jdx/aube/pull/937))
+
+## [1.24.0](https://github.com/jdx/aube/compare/aube-linker-v1.23.0...aube-linker-v1.24.0) - 2026-06-23
+
+### Other
+
+- refresh benchmarks for v1.23.0 ([#922](https://github.com/jdx/aube/pull/922))
+
 ## [1.23.0](https://github.com/jdx/aube/compare/aube-linker-v1.22.0...aube-linker-v1.23.0) - 2026-06-21
 
 ### Other

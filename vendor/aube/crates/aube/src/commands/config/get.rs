@@ -1,6 +1,6 @@
 use super::{
     ListLocation, is_protected_key, read_merged, read_project_entries, read_user_entries,
-    resolve_aliases,
+    resolve_aliases, setting_default_value, setting_for_key,
 };
 use clap::Args;
 use miette::miette;
@@ -61,6 +61,29 @@ pub fn run(args: GetArgs) -> miette::Result<()> {
         ListLocation::User | ListLocation::Global => read_user_entries(&cwd)?,
         ListLocation::Project => read_project_entries(&cwd)?,
     };
+
+    let managed_entries = super::aube_config::load_managed_entries();
+    if matches!(args.effective_location(), ListLocation::Merged)
+        && !managed_entries.is_empty()
+        && let Some(meta) = setting_for_key(&args.key)
+    {
+        let local = entries
+            .iter()
+            .rev()
+            .find_map(|(k, v)| aliases.iter().any(|a| a == k).then(|| v.clone()));
+        if let Some(v) = aube_settings::values::apply_managed_raw(
+            meta.name,
+            local.or_else(|| setting_default_value(meta)),
+            &managed_entries,
+        ) {
+            if args.json {
+                println!("{}", serde_json::Value::String(v));
+            } else {
+                println!("{v}");
+            }
+            return Ok(());
+        }
+    }
 
     if let Some(v) = find_value(&entries, &aliases) {
         if args.json {

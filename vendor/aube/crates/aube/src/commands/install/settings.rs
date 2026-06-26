@@ -84,19 +84,15 @@ fn resolve_minimum_release_age(
     if minutes == 0 {
         return None;
     }
-    // Parse `minimumReleaseAgeExclude` with the same grammar as
-    // `trustPolicyExclude` so a version-pinned or `||`-union entry
-    // (`axios@0.18.1 || 0.21.1`) actually exempts those versions, not
-    // just name-only entries. parse_lossy keeps every well-formed rule
-    // and reports malformed ones individually — a strict batch parse
-    // would turn one typo into a silently-empty exclude list, a security
-    // regression. Name-only entries behave exactly as before.
-    let (exclude, exclude_parse_errors) = aube_resolver::TrustExcludeRules::parse_lossy(
+    // Parse pattern-by-pattern (bare names, `*` name globs, exact-version
+    // unions) so one malformed entry doesn't silently drop the rest and
+    // weaken the gate. Same engine pnpm uses for both exclude settings.
+    let (exclude, parse_errors) = aube_resolver::PackageVersionPolicy::parse_lossy(
         aube_settings::resolved::minimum_release_age_exclude(ctx).unwrap_or_default(),
     );
-    for err in exclude_parse_errors {
+    for err in parse_errors {
         tracing::warn!(
-            code = aube_codes::warnings::WARN_AUBE_INVALID_TRUST_POLICY,
+            code = aube_codes::warnings::WARN_AUBE_INVALID_MINIMUM_RELEASE_AGE_EXCLUDE,
             error = %err,
             "ignoring malformed minimumReleaseAgeExclude entry"
         );
@@ -841,6 +837,7 @@ pub(crate) struct ResolverConfigInputs<'a> {
     /// — nothing consumes the extra resolutions. Callers compute this
     /// as `lockfile_enabled.then(|| source_kind_before.unwrap_or(Aube))`.
     pub(crate) target_lockfile_kind: Option<aube_lockfile::LockfileKind>,
+    pub(crate) dependency_policy: Option<aube_resolver::DependencyPolicy>,
     /// When `true`, the resolver caches full (non-corgi) packuments on
     /// disk so the next install/update can reuse them without a
     /// round-trip. Install opts in (`true`) to amortize the cost of
@@ -871,6 +868,7 @@ pub(crate) fn configure_resolver(
         workspace_catalogs,
         minimum_release_age_override,
         target_lockfile_kind,
+        dependency_policy,
         cache_full_packuments,
         ignore_scripts,
     } = inputs;
@@ -883,27 +881,23 @@ pub(crate) fn configure_resolver(
     let registry_supports_time_field = resolve_registry_supports_time_field(settings_ctx);
     let force_metadata_primer = resolve_force_metadata_primer(settings_ctx);
     let (sup_os, sup_cpu, sup_libc) =
-        effective_supported_architectures(manifest, workspace_config, settings_ctx);
-    // pnpm-lock.yaml, aube-lock.yaml, bun.lock, and package-lock.json are
-    // all committed, cross-platform artifacts that carry per-package os/cpu
-    // metadata. When the user hasn't declared
-    // `pnpm.supportedArchitectures`, record EVERY optional-dep variant a
-    // package declares (`accept_all`) so the committed lockfile installs
-    // cleanly on every contributor's platform — withholding variants leaves
-    // teammates with "Cannot find native binding". This matches what pnpm
-    // AND bun both write verbatim (all 26 `@esbuild/*` / `@rollup/rollup-*`
-    // natives, freebsd/ppc64/s390x and all), so a lockfile aube regenerates
-    // stays diff-clean against the native tool. For package-lock.json the
-    // stakes are higher still: a platform-mismatched *root* optional
-    // dependency (fsevents on Linux) missing from the lockfile makes
-    // `npm ci` refuse the whole install with EUSAGE "Missing:
-    // fsevents@x.y.z from lock file", so npm is widened too. Install-time
-    // filtering (`filter_graph`) and the streaming-fetch gate run against
-    // the unmodified host triple, so `node_modules` and tarball downloads
-    // stay trimmed to the host — the wider lockfile costs only bytes, never
-    // extra installs. Yarn classic lockfiles have no per-package os/cpu
-    // metadata, so widening there would only bloat them — keep pnpm's
-    // host-only default.
+        aube_manifest::effective_supported_architectures(manifest, workspace_config);
+    // pnpm-lock.yaml, aube-lock.yaml, bun.lock, package-lock.json, and
+    // npm-shrinkwrap.json are committed, cross-platform artifacts that
+    // carry per-package os/cpu metadata.
+    // When the user hasn't declared `pnpm.supportedArchitectures`, record
+    // EVERY optional-dep variant a package declares (`accept_all`) so the
+    // committed lockfile installs cleanly on every contributor's platform
+    // — withholding variants leaves teammates with "Cannot find native
+    // binding". This matches what npm, pnpm, and bun write verbatim (all
+    // 26 `@esbuild/*` / `@rollup/rollup-*` natives, freebsd/ppc64/s390x
+    // and all), so a lockfile aube regenerates stays diff-clean against the
+    // native tool. Install-time filtering (`filter_graph`) and the
+    // streaming-fetch gate run against the unmodified host triple, so
+    // `node_modules` and tarball downloads stay trimmed to the host — the
+    // wider lockfile costs only bytes, never extra installs. Yarn lockfiles
+    // don't carry the same per-package os/cpu metadata, so widening there
+    // would only bloat them — keep the host-only default.
     let manifest_set_supported_arch =
         !(sup_os.is_empty() && sup_cpu.is_empty() && sup_libc.is_empty());
     let writes_cross_platform_lock = matches!(
@@ -913,6 +907,7 @@ pub(crate) fn configure_resolver(
                 | aube_lockfile::LockfileKind::Aube
                 | aube_lockfile::LockfileKind::Bun
                 | aube_lockfile::LockfileKind::Npm
+                | aube_lockfile::LockfileKind::NpmShrinkwrap
         )
     );
     let supported_architectures = if manifest_set_supported_arch {
@@ -955,7 +950,8 @@ pub(crate) fn configure_resolver(
     if !effective_overrides.is_empty() {
         tracing::debug!("applying {} overrides", effective_overrides.len());
     }
-    let dependency_policy = resolve_dependency_policy(manifest, settings_ctx);
+    let dependency_policy =
+        dependency_policy.unwrap_or_else(|| resolve_dependency_policy(manifest, settings_ctx));
     if !dependency_policy.package_extensions.is_empty() {
         tracing::debug!(
             "applying {} packageExtensions",
@@ -975,7 +971,7 @@ pub(crate) fn configure_resolver(
         resolve_minimum_release_age(settings_ctx, minimum_release_age_override);
     if let Some(ref mra) = minimum_release_age {
         tracing::debug!(
-            "minimumReleaseAge: {} min, {} excluded, strict={}",
+            "minimumReleaseAge: {} min, {} exclude rules, strict={}",
             mra.minutes,
             mra.exclude.len(),
             mra.strict

@@ -6,7 +6,59 @@ use crate::{Error, LinkStats, LinkStrategy, Linker, sys};
 use aube_lockfile::{LockedPackage, shared_local_dep_path};
 use aube_store::{PackageIndex, StoredFile};
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
+
+enum MaterializePlacement {
+    Placed,
+    LostRace,
+}
+
+fn materialize_tmp_name() -> String {
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+    format!(".tmp-{}-{id}", std::process::id())
+}
+
+fn place_materialized_entry(src: &Path, dst: &Path) -> io::Result<MaterializePlacement> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut backoff_ms = 20u64;
+    let mut attempt = 0;
+    loop {
+        match std::fs::rename(src, dst) {
+            Ok(()) => return Ok(MaterializePlacement::Placed),
+            Err(_) if dst.exists() => return Ok(MaterializePlacement::LostRace),
+            Err(err) if is_transient_rename_error(&err) && attempt < MAX_ATTEMPTS - 1 => {
+                thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = backoff_ms.saturating_mul(2);
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn is_transient_rename_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::AlreadyExists
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+    )
+}
+
+/// Test-only switch that forces the reflink attempt in
+/// [`Linker::link_file_fresh`] to be treated as failed, so the
+/// clonefile-failure fallback path can be exercised deterministically on
+/// any filesystem (CI runs on reflink-capable APFS/btrfs where a real
+/// `clonefile` would otherwise succeed). Compiled out of release builds.
+#[cfg(test)]
+pub(crate) static FORCE_REFLINK_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl Linker {
     /// Detect the best linking strategy for the filesystem at the given path.
@@ -21,32 +73,47 @@ impl Linker {
     /// falls back to `fs::copy` per file silently, thousands of
     /// wasted syscalls, user thinks they got hardlinks.
     ///
-    /// Returns the best available zero-/low-cost strategy: `Reflink`
-    /// when the filesystem supports copy-on-write clones (APFS
-    /// clonefile, btrfs/xfs FICLONE), else `Hardlink` when same-mount
-    /// hard links work, else `Copy`. `auto` prefers reflink because a
-    /// clone is measurably cheaper than a hard link on every CoW
-    /// filesystem we benchmark — APFS clonefile runs ~2.5x faster than
-    /// `hard_link` on node_modules' small-file profile (the dominant
-    /// case), and reflinked files also get independent inodes so a
-    /// later in-place patch can't corrupt the shared store entry.
-    /// Mirrors pnpm's `auto` importer, which probes clone first and
-    /// only falls back to hardlink (`fs/indexed-pkg-importer`). The
-    /// exception is Windows, where reflink (ReFS Dev Drive) is ~10x
-    /// slower than the default path, so the probe keeps hardlink-first
-    /// there.
+    /// Returns the same-filesystem strategy `auto` resolves to when the
+    /// probe succeeds, `Copy` otherwise. The same-FS strategy is
+    /// OS-specific: on macOS `auto` resolves to `ReflinkAuto` (APFS
+    /// clonefile benchmarks ~1.91x faster than hardlink), on Linux and
+    /// other targets it resolves to `Hardlink` (btrfs/xfs hardlink
+    /// benchmarks ~2.4-2.6x faster than FICLONE reflink).
+    ///
+    /// The macOS `auto` resolution is conservative on non-APFS volumes:
+    /// `clonefile` is APFS-only, so on an HFS+ volume (external drives,
+    /// Fusion/older disks) the same-FS hardlink probe succeeds and
+    /// resolves `ReflinkAuto`, but the real `clonefile` then fails.
+    /// `link_file_fresh` handles this by falling the reflink back to a
+    /// hardlink (which HFS+ supports) before copy, so a non-APFS same-FS
+    /// target still gets zero-cost links rather than a per-file copy.
+    /// This probe never yields the plain `Reflink` strategy — that is
+    /// reachable only through explicit `packageImportMethod = clone` /
+    /// `clone-or-copy`, which keep a plain copy fallback.
     pub fn detect_strategy(path: &Path) -> LinkStrategy {
         Self::detect_strategy_cross(path, path)
     }
 
     /// Two-arg probe. src is the store shard (or any dir on the
     /// store FS), dst is the project modules dir (or any dir on the
-    /// destination FS). The probe creates a real cross-mount src file
-    /// and, on non-Windows, first tries to reflink it into dst (CoW
-    /// clone); on success it returns `Reflink`. Otherwise it tries a
-    /// hardlink, which also catches EXDEV up front, and returns
-    /// `Hardlink` on success or `Copy` when neither works.
+    /// destination FS). Probe creates a real cross-mount src file
+    /// and tries to hardlink into dst, which catches EXDEV up front.
+    /// A successful hardlink proves src and dst share a mount, so it
+    /// doubles as the same-FS probe for reflink too (APFS clonefile /
+    /// btrfs FICLONE require the same FS). Returns the OS-specific
+    /// same-FS strategy when the probe succeeds (`ReflinkAuto` on macOS,
+    /// `Hardlink` elsewhere), `Copy` otherwise.
     pub fn detect_strategy_cross(src_dir: &Path, dst_dir: &Path) -> LinkStrategy {
+        // Same-FS strategy `auto` resolves to once the probe succeeds.
+        // macOS/APFS clonefile is measurably faster than hardlink there;
+        // Linux btrfs/xfs hardlink is measurably faster than FICLONE.
+        // `ReflinkAuto` (not the plain `Reflink` explicit selections use)
+        // carries the non-APFS hardlink-before-copy fallback.
+        #[cfg(target_os = "macos")]
+        const SAME_FS_STRATEGY: LinkStrategy = LinkStrategy::ReflinkAuto;
+        #[cfg(not(target_os = "macos"))]
+        const SAME_FS_STRATEGY: LinkStrategy = LinkStrategy::Hardlink;
+
         // Memoize per (src_dir, dst_dir) for the process lifetime.
         // The probe writes a real test file and tries hardlink,
         // ~2 syscalls + 2 unlinks. Multiple Linker instances within
@@ -66,28 +133,10 @@ impl Linker {
         let test_dst = dst_dir.join(".aube-link-test-dst");
 
         let strategy = if std::fs::write(&test_src, b"test").is_ok() {
-            // Probe order mirrors pnpm's `auto`: prefer a copy-on-write
-            // reflink (cheapest on APFS/btrfs/xfs and store-safe), fall
-            // back to a same-mount hardlink, then to per-file copy.
-            // Windows keeps hardlink-first — reflink there means ReFS
-            // Dev Drive, which clones ~10x slower than the default path.
-            let probe_reflink = || {
-                // `reflink` refuses to overwrite, so clear any leftover
-                // dst from a prior probe before testing.
-                let _ = std::fs::remove_file(&test_dst);
-                reflink_copy::reflink(&test_src, &test_dst).is_ok()
-            };
-            let result = if !cfg!(windows) && probe_reflink() {
-                LinkStrategy::Reflink
+            let result = if std::fs::hard_link(&test_src, &test_dst).is_ok() {
+                SAME_FS_STRATEGY
             } else {
-                // A failed reflink probe can leave a partial dst; clear
-                // it so the hardlink attempt isn't an EEXIST false-negative.
-                let _ = std::fs::remove_file(&test_dst);
-                if std::fs::hard_link(&test_src, &test_dst).is_ok() {
-                    LinkStrategy::Hardlink
-                } else {
-                    LinkStrategy::Copy
-                }
+                LinkStrategy::Copy
             };
             let _ = std::fs::remove_file(&test_src);
             let _ = std::fs::remove_file(&test_dst);
@@ -102,7 +151,9 @@ impl Linker {
         // hardlink-ok, the other sees the first writer's leftover and
         // falls back to Copy. `.insert()` would let the wrong Copy
         // result clobber the correct Hardlink for the rest of the
-        // process; `or_insert` keeps whichever value landed first.
+        // process; `or_insert` keeps whichever value landed first. (The
+        // value at stake is the same-FS strategy above, not literally
+        // Hardlink — ReflinkAuto on macOS.)
         *cache
             .write()
             .expect("probe cache poisoned")
@@ -138,6 +189,39 @@ impl Linker {
         // this graph" and the materialize hot path stays unchanged.
         nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
     ) -> Result<(), Error> {
+        // Global-store paths always run through the vstore_key map —
+        // when hashes are installed this folds dep-graph + engine
+        // state into the leaf name, so concurrent builds of the same
+        // package against different toolchains don't collide.
+        let subdir = self.virtual_store_subdir(dep_path);
+        self.ensure_in_virtual_store_with_subdir(
+            dep_path,
+            &subdir,
+            pkg,
+            index,
+            stats,
+            nested_link_targets,
+        )
+    }
+
+    /// `ensure_in_virtual_store` with the virtual-store subdir already
+    /// computed by the caller. The link step's per-package par_iter
+    /// derives `virtual_store_subdir(dep_path)` once to build the
+    /// shared-store entry path, so passing it in here avoids recomputing
+    /// the same `dep_path_to_filename` encode (a `String` alloc plus the
+    /// escape/uppercase scans, and a second alloc + BLAKE3 short-hash on
+    /// long/scoped/peer-context names). `subdir` MUST equal
+    /// `self.virtual_store_subdir(dep_path)`; the public wrapper above
+    /// guarantees that for callers that don't already have it.
+    pub(crate) fn ensure_in_virtual_store_with_subdir(
+        &self,
+        dep_path: &str,
+        subdir: &str,
+        pkg: &LockedPackage,
+        index: &PackageIndex,
+        stats: &mut LinkStats,
+        nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
+    ) -> Result<(), Error> {
         let _diag =
             aube_util::diag::Span::new(aube_util::diag::Category::Linker, "ensure_in_vstore")
                 .with_meta_fn(|| {
@@ -147,14 +231,9 @@ impl Linker {
                         index.len()
                     )
                 });
-        // Global-store paths always run through the vstore_key map —
-        // when hashes are installed this folds dep-graph + engine
-        // state into the leaf name, so concurrent builds of the same
-        // package against different toolchains don't collide.
-        let subdir = self.virtual_store_subdir(dep_path);
         let pkg_nm_dir = self
             .virtual_store
-            .join(&subdir)
+            .join(subdir)
             .join("node_modules")
             .join(&pkg.name);
 
@@ -166,14 +245,12 @@ impl Linker {
 
         // Materialize into a temp directory, then atomically rename into place
         // to avoid TOCTOU races between concurrent `aube install` processes.
-        // `subdir` already comes from `dep_path_to_filename`, which
-        // flattens `/` to `+` as part of its escape pass, so it's
-        // already safe to splice into a single path component.
-        let tmp_name = format!(".tmp-{}-{subdir}", std::process::id());
+        let tmp_name = materialize_tmp_name();
         let tmp_base = self.virtual_store.join(&tmp_name);
 
         let result = self.materialize_into(
             &tmp_base,
+            &self.virtual_store,
             dep_path,
             pkg,
             index,
@@ -188,21 +265,24 @@ impl Linker {
         }
 
         // Atomically move the dep_path entry from the temp dir to the final location.
-        let tmp_entry = tmp_base.join(&subdir);
-        let final_entry = self.virtual_store.join(&subdir);
+        let tmp_entry = tmp_base.join(subdir);
+        let final_entry = self.virtual_store.join(subdir);
 
         // Ensure the parent of the final entry exists (e.g. for scoped packages).
-        if let Some(parent) = final_entry.parent() {
-            mkdirp(parent)?;
+        if let Some(parent) = final_entry.parent()
+            && let Err(e) = mkdirp(parent)
+        {
+            let _ = std::fs::remove_dir_all(&tmp_base);
+            return Err(e);
         }
 
-        match aube_util::fs_atomic::rename_with_retry(&tmp_entry, &final_entry) {
-            Ok(()) => {
+        match place_materialized_entry(&tmp_entry, &final_entry) {
+            Ok(MaterializePlacement::Placed) => {
                 trace!("atomically placed {subdir} in virtual store");
             }
-            Err(e) if final_entry.exists() => {
+            Ok(MaterializePlacement::LostRace) => {
                 // Another process won the race — that's fine, use theirs.
-                trace!("lost rename race for {dep_path}, using existing: {e}");
+                trace!("lost rename race for {dep_path}, using existing");
                 // Undo the stats from our materialization since we're discarding it
                 stats.packages_linked = stats.packages_linked.saturating_sub(1);
                 stats.files_linked = stats.files_linked.saturating_sub(index.len());
@@ -297,10 +377,13 @@ impl Linker {
     /// virtual store at `aube_dir/<dep_path>/node_modules/<name>/`.
     ///
     /// Idempotent: if the entry already exists, counts as cached and
-    /// returns. Used by the install-time materializer to pipeline the
-    /// link work into the fetch phase under non-GVS mode, so the
-    /// dedicated link phase only has to create top-level
-    /// `node_modules/<name>` symlinks.
+    /// returns. Otherwise materializes into a unique temp directory
+    /// and atomically renames that entry into place so duplicate
+    /// in-process fetch events for the same dep-path cannot race while
+    /// writing `node_modules/.aube/<dep_path>/`. Used by the
+    /// install-time materializer to pipeline the link work into the
+    /// fetch phase under non-GVS mode, so the dedicated link phase only
+    /// has to create top-level `node_modules/<name>` symlinks.
     pub fn ensure_in_aube_dir(
         &self,
         aube_dir: &Path,
@@ -310,16 +393,17 @@ impl Linker {
         stats: &mut LinkStats,
         nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
     ) -> Result<(), Error> {
-        // `materialize_into` batches `create_dir_all` for every parent
-        // it needs, so callers don't have to mkdirp the entry's parent
-        // (which is just `aube_dir` itself, already created by the
-        // materializer driver).
-        let entry = aube_dir.join(self.aube_dir_entry_name(dep_path));
-        if entry.exists() {
+        let subdir = self.aube_dir_entry_name(dep_path);
+        let final_entry = aube_dir.join(&subdir);
+        if final_entry.exists() {
             stats.packages_cached += 1;
             return Ok(());
         }
-        self.materialize_into(
+
+        let tmp_name = materialize_tmp_name();
+        let tmp_base = aube_dir.join(&tmp_name);
+        let result = self.materialize_into(
+            &tmp_base,
             aube_dir,
             dep_path,
             pkg,
@@ -327,10 +411,53 @@ impl Linker {
             stats,
             false,
             nested_link_targets,
-        )
+        );
+
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&tmp_base);
+            return result;
+        }
+
+        let tmp_entry = tmp_base.join(&subdir);
+        if let Some(parent) = final_entry.parent()
+            && let Err(e) = mkdirp(parent)
+        {
+            let _ = std::fs::remove_dir_all(&tmp_base);
+            return Err(e);
+        }
+
+        match place_materialized_entry(&tmp_entry, &final_entry) {
+            Ok(MaterializePlacement::Placed) => {}
+            Ok(MaterializePlacement::LostRace) => {
+                stats.packages_linked = stats.packages_linked.saturating_sub(1);
+                stats.files_linked = stats.files_linked.saturating_sub(index.len());
+                stats.packages_cached += 1;
+                let _ = std::fs::remove_dir_all(&tmp_base);
+                return Ok(());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_base);
+                return Err(Error::Io(final_entry, e));
+            }
+        }
+
+        if let Err(e) = std::fs::remove_dir(&tmp_base) {
+            debug!(
+                "remove_dir({}) failed, leaving tmp in place: {e}",
+                tmp_base.display()
+            );
+        }
+
+        Ok(())
     }
 
     /// Materialize a package's files and transitive dep symlinks into a base directory.
+    ///
+    /// `base_dir` is where files are written during materialization.
+    /// `final_base_dir` is where those files will live after any
+    /// wrapper rename. These differ for `.tmp-*` staging dirs; Windows
+    /// junctions need the final root because they persist absolute
+    /// targets at creation time.
     ///
     /// `apply_hashes` controls whether per-dep subdir names are run
     /// through `vstore_key` (the content-addressed name) or used as
@@ -343,6 +470,7 @@ impl Linker {
     pub(crate) fn materialize_into(
         &self,
         base_dir: &Path,
+        final_base_dir: &Path,
         dep_path: &str,
         pkg: &LockedPackage,
         index: &PackageIndex,
@@ -359,6 +487,9 @@ impl Linker {
         // this graph", which is the common case.
         nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
     ) -> Result<(), Error> {
+        #[cfg(not(windows))]
+        let _ = final_base_dir;
+
         validate_package_link_name(&pkg.name)?;
         for dep_name in pkg.dependencies.keys() {
             validate_package_link_name(dep_name)?;
@@ -603,27 +734,20 @@ impl Linker {
             let target = pathdiff::diff_paths(&sibling_abs, link_parent)
                 .unwrap_or_else(|| sibling_abs.clone());
 
-            // GVS materialize writes into `.tmp-<pid>-<subdir>/`, then
-            // atomic-renames into `self.virtual_store/<subdir>/`. POSIX
-            // symlinks store the relative offset verbatim. Offset stays
-            // invariant under the wrapper rename, so the link resolves
-            // correctly after the move. Windows junctions resolve the
-            // target against `link.parent()` at create time and persist
-            // an absolute path, which binds the junction to the tmp
-            // wrapper. After rename every sibling link dangles into a
-            // gone `.tmp-<pid>-...` path. Fix: on Windows GVS path
-            // (`apply_hashes = true`) rewrite the target to point at
-            // the final virtual store root so the stored absolute path
-            // survives the rename.
+            // Staged materialization writes into `.tmp-<pid>-<id>/`,
+            // then atomic-renames into `final_base_dir/<subdir>/`.
+            // POSIX symlinks store the relative offset verbatim.
+            // Offset stays invariant under the wrapper rename, so the
+            // link resolves correctly after the move. Windows junctions
+            // resolve the target against `link.parent()` at create time
+            // and persist an absolute path, which binds the junction to
+            // the tmp wrapper. Point Windows at the final root up front
+            // so the stored absolute path survives the rename.
             #[cfg(windows)]
-            let target = if apply_hashes {
-                self.virtual_store
-                    .join(&sibling_subdir)
-                    .join("node_modules")
-                    .join(dep_name)
-            } else {
-                target
-            };
+            let target = final_base_dir
+                .join(&sibling_subdir)
+                .join("node_modules")
+                .join(dep_name);
 
             sys::create_dir_link(&target, &symlink_path)
                 .map_err(|e| Error::Io(symlink_path.clone(), e))?;
@@ -647,6 +771,8 @@ impl Linker {
         rel_path: &str,
         dst: &Path,
     ) -> Result<(), Error> {
+        #[cfg(target_os = "macos")]
+        const SMALL_FILE_COPY_MAX: u64 = 16 * 1024;
         let map_io = |e: std::io::Error| classify_link_error(stored, rel_path, dst, e);
         let missing_source = || Error::MissingStoreFile {
             store_path: stored.store_path.clone(),
@@ -661,22 +787,99 @@ impl Linker {
         let diag_t0 = aube_util::diag::enabled().then(std::time::Instant::now);
         let realized: &'static str;
         match self.strategy {
-            LinkStrategy::Reflink => {
-                // No small-file copy shortcut: clonefile beats copy even
-                // for sub-16KB files on APFS (measured 0.11ms vs 0.13-0.18ms),
-                // and a clone keeps the store entry's inode independent so
-                // an in-place patch can never write through into the CAS.
-                if let Err(e) = reflink_copy::reflink(&stored.store_path, dst) {
+            // Two reflink strategies share the clonefile attempt and the
+            // macOS small-file copy shortcut, but differ in fallback:
+            //   * `Reflink` (explicit `clone` / `clone-or-copy`) — the
+            //     documented contract is reflink with a plain copy
+            //     fallback, so a clonefile failure degrades straight to
+            //     copy.
+            //   * `ReflinkAuto` (`auto` on a same-FS macOS target) — the
+            //     probe already proved the target shares a mount, so on a
+            //     non-APFS same-FS volume (HFS+, where `clonefile` is
+            //     unsupported but hardlinks are not) it tries a zero-cost
+            //     hardlink before copy.
+            LinkStrategy::Reflink | LinkStrategy::ReflinkAuto => {
+                let auto = matches!(self.strategy, LinkStrategy::ReflinkAuto);
+                #[cfg(target_os = "macos")]
+                if matches!(stored.size, Some(size) if size <= SMALL_FILE_COPY_MAX) {
+                    std::fs::copy(&stored.store_path, dst).map_err(map_io)?;
+                    if let Some(t0) = diag_t0 {
+                        aube_util::diag::event(
+                            aube_util::diag::Category::Linker,
+                            "link_macos_small_copy",
+                            t0.elapsed(),
+                            None,
+                        );
+                    }
+                    return Ok(());
+                }
+                let reflink_result = {
+                    #[cfg(test)]
+                    {
+                        if FORCE_REFLINK_FAILURE.load(std::sync::atomic::Ordering::Relaxed) {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Unsupported,
+                                "forced reflink failure (test)",
+                            ))
+                        } else {
+                            reflink_copy::reflink(&stored.store_path, dst)
+                        }
+                    }
+                    #[cfg(not(test))]
+                    {
+                        reflink_copy::reflink(&stored.store_path, dst)
+                    }
+                };
+                if let Err(e) = reflink_result {
                     // Source-missing short-circuit avoids the misleading
                     // "fell back to copy" trace and the redundant copy
                     // attempt that would just ENOENT for the same reason.
                     if !stored.store_path.exists() {
                         return Err(missing_source());
                     }
-                    // Fall back to copy on cross-filesystem errors
-                    trace!("reflink failed, falling back to copy: {e}");
-                    std::fs::copy(&stored.store_path, dst).map_err(map_io)?;
-                    realized = "reflink_fallback_copy";
+                    // `auto` (ReflinkAuto) is the resolved strategy only
+                    // when the same-FS probe succeeded, so the target is
+                    // known same-filesystem. `reflink_copy::reflink` uses
+                    // `clonefile`, which is APFS-only: on an HFS+ volume it
+                    // fails even though the volume is same-FS and supports
+                    // hardlinks. There, try a hardlink before degrading to
+                    // a full per-file copy — a hardlink is zero-cost and
+                    // preserves the dedupe the probe promised, where copy
+                    // silently regresses to a byte transfer per file.
+                    // Explicit `clone` / `clone-or-copy` (Reflink) keep
+                    // their documented copy fallback and skip this step.
+                    //
+                    // Surface the hardlink attempt's OWN error in the copy
+                    // trace: if the auto hardlink itself fails (a cross-mount
+                    // edge the probe missed, a transient permission error), it
+                    // — not the original reflink error — is the proximate
+                    // cause of the copy, so reporting only `e` would point at
+                    // the wrong failure.
+                    let hardlinked = if auto {
+                        match std::fs::hard_link(&stored.store_path, dst) {
+                            Ok(()) => {
+                                trace!("reflink failed, fell back to hardlink: {e}");
+                                true
+                            }
+                            Err(he) => {
+                                trace!(
+                                    "reflink failed ({e}); hardlink fallback also failed ({he}); falling back to copy"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if hardlinked {
+                        realized = "reflink_fallback_hardlink";
+                    } else {
+                        if !auto {
+                            trace!("reflink failed, falling back to copy: {e}");
+                        }
+                        std::fs::copy(&stored.store_path, dst).map_err(map_io)?;
+                        realized = "reflink_fallback_copy";
+                    }
                 } else {
                     realized = "reflink";
                 }
@@ -705,6 +908,7 @@ impl Linker {
             // O(1) and the static `&str` keeps the JSONL category compact.
             let name = match realized {
                 "reflink" => "link_reflink",
+                "reflink_fallback_hardlink" => "link_reflink_fallback_hardlink",
                 "reflink_fallback_copy" => "link_reflink_fallback",
                 "hardlink" => "link_hardlink",
                 "hardlink_fallback_copy" => "link_hardlink_fallback",

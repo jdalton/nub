@@ -9,7 +9,7 @@ CLI flags. Existing `pnpm-workspace.yaml` files are migration inputs.
 | Area | Default | Why it matters |
 | --- | --- | --- |
 | Linker | `nodeLinker=isolated` | Keeps transitive dependencies scoped to the packages that declared them. |
-| Package imports | `packageImportMethod=auto` | Hardlinks files from the store, falling back to copy on cross-filesystem boundaries. Opt into reflink with `clone` or `clone-or-copy`. |
+| Package imports | `packageImportMethod=auto` | Links files from the store with the faster same-filesystem primitive per platform — reflink (clonefile) on macOS, hardlink on Linux and elsewhere — falling back to copy on cross-filesystem boundaries. Set `clone` or `clone-or-copy` to attempt reflink first, still falling back to copy when reflink is unavailable. |
 | New releases | `minimumReleaseAge=1440` | Avoids installing versions published in the last 24 hours by default. |
 | Exotic transitive deps | `blockExoticSubdeps=true` | Blocks transitive git and tarball dependencies unless you opt out. |
 | Dependency scripts | approval required | Build scripts in dependencies stay skipped until approved. |
@@ -37,6 +37,30 @@ the same value. Aube-only and pnpm-only settings land in
 warnings from sibling tools.
 
 [settings-toml]: https://github.com/jdx/aube/blob/main/crates/aube-settings/settings.toml
+
+## Managed hardening config
+
+System administrators can enforce security settings with
+`/etc/aube/managed.toml`. Managed config is not normal precedence: aube first
+resolves CLI, env, project, workspace, and user config, then applies managed
+policy as a final hardening pass. Local config, env vars, and CLI flags can
+make managed settings stricter, but cannot weaken them.
+
+For tests and non-root deployments, `AUBE_MANAGED_CONFIG_PATH` points at an
+additional managed TOML file. It is additive with `/etc/aube/managed.toml`: when
+both files set the same managed setting, aube keeps the stricter value.
+
+The [settings reference](/settings/) is generated from the settings registry
+and marks every enforceable setting with `Managed policy`. The policy names
+describe how multiple managed files and local config combine:
+
+- `max`: the largest integer wins.
+- `trueWins`: `true` wins over `false`.
+- `falseWins`: `false` wins over `true`.
+- `ranked:a<b<c`: later ranked values are stricter.
+- `managedWins`: the managed value replaces the local value; when multiple
+  managed files set a list, aube keeps only entries present in every managed
+  file.
 
 ## .npmrc
 

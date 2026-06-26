@@ -46,6 +46,7 @@ pub(super) struct LockfileOnlyInput<'a> {
     pub ws_config: &'a aube_manifest::workspace::WorkspaceConfig,
     pub workspace_catalogs: &'a crate::commands::CatalogMap,
     pub settings_ctx: &'a aube_settings::ResolveCtx<'a>,
+    pub dependency_policy: &'a aube_resolver::DependencyPolicy,
     pub lockfile_pre_parse: Option<&'a (LockfileGraph, LockfileKind)>,
     pub lockfile_conflict_marker_warning_emitted: bool,
     pub existing_for_resolver: Option<&'a LockfileGraph>,
@@ -62,6 +63,7 @@ pub(super) struct LockfileOnlyInput<'a> {
     pub minimum_release_age_override: Option<u64>,
     pub ws_package_versions: &'a HashMap<String, String>,
     pub ignore_scripts: bool,
+    pub write_lockfile: bool,
     pub prog_ref: Option<&'a InstallProgress>,
 }
 
@@ -77,6 +79,7 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
         ws_config,
         workspace_catalogs,
         settings_ctx,
+        dependency_policy,
         lockfile_pre_parse,
         lockfile_conflict_marker_warning_emitted,
         existing_for_resolver,
@@ -93,6 +96,7 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
         minimum_release_age_override,
         ws_package_versions,
         ignore_scripts,
+        write_lockfile,
         prog_ref,
     } = input;
 
@@ -188,6 +192,12 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
         if let Some(p) = prog_ref {
             p.finish(true);
         }
+        if !write_lockfile {
+            eprintln!(
+                "Dry run: lockfile is up to date; fetch/link steps were not run and node_modules were not modified"
+            );
+            return Ok(());
+        }
         eprintln!("Lockfile is up to date, resolution step is skipped");
         return Ok(());
     }
@@ -235,6 +245,7 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
                 source_kind_before
                     .unwrap_or_else(|| crate::commands::default_lockfile_kind(settings_ctx))
             }),
+            dependency_policy: Some(dependency_policy.clone()),
             cache_full_packuments: true,
             ignore_scripts,
         },
@@ -311,6 +322,16 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
     // (`optional: true`, `transitivePeerDependencies`) so `--lockfile-only`
     // output stays byte-identical to a regular install.
     crate::commands::prepare_resolved_graph_for_lockfile_write(&mut graph);
+    if !write_lockfile {
+        if let Some(p) = prog_ref {
+            p.finish(true);
+        }
+        eprintln!(
+            "Dry run: resolved {} package(s); lockfile and node_modules were not modified",
+            graph.packages.len()
+        );
+        return Ok(());
+    }
     // Same `time:`-persistence gate as the regular install write path:
     // pnpm writes a top-level `time:` block only under time-based mode,
     // so a Highest-mode `--lockfile-only` run stays `time:`-free even

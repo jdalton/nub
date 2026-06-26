@@ -38,6 +38,7 @@ fn ctx<'a>(
     embedder: &'a [(String, String)],
 ) -> ResolveCtx<'a> {
     ResolveCtx {
+        managed_aube_config: &[],
         project_aube_config: &[],
         project_npmrc: npmrc,
         user_aube_config: &[],

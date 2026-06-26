@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.25.1](https://github.com/jdx/aube/compare/v1.25.0...v1.25.1) - 2026-06-25
+
+### Other
+
+- refresh benchmarks for v1.25.0 ([#947](https://github.com/jdx/aube/pull/947))
+
+## [1.25.0](https://github.com/jdx/aube/compare/v1.24.0...v1.25.0) - 2026-06-25
+
+### Added
+
+- *(runtime)* add shell-activated tool shims ([#945](https://github.com/jdx/aube/pull/945))
+- *(resolver)* support globs and version unions in minimumReleaseAgeExclude ([#941](https://github.com/jdx/aube/pull/941))
+
+### Fixed
+
+- *(install)* preserve npm optional natives ([#942](https://github.com/jdx/aube/pull/942))
+- *(install)* move computed-integrity tests to end of module ([#940](https://github.com/jdx/aube/pull/940))
+
+### Other
+
+- refresh benchmarks for v1.24.0 ([#937](https://github.com/jdx/aube/pull/937))
+
+## [1.24.0](https://github.com/jdx/aube/compare/v1.23.0...v1.24.0) - 2026-06-23
+
+### Added
+
+- *(config)* add managed hardening config ([#935](https://github.com/jdx/aube/pull/935))
+- *(sbom)* exclude peer-only components ([#934](https://github.com/jdx/aube/pull/934))
+- *(install)* add dry-run resolution preview ([#927](https://github.com/jdx/aube/pull/927))
+- *(sbom)* mark dev-only CycloneDX components ([#926](https://github.com/jdx/aube/pull/926))
+- *(view)* infer package name from manifest ([#925](https://github.com/jdx/aube/pull/925))
+
+### Fixed
+
+- *(install)* persist computed tarball integrity ([#933](https://github.com/jdx/aube/pull/933))
+- *(run)* honor recursive no-bail exits ([#928](https://github.com/jdx/aube/pull/928))
+- *(install)* validate trust policy on lockfile reuse ([#929](https://github.com/jdx/aube/pull/929))
+- *(add)* check exact pins with versioned OSV gate ([#923](https://github.com/jdx/aube/pull/923))
+
+### Other
+
+- refresh benchmarks for v1.23.0 ([#922](https://github.com/jdx/aube/pull/922))
+
 ## [1.23.0](https://github.com/jdx/aube/compare/v1.22.0...v1.23.0) - 2026-06-21
 
 ### Fixed

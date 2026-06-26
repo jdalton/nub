@@ -23,6 +23,7 @@ use crate::local_source::{
     dep_path_for, is_non_registry_specifier, read_local_manifest, rebase_local,
     resolve_exec_manifest, resolve_git_source, resolve_remote_tarball, should_block_exotic_subdep,
 };
+use crate::locked_index::LockedIndex;
 use crate::package_ext::{
     apply_package_extensions, apply_package_extensions_to_deps, pick_override_spec,
 };
@@ -34,9 +35,7 @@ use crate::{
     Error, ExoticSubdepDetails, FxHashMap, FxHashSet, ResolutionMode, ResolveTask, ResolvedPackage,
     Resolver, error, is_deprecation_allowed, is_supported,
 };
-use aube_lockfile::{
-    DepType, DirectDep, LocalSource, LockedPackage, LockfileGraph, git_commits_match,
-};
+use aube_lockfile::{DepType, DirectDep, LocalSource, LockedPackage, LockfileGraph};
 use aube_manifest::PackageJson;
 use aube_util::adaptive::{AdaptiveLimit, PersistentState};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -53,6 +52,13 @@ pub(crate) struct ResolveDriver<'a> {
     /// path never burn a tokio spawn. Strictly an optimization — the
     /// wait-for-fetch loop calls `ensure_fetch` unconditionally.
     existing_names: FxHashSet<&'a str>,
+    /// By-name index over `existing`'s packages. Collapses the three
+    /// per-task `existing.packages.values().find(..)` scans (lockfile
+    /// reuse, the `locked_version` hint, local-source integrity) from
+    /// `O(lockfile)` to a single name-bucket lookup. Buckets preserve
+    /// `BTreeMap::values()` order so the first match is identical to
+    /// what a linear scan returns. Empty when `existing` is `None`.
+    locked_index: LockedIndex<'a>,
     /// Per-importer set of declared dep names (`dependencies` ∪
     /// `devDependencies` ∪ `optionalDependencies` ∪ synthesized
     /// non-optional `peerDependencies`). Consulted by the peer-dep
@@ -105,6 +111,13 @@ pub(crate) struct ResolveDriver<'a> {
     /// from `minimum_release_age` for supply-chain mitigation;
     /// extended by the TimeBased cutoff once wave 0 resolves.
     published_by: Option<String>,
+    /// The TimeBased-resolution component of the cutoff, kept separate
+    /// from the merged `published_by`. `None` until wave 0 fires the
+    /// time-based wall (and stays `None` when time-based mode is off).
+    /// Acts as a hard floor that even `minimumReleaseAgeExclude`-exempt
+    /// versions must clear — the exclude relaxes only the
+    /// minimumReleaseAge age-gate, never the time-based wall.
+    time_cutoff: Option<String>,
     /// Direct deps still awaiting a terminal outcome (resolved,
     /// dropped, or filtered). Drops to zero once wave 0 completes and
     /// triggers the TimeBased cutoff computation.
@@ -217,12 +230,14 @@ impl<'a> ResolveDriver<'a> {
         let existing_names: FxHashSet<&'a str> = existing
             .map(|g| g.packages.values().map(|p| p.name.as_str()).collect())
             .unwrap_or_default();
+        let locked_index = LockedIndex::new(existing);
 
         Self {
             resolver,
             existing,
             workspace_packages,
             existing_names,
+            locked_index,
             importer_declared_dep_names,
             resolved: BTreeMap::new(),
             resolved_versions: FxHashMap::with_capacity_and_hasher(1024, Default::default()),
@@ -235,6 +250,7 @@ impl<'a> ResolveDriver<'a> {
             catalog_picks: BTreeMap::new(),
             deferred_transitives: Vec::new(),
             published_by,
+            time_cutoff: None,
             direct_deps_pending,
             cutoff_pending,
             needs_time,
@@ -366,6 +382,7 @@ impl<'a> ResolveDriver<'a> {
                 }
                 if let Some(m) = max_time {
                     tracing::debug!("time-based resolution cutoff: {}", m);
+                    self.time_cutoff = Some(m.clone());
                     self.published_by = Some(match self.published_by.take() {
                         Some(existing) if existing.as_str() < m.as_str() => existing,
                         _ => m.clone(),
@@ -599,45 +616,34 @@ impl<'a> ResolveDriver<'a> {
         // cache. `registry_name()` is the cache key for
         // aliased tasks (cache is populated under the real
         // registry name), so use the same accessor here.
-        // Find locked version
-        let locked_version = self.existing.and_then(|g| {
-            g.packages
-                .values()
-                .find(|p| p.name == task.name && version_satisfies(&p.version, &task.range))
-                .map(|p| p.version.as_str())
-                .filter(|v| {
-                    !is_vulnerable(task.registry_name(), v, &self.resolver.vulnerable_ranges)
-                })
-        });
+        // Find locked version. The vulnerability check is a *post*
+        // filter on the single name+range match (a vulnerable match is
+        // dropped, not skipped past), so look up the first in-range
+        // candidate and apply `.filter(..)` to it.
+        let locked_version = self
+            .locked_index
+            .find_first_in_range(&task.name, &task.range)
+            .map(|p| p.version.as_str())
+            .filter(|v| !is_vulnerable(task.registry_name(), v, &self.resolver.vulnerable_ranges));
 
         // Direct deps in time-based mode pick the lowest
         // satisfying version; everything else (transitives,
         // and all picks in Highest mode) picks highest.
         let pick_lowest =
             self.resolver.resolution_mode == ResolutionMode::TimeBased && task.is_root;
-        // Apply the cutoff unless this package is on the
-        // minimumReleaseAge exclude list. A *name-only* exclude entry
-        // (`lodash`) suppresses the cutoff for the whole package — and
-        // because we collapse the minimumReleaseAge and time-based-mode
-        // legs into the same `published_by` string here, that also drops
-        // the time-based leg (acceptable: the two aren't expected to
-        // coexist in the wild). A *version-pinned* entry
-        // (`axios@0.18.1 || 0.21.1`) can't be decided before the version
-        // is picked, so the cutoff stays active and the per-version
-        // exemption is threaded into `pick_version` via `age_exclude`
-        // below, where it bypasses the gate only for the listed versions.
-        let mra = self.resolver.minimum_release_age.as_ref();
-        let cutoff_for_pkg = match mra {
-            Some(m) if m.excludes_all_versions(&task.name) => None,
-            _ => self.published_by.as_deref(),
-        };
-        // Only pass the rules to the pick when this package actually has
-        // a version-pinned rule, so the common (no-exclude) path skips
-        // the per-candidate parse+match entirely.
-        let age_exclude = mra.and_then(|m| {
-            m.has_versioned_exclude(&task.name)
-                .then_some((&m.exclude, task.name.as_str()))
-        });
+        // `minimumReleaseAgeExclude` is applied per-candidate-version
+        // inside `pick_version` via the `is_age_exempt` closure below. A
+        // name-only exclude rule matches every version; a `pkg@1.2.3`
+        // rule waves only those versions. The exclude relaxes ONLY the
+        // minimumReleaseAge age-gate — never the time-based hard wall —
+        // so exempt versions are still checked against `exempt_cutoff`
+        // (the time-based component alone) instead of being fully waved
+        // through. Non-exempt versions are checked against the merged
+        // `cutoff_for_pkg` = min(minimumReleaseAge, time-based). When
+        // time-based mode is off, `exempt_cutoff` is `None`, so exempt
+        // versions bypass the cutoff entirely (the prior behavior).
+        let cutoff_for_pkg = self.published_by.as_deref();
+        let exempt_cutoff = self.time_cutoff.as_deref();
         // Strict semantics in two cases:
         //   - `minimumReleaseAgeStrict=true` (the user opted in
         //     to hard failures), or
@@ -652,6 +658,28 @@ impl<'a> ResolveDriver<'a> {
             None => true,
         };
         let registry_name = task.registry_name().to_string();
+        // `minimumReleaseAgeExclude` exemption, shared by the version
+        // pick and the vulnerability re-pick below. Matches against the
+        // registry name (not `task.name`, the user-facing alias) so an
+        // `npm:real-pkg`-aliased dep is exempted by its real name — the
+        // same identity the age/publish-time data and the trust-policy
+        // sibling (`check_no_downgrade`) key on. Reuses an already-parsed
+        // version when the caller has one, falling back to a name-only
+        // match for unparseable versions.
+        let mra_exclude = self
+            .resolver
+            .minimum_release_age
+            .as_ref()
+            .map(|m| &m.exclude);
+        let is_age_exempt = |ver: &str, parsed: Option<&node_semver::Version>| {
+            mra_exclude.is_some_and(|ex| match parsed {
+                Some(v) => ex.matches(&registry_name, v),
+                None => match node_semver::Version::parse(ver) {
+                    Ok(v) => ex.matches(&registry_name, &v),
+                    Err(_) => ex.matches_name_only(&registry_name),
+                },
+            })
+        };
         let selected_pick = loop {
             let packument = self.resolver.cache.get(&registry_name).ok_or_else(|| {
                 Error::Registry(registry_name.clone(), "packument not in cache".to_string())
@@ -662,8 +690,9 @@ impl<'a> ResolveDriver<'a> {
                 locked_version,
                 pick_lowest,
                 cutoff_for_pkg,
+                exempt_cutoff,
                 strict,
-                age_exclude,
+                is_age_exempt,
             );
             match pick {
                 // A primer-seeded pick that satisfies the range still
@@ -859,7 +888,9 @@ impl<'a> ResolveDriver<'a> {
             &selected_pick,
             pick_lowest,
             cutoff_for_pkg,
+            exempt_cutoff,
             &self.resolver.vulnerable_ranges,
+            is_age_exempt,
         );
         // Trust-policy enforcement runs *before* any other
         // post-pick processing (mirrors pnpm's placement
@@ -1304,9 +1335,12 @@ impl<'a> ResolveDriver<'a> {
         // Compute the child ancestor chain once — the same
         // frame (this package's name + resolved version)
         // applies to every dep / optionalDep / peer we enqueue
-        // below.
-        let mut child_ancestors = task.ancestors.clone();
+        // below. Build it as a `Vec` (one allocation per package),
+        // then freeze to an `Arc<[_]>` so each per-dep enqueue below
+        // is a refcount bump rather than a deep clone of the chain.
+        let mut child_ancestors = task.ancestors.to_vec();
         child_ancestors.push((task.name.clone(), version.clone()));
+        let child_ancestors: Arc<[(String, String)]> = child_ancestors.into();
 
         for (dep_name, dep_range) in &version_meta.dependencies {
             if bundled_names.contains(dep_name) {
@@ -1520,7 +1554,7 @@ impl<'a> ResolveDriver<'a> {
                     .parent
                     .clone()
                     .unwrap_or_else(|| "<unknown>".to_string()),
-                ancestors: task.ancestors.clone(),
+                ancestors: task.ancestors.to_vec(),
                 importer: task.importer.clone(),
             })));
         }
@@ -1603,12 +1637,8 @@ impl<'a> ResolveDriver<'a> {
                         )
                     })?;
             let integrity = integrity.or_else(|| {
-                existing_local_source_integrity(
-                    self.existing,
-                    &task.name,
-                    &version,
-                    &resolved_local,
-                )
+                self.locked_index
+                    .find_local_source_integrity(&task.name, &version, &resolved_local)
             });
             (resolved_local, version, deps, integrity)
         } else if let LocalSource::RemoteTarball(ref t) = raw_local {
@@ -1760,8 +1790,9 @@ impl<'a> ResolveDriver<'a> {
             // (directories, tarballs, portals, and exec outputs —
             // `link:` deps are fully the target's responsibility).
             if !matches!(local, LocalSource::Link(_)) {
-                let mut child_ancestors = task.ancestors.clone();
+                let mut child_ancestors = task.ancestors.to_vec();
                 child_ancestors.push((linked_name.clone(), real_version.clone()));
+                let child_ancestors: Arc<[(String, String)]> = child_ancestors.into();
                 for (child_name, child_range) in target_deps {
                     self.queue.push_back(ResolveTask::transitive(
                         child_name,
@@ -2058,17 +2089,12 @@ impl<'a> ResolveDriver<'a> {
     /// Returns true when a lockfile entry handled the task (whether
     /// fully resolved or dropped as a platform-mismatched optional).
     async fn try_lockfile_reuse(&mut self, task: &ResolveTask) -> bool {
-        let Some(locked_pkg) = self.existing.and_then(|g| {
-            g.packages.values().find(|p| {
-                p.name == task.name
-                    && version_satisfies(&p.version, &task.range)
-                    && !is_vulnerable(
-                        task.registry_name(),
-                        &p.version,
-                        &self.resolver.vulnerable_ranges,
-                    )
-            })
-        }) else {
+        let Some(locked_pkg) = self.locked_index.find_satisfying(
+            &task.name,
+            &task.range,
+            task.registry_name(),
+            &self.resolver.vulnerable_ranges,
+        ) else {
             return false;
         };
         // Drop optional deps whose platform constraints don't match
@@ -2231,8 +2257,9 @@ impl<'a> ResolveDriver<'a> {
             // `"is-number@6.0.0"`, which doesn't parse as semver. The
             // lockfile already omitted bundled dep edges on write, so
             // iterating `locked_pkg.dependencies` naturally skips them.
-            let mut child_ancestors = task.ancestors.clone();
+            let mut child_ancestors = task.ancestors.to_vec();
             child_ancestors.push((task.name.clone(), version.clone()));
+            let child_ancestors: Arc<[(String, String)]> = child_ancestors.into();
             for (dep_name, dep_version) in &locked_pkg.dependencies {
                 let prefix = format!("{dep_name}@");
                 let stripped = dep_version.strip_prefix(&prefix).unwrap_or(dep_version);
@@ -2283,38 +2310,6 @@ impl<'a> ResolveDriver<'a> {
     }
 }
 
-fn existing_local_source_integrity(
-    existing: Option<&LockfileGraph>,
-    name: &str,
-    version: &str,
-    local: &LocalSource,
-) -> Option<String> {
-    existing
-        .and_then(|g| {
-            g.packages.values().find(|pkg| {
-                pkg.name == name
-                    && pkg.local_source.as_ref().is_some_and(|old| {
-                        local_sources_match_for_integrity(old, local)
-                            && (pkg.version == version
-                                || matches!(
-                                    (old, local),
-                                    (LocalSource::Git(_), LocalSource::Git(_))
-                                ) && pkg.version == "0.0.0")
-                    })
-            })
-        })
-        .and_then(|pkg| pkg.integrity.clone())
-}
-
-fn local_sources_match_for_integrity(old: &LocalSource, new: &LocalSource) -> bool {
-    match (old, new) {
-        (LocalSource::Git(old), LocalSource::Git(new)) => {
-            git_commits_match(&old.resolved, &new.resolved) && old.subpath == new.subpath
-        }
-        _ => old == new,
-    }
-}
-
 fn attach_integrity_to_git_source(local: &mut LocalSource, integrity: Option<&str>) {
     if let LocalSource::Git(git) = local
         && git.integrity.is_none()
@@ -2326,124 +2321,7 @@ fn attach_integrity_to_git_source(local: &mut LocalSource, integrity: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aube_lockfile::{GitSource, LockedPackage};
-
-    #[test]
-    fn existing_local_source_integrity_matches_resolved_git_commit() {
-        let source = LocalSource::Git(GitSource {
-            url: "git+https://github.com/acme/dep.git".to_string(),
-            committish: Some("main".to_string()),
-            resolved: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
-            integrity: None,
-            subpath: None,
-        });
-        let graph = LockfileGraph {
-            packages: BTreeMap::from([(
-                "dep@git+https://github.com/acme/dep.git#abcdef0123456789abcdef0123456789abcdef01"
-                    .to_string(),
-                LockedPackage {
-                    name: "dep".to_string(),
-                    version: "1.0.0".to_string(),
-                    integrity: Some("sha512-old".to_string()),
-                    local_source: Some(source.clone()),
-                    ..Default::default()
-                },
-            )]),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            existing_local_source_integrity(Some(&graph), "dep", "1.0.0", &source).as_deref(),
-            Some("sha512-old")
-        );
-
-        let changed_commit = LocalSource::Git(GitSource {
-            resolved: "1111111111111111111111111111111111111111".to_string(),
-            ..match source {
-                LocalSource::Git(g) => g,
-                _ => unreachable!(),
-            }
-        });
-        assert!(
-            existing_local_source_integrity(Some(&graph), "dep", "1.0.0", &changed_commit)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn existing_local_source_integrity_matches_git_by_resolved_commit() {
-        let old_source = LocalSource::Git(GitSource {
-            url: "git+ssh://git@github.com/acme/dep.git".to_string(),
-            committish: None,
-            resolved: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
-            integrity: None,
-            subpath: Some("packages/dep".to_string()),
-        });
-        let graph = LockfileGraph {
-            packages: BTreeMap::from([(
-                "dep@git+ssh://git@github.com/acme/dep.git#abcdef0123456789abcdef0123456789abcdef01"
-                    .to_string(),
-                LockedPackage {
-                    name: "dep".to_string(),
-                    version: "1.0.0".to_string(),
-                    integrity: Some("sha512-old".to_string()),
-                    local_source: Some(old_source),
-                    ..Default::default()
-                },
-            )]),
-            ..Default::default()
-        };
-        let resolved_source = LocalSource::Git(GitSource {
-            url: "https://github.com/acme/dep.git".to_string(),
-            committish: Some("main".to_string()),
-            resolved: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
-            integrity: None,
-            subpath: Some("packages/dep".to_string()),
-        });
-
-        assert_eq!(
-            existing_local_source_integrity(Some(&graph), "dep", "1.0.0", &resolved_source)
-                .as_deref(),
-            Some("sha512-old")
-        );
-    }
-
-    #[test]
-    fn existing_local_source_integrity_matches_git_abbrev_and_placeholder_version() {
-        let old_source = LocalSource::Git(GitSource {
-            url: "git+ssh://git@github.com/acme/dep.git".to_string(),
-            committish: None,
-            resolved: "abcdef0".to_string(),
-            integrity: None,
-            subpath: None,
-        });
-        let graph = LockfileGraph {
-            packages: BTreeMap::from([(
-                "dep@git+ssh://git@github.com/acme/dep.git#abcdef0".to_string(),
-                LockedPackage {
-                    name: "dep".to_string(),
-                    version: "0.0.0".to_string(),
-                    integrity: Some("sha512-old".to_string()),
-                    local_source: Some(old_source),
-                    ..Default::default()
-                },
-            )]),
-            ..Default::default()
-        };
-        let resolved_source = LocalSource::Git(GitSource {
-            url: "https://github.com/acme/dep.git".to_string(),
-            committish: Some("main".to_string()),
-            resolved: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
-            integrity: None,
-            subpath: None,
-        });
-
-        assert_eq!(
-            existing_local_source_integrity(Some(&graph), "dep", "1.0.0", &resolved_source)
-                .as_deref(),
-            Some("sha512-old")
-        );
-    }
+    use aube_lockfile::GitSource;
 
     #[test]
     fn attach_integrity_to_git_source_fills_missing_git_integrity() {

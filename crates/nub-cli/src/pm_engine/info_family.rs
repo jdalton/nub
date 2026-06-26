@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(query.args.selector, ":deprecated");
 
         let view: ViewCli = parse(&["nub", "react@next", "dist.tarball"]);
-        assert_eq!(view.args.package, "react@next");
+        assert_eq!(view.args.package.as_deref(), Some("react@next"));
         assert_eq!(view.args.field.as_deref(), Some("dist.tarball"));
 
         let check: CheckCli = parse(&["nub", "--json"]);

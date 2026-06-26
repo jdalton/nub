@@ -3,6 +3,13 @@ mod catalog;
 mod direct_dep_info;
 mod error;
 mod local_source;
+// `locked_index` is an internal lockfile-reuse index. It is only `pub` under
+// the `bench` feature so the `locked_lookup` bench can reach `LockedIndex`;
+// the default build keeps it `pub(crate)`, off the public surface.
+#[cfg(feature = "bench")]
+pub mod locked_index;
+#[cfg(not(feature = "bench"))]
+pub(crate) mod locked_index;
 pub mod override_rule;
 mod package_ext;
 mod peer_context;
@@ -23,8 +30,11 @@ pub use peer_context::{
 };
 pub use platform::{SupportedArchitectures, is_supported};
 pub use primer::{PruneStats as PrimerPruneStats, prune_cache as prune_primer_cache};
-pub use trust::{MissingTimeDetails as MissingTrustTimeDetails, TrustDowngradeDetails};
-pub use trust::{TrustEvidence, TrustExcludeParseError, TrustExcludeRules};
+pub use trust::{
+    MissingTimeDetails as MissingTrustTimeDetails, TrustCheckError, TrustDowngradeDetails,
+    check_no_downgrade,
+};
+pub use trust::{PackageVersionPolicy, TrustEvidence, TrustExcludeParseError, TrustExcludeRules};
 pub use types::{
     DependencyPolicy, MinimumReleaseAge, PackageExtension, ReadPackageHook, ResolutionMode,
     ResolvedPackage, TrustPolicy,
@@ -263,7 +273,14 @@ pub(crate) struct ResolveTask {
     /// selectors. Empty for root/importer deps. Each child-enqueue
     /// site is responsible for extending its parent's chain with the
     /// parent's own `(name, version)` frame.
-    pub(crate) ancestors: Vec<(String, String)>,
+    ///
+    /// `Arc<[_]>` rather than `Vec` because the chain is immutable once
+    /// built and is shared, unmodified, by every dependency a package
+    /// enqueues: the child chain is materialized into a `Vec` once per
+    /// package, frozen here, and each per-dep enqueue is then a refcount
+    /// bump instead of a full deep clone (clone cost scaled with graph
+    /// edges × depth before this).
+    pub(crate) ancestors: Arc<[(String, String)]>,
     /// `true` when an override rewrote `range` to a `link:`/`file:`
     /// path. Override paths are anchored at the project root (where the
     /// override is declared), not at the consuming workspace package or
@@ -298,7 +315,7 @@ impl ResolveTask {
             importer,
             original_specifier: Some(original),
             real_name: None,
-            ancestors: Vec::new(),
+            ancestors: Arc::from([]),
             range_from_override: false,
         }
     }
@@ -312,7 +329,7 @@ impl ResolveTask {
         dep_type: DepType,
         parent: String,
         importer: String,
-        ancestors: Vec<(String, String)>,
+        ancestors: Arc<[(String, String)]>,
     ) -> Self {
         Self {
             name,

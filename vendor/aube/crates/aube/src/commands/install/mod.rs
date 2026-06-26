@@ -43,7 +43,7 @@ pub use dep_selection::DepSelection;
 pub(super) use fetch::fetch_packages;
 use fetch::{
     fetch_packages_with_root, import_local_source, remap_indices_to_contextualized,
-    version_from_dep_path,
+    strip_peer_context_suffix, version_from_dep_path,
 };
 pub use frozen::{FrozenMode, FrozenOverride, GlobalVirtualStoreFlags};
 pub(crate) use lifecycle::{
@@ -64,11 +64,11 @@ pub(crate) use settings::{ResolverConfigInputs, configure_resolver, finalize_loc
 pub(crate) use side_effects_cache::{SideEffectsCacheConfig, side_effects_cache_root};
 
 use settings::{
-    check_unmet_peers, default_streaming_network_concurrency, maybe_cleanup_unused_catalogs,
-    resolve_git_shallow_hosts, resolve_link_concurrency, resolve_network_concurrency,
-    resolve_side_effects_cache, resolve_side_effects_cache_readonly,
-    resolve_strict_peer_dependencies, resolve_strict_store_pkg_content_check,
-    resolve_verify_store_integrity,
+    check_unmet_peers, default_lockfile_network_concurrency, default_streaming_network_concurrency,
+    maybe_cleanup_unused_catalogs, resolve_dependency_policy, resolve_git_shallow_hosts,
+    resolve_link_concurrency, resolve_network_concurrency, resolve_side_effects_cache,
+    resolve_side_effects_cache_readonly, resolve_strict_peer_dependencies,
+    resolve_strict_store_pkg_content_check, resolve_verify_store_integrity,
 };
 use startup::{
     apply_force_state_reset, merge_branch_lockfiles_if_needed, modules_cache_sweep_is_default,
@@ -147,6 +147,16 @@ pub(crate) fn warm_load_index(
     } else {
         store.load_index(name, version, integrity)
     }
+}
+
+const TRUST_POLICY_VALIDATION_CACHE_DIR: &str = "trust-policy-v1";
+const TRUST_POLICY_VALIDATION_CACHE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct TrustPolicyValidationStamp {
+    key: String,
+    validated_at_secs: u64,
 }
 
 #[derive(Default)]
@@ -229,6 +239,262 @@ impl InstallPhaseTimings {
     }
 }
 
+fn apply_computed_integrities(
+    graph: &mut aube_lockfile::LockfileGraph,
+    computed: &BTreeMap<String, String>,
+) {
+    if computed.is_empty() {
+        return;
+    }
+    for pkg in graph.packages.values_mut() {
+        if pkg.integrity.is_some() || pkg.local_source.is_some() {
+            continue;
+        }
+        let canonical = strip_peer_context_suffix(&pkg.dep_path);
+        if let Some(integrity) = computed.get(canonical) {
+            pkg.integrity = Some(integrity.clone());
+        }
+    }
+}
+
+async fn validate_lockfile_trust_policy(
+    cwd: &std::path::Path,
+    graph: &aube_lockfile::LockfileGraph,
+    network_mode: aube_registry::NetworkMode,
+    policy: &aube_resolver::DependencyPolicy,
+) -> miette::Result<()> {
+    let Some(cache_key) = trust_policy_validation_cache_key(cwd, graph, network_mode, policy)
+    else {
+        return Ok(());
+    };
+    if trust_policy_validation_cache_hit(cwd, &cache_key) {
+        tracing::debug!("trustPolicy=no-downgrade: reused lockfile validation cache");
+        return Ok(());
+    }
+
+    let client = std::sync::Arc::new(make_client(cwd).with_network_mode(network_mode));
+    let full_cache_dir = super::packument_full_cache_dir();
+    let concurrency = default_lockfile_network_concurrency().max(1);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut checks: tokio::task::JoinSet<Result<(), aube_resolver::Error>> =
+        tokio::task::JoinSet::new();
+
+    for dep_path in reachable_package_dep_paths(graph) {
+        let Some(pkg) = graph.packages.get(&dep_path) else {
+            continue;
+        };
+        if pkg.local_source.is_some() {
+            continue;
+        }
+        let name = pkg.registry_name().to_string();
+        let version = pkg.version.clone();
+        if !seen.insert((name.clone(), version.clone())) {
+            continue;
+        }
+
+        let client = client.clone();
+        let full_cache_dir = full_cache_dir.clone();
+        let exclude = policy.trust_policy_exclude.clone();
+        let ignore_after = policy.trust_policy_ignore_after;
+        let semaphore = semaphore.clone();
+        checks.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.map_err(|e| {
+                aube_resolver::Error::Registry(name.clone(), format!("trust check cancelled: {e}"))
+            })?;
+            let packument = client
+                .fetch_packument_with_time_cached(&name, &full_cache_dir)
+                .await
+                .map_err(|e| aube_resolver::Error::Registry(name.clone(), e.to_string()))?;
+            let picked = packument.versions.get(&version).ok_or_else(|| {
+                aube_resolver::Error::Registry(
+                    name.clone(),
+                    format!("registry packument has no metadata for {name}@{version}"),
+                )
+            })?;
+            aube_resolver::check_no_downgrade(&packument, &version, picked, &exclude, ignore_after)
+                .map_err(|e| match e {
+                    aube_resolver::TrustCheckError::Downgrade(d) => {
+                        aube_resolver::Error::TrustDowngrade(Box::new(d))
+                    }
+                    aube_resolver::TrustCheckError::MissingTime(d) => {
+                        aube_resolver::Error::TrustCheckMissingTime(Box::new(d))
+                    }
+                })
+        });
+    }
+
+    while let Some(result) = checks.join_next().await {
+        let result = result.map_err(|e| miette!("trust-policy validation task failed: {e}"))?;
+        result.map_err(miette::Report::new)?;
+    }
+
+    record_lockfile_trust_policy_validation(cwd, &cache_key);
+    Ok(())
+}
+
+fn trust_policy_validation_cache_key(
+    cwd: &std::path::Path,
+    graph: &aube_lockfile::LockfileGraph,
+    network_mode: aube_registry::NetworkMode,
+    policy: &aube_resolver::DependencyPolicy,
+) -> Option<String> {
+    if policy.trust_policy != aube_resolver::TrustPolicy::NoDowngrade
+        || matches!(network_mode, aube_registry::NetworkMode::Offline)
+    {
+        return None;
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aube:trust-policy-validation:v1\0");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(b"\0network=");
+    hasher.update(format!("{network_mode:?}").as_bytes());
+    hasher.update(b"\0ignore_after=");
+    hasher.update(format!("{:?}", policy.trust_policy_ignore_after).as_bytes());
+    hasher.update(b"\0exclude=");
+    hasher.update(format!("{:?}", policy.trust_policy_exclude).as_bytes());
+
+    let config = super::load_npm_config(cwd);
+    hasher.update(b"\0registry=");
+    hasher.update(config.registry.as_bytes());
+    hasher.update(b"\0scoped_registries=");
+    for (scope, url) in config.scoped_registries {
+        hasher.update(scope.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(url.as_bytes());
+        hasher.update(b"\x1e");
+    }
+
+    for dep_path in reachable_package_dep_paths(graph) {
+        let Some(pkg) = graph.packages.get(&dep_path) else {
+            continue;
+        };
+        if pkg.local_source.is_some() {
+            continue;
+        }
+        hasher.update(b"\0pkg=");
+        hasher.update(dep_path.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(pkg.name.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(pkg.registry_name().as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(pkg.version.as_bytes());
+        hasher.update(b"\x1f");
+        if let Some(alias_of) = &pkg.alias_of {
+            hasher.update(alias_of.as_bytes());
+        }
+        hasher.update(b"\x1f");
+        if let Some(integrity) = &pkg.integrity {
+            hasher.update(integrity.as_bytes());
+        }
+        hasher.update(b"\x1f");
+        if let Some(tarball_url) = &pkg.tarball_url {
+            hasher.update(tarball_url.as_bytes());
+        }
+    }
+
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+fn trust_policy_validation_cache_path(cwd: &std::path::Path, key: &str) -> std::path::PathBuf {
+    super::resolved_cache_dir(cwd)
+        .join(TRUST_POLICY_VALIDATION_CACHE_DIR)
+        .join(format!("{key}.json"))
+}
+
+fn trust_policy_validation_cache_hit(cwd: &std::path::Path, key: &str) -> bool {
+    let path = trust_policy_validation_cache_path(cwd, key);
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(stamp) = serde_json::from_slice::<TrustPolicyValidationStamp>(&bytes) else {
+        return false;
+    };
+    if stamp.key != key {
+        return false;
+    }
+    let Some(now) = unix_time_secs() else {
+        return false;
+    };
+    let Some(age_secs) = now.checked_sub(stamp.validated_at_secs) else {
+        return false;
+    };
+    age_secs <= TRUST_POLICY_VALIDATION_CACHE_TTL.as_secs()
+}
+
+fn record_lockfile_trust_policy_validation(cwd: &std::path::Path, cache_key: &str) {
+    let Some(validated_at_secs) = unix_time_secs() else {
+        return;
+    };
+    let stamp = TrustPolicyValidationStamp {
+        key: cache_key.to_string(),
+        validated_at_secs,
+    };
+    let Ok(bytes) = serde_json::to_vec(&stamp) else {
+        return;
+    };
+    let path = trust_policy_validation_cache_path(cwd, cache_key);
+    if let Err(e) = aube_util::fs_atomic::atomic_write(&path, &bytes) {
+        tracing::debug!("failed to write trust-policy validation cache: {e}");
+    }
+}
+
+fn maybe_record_lockfile_trust_policy_validation(
+    cwd: &std::path::Path,
+    graph: &aube_lockfile::LockfileGraph,
+    network_mode: aube_registry::NetworkMode,
+    policy: &aube_resolver::DependencyPolicy,
+) {
+    if let Some(cache_key) = trust_policy_validation_cache_key(cwd, graph, network_mode, policy) {
+        record_lockfile_trust_policy_validation(cwd, &cache_key);
+    }
+}
+
+fn can_seed_trust_policy_validation_from_resolve(
+    lockfile_enabled: bool,
+    had_existing_lockfile_for_resolver: bool,
+) -> bool {
+    lockfile_enabled && !had_existing_lockfile_for_resolver
+}
+
+fn unix_time_secs() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+fn reachable_package_dep_paths(
+    graph: &aube_lockfile::LockfileGraph,
+) -> std::collections::BTreeSet<String> {
+    let mut reachable = std::collections::BTreeSet::new();
+    let mut stack = graph
+        .importers
+        .values()
+        .flat_map(|deps| deps.iter().map(|dep| dep.dep_path.clone()))
+        .collect::<Vec<_>>();
+
+    while let Some(dep_path) = stack.pop() {
+        if !reachable.insert(dep_path.clone()) {
+            continue;
+        }
+        let Some(pkg) = graph.packages.get(&dep_path) else {
+            continue;
+        };
+        for (name, tail) in &pkg.dependencies {
+            if let Some(child) =
+                aube_lockfile::resolve_dep_edge(name, tail, |k| graph.packages.contains_key(k))
+            {
+                stack.push(child);
+            }
+        }
+    }
+
+    reachable
+}
+
 pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     let mode = opts.mode;
     let cwd = resolve_project_cwd(&opts)?;
@@ -239,8 +505,12 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     aube_util::diag::instant(aube_util::diag::Category::Install, "begin", None);
     let _diag_install = aube_util::diag::Span::new(aube_util::diag::Category::Install, "total");
 
-    apply_force_state_reset(&cwd, &opts)?;
-    if try_install_fast_path(&cwd, &opts, mode, modules_cache_sweep_is_default(&cwd)) {
+    if !opts.dry_run {
+        apply_force_state_reset(&cwd, &opts)?;
+    }
+    if !opts.dry_run
+        && try_install_fast_path(&cwd, &opts, mode, modules_cache_sweep_is_default(&cwd))
+    {
         return Ok(());
     }
 
@@ -274,6 +544,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // order.
     let workspace_catalogs = super::discover_catalogs(&cwd)?;
     let settings_ctx = files.ctx(&raw_workspace, &opts.env_snapshot, &opts.cli_flags);
+    let dependency_policy = resolve_dependency_policy(&manifest, &settings_ctx);
     // Resolve the project's Node runtime before anything can spawn
     // node: the root `preinstall` hooks below must already run on the
     // switched runtime, and the virtual-store keys downstream fold
@@ -284,13 +555,15 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     if opts.network_mode == aube_registry::NetworkMode::Offline {
         runtime_settings.network = aube_runtime::NetworkMode::Offline;
     }
-    crate::runtime::ensure(
-        &cwd,
-        Some(&manifest),
-        runtime_settings,
-        crate::runtime::lockfile_node_pin(&cwd, &manifest).as_ref(),
-    )
-    .await?;
+    if !opts.dry_run {
+        crate::runtime::ensure(
+            &cwd,
+            Some(&manifest),
+            runtime_settings,
+            crate::runtime::lockfile_node_pin(&cwd, &manifest).as_ref(),
+        )
+        .await?;
+    }
     super::configure_script_settings(&cwd, &settings_ctx, Some("install"));
 
     let layout::InstallLayoutConfig {
@@ -310,13 +583,15 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         opts.strict_no_lockfile,
     )?;
 
-    merge_branch_lockfiles_if_needed(
-        &cwd,
-        &manifest,
-        &settings_ctx,
-        lockfile_enabled,
-        opts.merge_git_branch_lockfiles,
-    )?;
+    if !opts.dry_run {
+        merge_branch_lockfiles_if_needed(
+            &cwd,
+            &manifest,
+            &settings_ctx,
+            lockfile_enabled,
+            opts.merge_git_branch_lockfiles,
+        )?;
+    }
 
     // Resolve the install-wide networking / integrity knobs once up
     // front so every downstream fetch site (the lockfile path, the
@@ -421,7 +696,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     //     that will be linked, matching pnpm's recursive install
     //     behavior. Runs before the progress UI starts so script output
     //     cannot collide with the progress display.
-    if !opts.ignore_scripts && !lockfile_only_effective && !opts.skip_root_lifecycle {
+    if !opts.dry_run
+        && !opts.ignore_scripts
+        && !lockfile_only_effective
+        && !opts.skip_root_lifecycle
+    {
         let phase_start = std::time::Instant::now();
         for (importer_path, importer_manifest) in &lifecycle_manifests {
             let project_dir = importer_project_dir(&cwd, importer_path);
@@ -513,14 +792,44 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
 
     // `--lockfile-only` short-circuit. Resolves (or reuses a fresh
     // lockfile), writes the new lockfile, and exits before any tarball
-    // fetch / link / lifecycle work. Runs *before* the FrozenMode
-    // match so it bypasses drift hard-errors entirely — pnpm's
-    // `--lockfile-only` regenerates regardless of frozen mode, and
-    // we'd otherwise be preempted by the auto-CI Frozen default.
+    // fetch / link / lifecycle work. Runs *before* the FrozenMode match
+    // so lockfile-only bypasses drift hard-errors entirely — pnpm's
+    // `--lockfile-only` regenerates regardless of frozen mode, and we'd
+    // otherwise be preempted by the auto-CI Frozen default.
     // `enableModulesDir=false` follows the same short-circuit so
     // projects that persistently disable node_modules materialization
-    // share the exact same control flow.
-    if lockfile_only_effective {
+    // share the exact same control flow. `--dry-run` reuses the resolve
+    // and report path without writing the lockfile; unlike
+    // `--lockfile-only`, explicit frozen mode still validates drift.
+    if lockfile_only_effective || opts.dry_run {
+        if opts.dry_run && opts.strict_no_lockfile && matches!(mode, FrozenMode::Frozen) {
+            match resolve::select_lockfile_result(resolve::SelectLockfileInput {
+                lockfile_enabled,
+                mode,
+                cwd: &cwd,
+                lockfile_dir: &lockfile_dir,
+                lockfile_importer_key: &lockfile_importer_key,
+                manifest: &manifest,
+                manifests: &manifests,
+                ws_config: &ws_config_shared,
+                workspace_catalogs: &workspace_catalogs,
+                is_workspace_project,
+                lockfile_pre_parse: lockfile_pre_parse.as_ref(),
+            })? {
+                Ok(_) => {}
+                Err(aube_lockfile::Error::NotFound(_)) => {
+                    return Err(miette!(
+                        "no lockfile found and --frozen-lockfile is set\n\
+                         help: commit pnpm-lock.yaml to your repository, or run \
+                         `{} --no-frozen-lockfile` to generate one",
+                        aube_util::cmd("install")
+                    ));
+                }
+                Err(e) => {
+                    return Err(miette::Report::new(e)).wrap_err("failed to parse lockfile");
+                }
+            }
+        }
         resolve::run_lockfile_only(resolve::LockfileOnlyInput {
             cwd: &cwd,
             mode,
@@ -532,6 +841,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             ws_config: &ws_config_shared,
             workspace_catalogs: &workspace_catalogs,
             settings_ctx: &settings_ctx,
+            dependency_policy: &dependency_policy,
             lockfile_pre_parse: lockfile_pre_parse.as_ref(),
             lockfile_conflict_marker_warning_emitted,
             existing_for_resolver,
@@ -548,6 +858,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             minimum_release_age_override: opts.minimum_release_age_override,
             ws_package_versions: &ws_package_versions,
             ignore_scripts: opts.ignore_scripts,
+            write_lockfile: !opts.dry_run,
             prog_ref,
         })
         .await?;
@@ -713,6 +1024,8 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 &ws_config_shared,
                 &settings_ctx,
             )?;
+            validate_lockfile_trust_policy(&cwd, &graph, opts.network_mode, &dependency_policy)
+                .await?;
             let source_label = resolve::lockfile_source_label(kind);
             tracing::debug!(
                 "{source_label}: {} packages for {project_name}",
@@ -873,7 +1186,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // closes and it exits naturally. Awaiting first lets a real
             // materializer error (the likely root cause of a generic
             // "materializer task exited..." fetch err) surface instead.
-            let (indices, cached, fetched) = match fetch_result {
+            let (indices, cached, fetched, _) = match fetch_result {
                 Ok(t) => t,
                 Err(e) => {
                     // Fetch failed: the install is aborting, so no build
@@ -1026,6 +1339,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                         source_kind_before
                             .unwrap_or_else(|| super::default_lockfile_kind(&settings_ctx))
                     }),
+                    dependency_policy: Some(dependency_policy.clone()),
                     cache_full_packuments: true,
                     ignore_scripts: opts.ignore_scripts,
                 },
@@ -1135,7 +1449,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 // JoinSet aborts every outstanding task on drop,
                 // matches the pattern ensure_dep_scripts uses.
                 let mut handles: tokio::task::JoinSet<
-                    miette::Result<(String, aube_store::PackageIndex)>,
+                    miette::Result<(String, aube_store::PackageIndex, Option<String>)>,
                 > = tokio::task::JoinSet::new();
                 let mut indices: BTreeMap<String, aube_store::PackageIndex> = BTreeMap::new();
                 let mut cached_count = 0usize;
@@ -1356,7 +1670,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                                 fetch_strict_pkg_content_check,
                             )
                             .await;
-                            let (index, bytes_len) = match streamed {
+                            let (index, bytes_len, computed_integrity) = match streamed {
                                 Ok(v) => {
                                     permit.record_success();
                                     v
@@ -1373,7 +1687,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                             if let Some(p) = bytes_progress.as_ref() {
                                 p.inc_downloaded_bytes(bytes_len);
                             }
-                            return Ok::<_, miette::Report>((dep_path, index));
+                            return Ok::<_, miette::Report>((
+                                dep_path,
+                                index,
+                                computed_integrity,
+                            ));
                         }
 
                         let fetch_outcome = if streaming_sha512_enabled {
@@ -1425,33 +1743,55 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                             p.inc_downloaded_bytes(bytes.len() as u64);
                         }
 
+                        let computed_integrity = integrity
+                            .is_none()
+                            .then(|| match streamed_digest.as_ref() {
+                                Some(digest) => aube_store::sha512_integrity_from_digest(digest),
+                                None => aube_store::sha512_integrity(&bytes),
+                            });
                         let (index, _) = run_import_on_blocking(
-                            store,
+                            store.clone(),
                             bytes,
                             streamed_digest,
-                            pkg_display_name,
-                            pkg_registry_name,
-                            pkg_version,
-                            integrity,
+                            pkg_display_name.clone(),
+                            pkg_registry_name.clone(),
+                            pkg_version.clone(),
+                            integrity.clone(),
                             fetch_verify_integrity,
                             fetch_strict_integrity,
                             fetch_strict_pkg_content_check,
                         )
                         .await?;
+                        if let Some(integrity) = computed_integrity.as_deref()
+                            && let Err(e) =
+                                store.save_index(&pkg_registry_name, &pkg_version, Some(integrity), &index)
+                        {
+                            tracing::warn!(
+                                code = aube_codes::warnings::WARN_AUBE_CACHE_WRITE_FAILED,
+                                "Failed to cache index for {}@{} with computed integrity: {e}",
+                                pkg_display_name,
+                                pkg_version
+                            );
+                        }
 
-                        Ok::<_, miette::Report>((dep_path, index))
+                        Ok::<_, miette::Report>((dep_path, index, computed_integrity))
                     });
                 }
 
                 // Collect all fetch results via JoinSet. Drop on
                 // error aborts outstanding siblings.
                 let fetch_count = handles.len();
+                let mut computed_integrities: BTreeMap<String, String> = BTreeMap::new();
                 while let Some(joined) = handles.join_next().await {
-                    let (dep_path, index) = joined.into_diagnostic()??;
+                    let (dep_path, index, computed_integrity) = joined.into_diagnostic()??;
                     materialize_tx
                         .send((dep_path.clone(), index.clone()))
                         .await
                         .map_err(|_| miette!("materializer task exited before fetch finished"))?;
+                    if let Some(integrity) = computed_integrity {
+                        computed_integrities
+                            .insert(strip_peer_context_suffix(&dep_path).to_owned(), integrity);
+                    }
                     indices.insert(dep_path, index);
                 }
                 // Explicitly drop the materialize sender so the
@@ -1461,7 +1801,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 if let Some(state) = persistent_for_save.as_ref() {
                     semaphore_for_persist.persist(state, "tarball:default");
                 }
-                Ok::<_, miette::Report>((indices, cached_count, fetch_count))
+                Ok::<_, miette::Report>((indices, cached_count, fetch_count, computed_integrities))
             });
 
             // Run resolution (this streams packages to the fetch coordinator).
@@ -1684,7 +2024,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 Some(joined) => joined.into_diagnostic()??,
                 None => unreachable!("OSV JoinSet had exactly one spawned task"),
             };
-            let (canonical_indices, mut cached, mut fetched) = fetch_result;
+            let (canonical_indices, mut cached, mut fetched, computed_integrities) = fetch_result;
             tracing::debug!(
                 "phase:fetch {:.1?} ({fetched} packages, {cached} cached)",
                 fetch_phase_start.elapsed()
@@ -1726,11 +2066,13 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // same canonical package share a single set of files, so
             // cloning the PackageIndex is cheap relative to re-extraction.
             let mut indices = remap_indices_to_contextualized(&canonical_indices, &graph);
+            apply_computed_integrities(&mut graph, &computed_integrities);
 
             // Write the lockfile in whatever format the project was
             // already using. If no lockfile existed, create aube's
             // default `aube-lock.yaml`. Skipped entirely when
             // `lockfile=false`.
+            let write_kind = source_kind_before.unwrap_or(aube_lockfile::LockfileKind::Aube);
             if lockfile_enabled {
                 // When `lockfileIncludeTarballUrl=true`, record the
                 // registry tarball URL on every registry-sourced
@@ -1837,6 +2179,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             } else {
                 tracing::debug!("lockfile=false: skipping lockfile write");
             }
+            let mut lockfile_graph_for_integrity_rewrite = lockfile_enabled.then(|| graph.clone());
 
             // Trim the in-memory graph down to host-installable optionals
             // before it reaches the linker. When the resolver widened its
@@ -1919,36 +2262,62 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 let catchup_start = std::time::Instant::now();
                 let cwd_for_catchup_client = cwd.clone();
                 let catchup_network_mode = opts.network_mode;
-                let (catchup_indices, catchup_cached, catchup_fetched) = fetch_packages_with_root(
-                    &missing_packages,
-                    &store,
-                    || {
-                        std::sync::Arc::new(
-                            make_client(&cwd_for_catchup_client)
-                                .with_network_mode(catchup_network_mode),
-                        )
-                    },
-                    prog_ref,
-                    &cwd,
-                    &aube_dir,
-                    /*materialize_tx=*/ None,
-                    // Same warm-store-verify gate as the primary fetch
-                    // above: re-enable the workspace `AlreadyLinked`
-                    // shortcut only under fast-trust; default keeps the
-                    // upstream `has_workspace` value.
-                    /*skip_already_linked_shortcut=*/
-                    has_workspace && warm_store_verify(),
-                    virtual_store_dir_max_length,
-                    opts.ignore_scripts,
-                    network_concurrency_setting,
-                    verify_store_integrity_setting,
-                    strict_store_integrity_setting,
-                    strict_store_pkg_content_check_setting,
-                    opts.git_prepare_depth,
-                    inherited_build_policy_for_git_prepare.clone(),
-                    resolve_git_shallow_hosts(&settings_ctx),
-                )
-                .await?;
+                let (catchup_indices, catchup_cached, catchup_fetched, catchup_integrities) =
+                    fetch_packages_with_root(
+                        &missing_packages,
+                        &store,
+                        || {
+                            std::sync::Arc::new(
+                                make_client(&cwd_for_catchup_client)
+                                    .with_network_mode(catchup_network_mode),
+                            )
+                        },
+                        prog_ref,
+                        &cwd,
+                        &aube_dir,
+                        /*materialize_tx=*/ None,
+                        // Same warm-store-verify gate as the primary fetch
+                        // above: re-enable the workspace `AlreadyLinked`
+                        // shortcut only under fast-trust; default keeps the
+                        // upstream `has_workspace` value.
+                        /*skip_already_linked_shortcut=*/
+                        has_workspace && warm_store_verify(),
+                        virtual_store_dir_max_length,
+                        opts.ignore_scripts,
+                        network_concurrency_setting,
+                        verify_store_integrity_setting,
+                        strict_store_integrity_setting,
+                        strict_store_pkg_content_check_setting,
+                        opts.git_prepare_depth,
+                        inherited_build_policy_for_git_prepare.clone(),
+                        resolve_git_shallow_hosts(&settings_ctx),
+                    )
+                    .await?;
+                if !catchup_integrities.is_empty() {
+                    apply_computed_integrities(&mut graph, &catchup_integrities);
+                    if let Some(lock_graph) = lockfile_graph_for_integrity_rewrite.as_mut() {
+                        apply_computed_integrities(lock_graph, &catchup_integrities);
+                        if shared_workspace_lockfile || !has_workspace {
+                            write_lockfile_dir_remapped(
+                                &lockfile_dir,
+                                &lockfile_importer_key,
+                                lock_graph,
+                                &manifest,
+                                write_kind,
+                            )
+                            .into_diagnostic()
+                            .wrap_err("failed to write lockfile with computed integrity")?;
+                        } else {
+                            write_per_project_lockfiles(
+                                &cwd,
+                                lock_graph,
+                                &manifests,
+                                write_kind,
+                                per_project_write_selection.as_ref(),
+                            )?;
+                        }
+                    }
+                }
                 indices.extend(catchup_indices);
                 cached += catchup_cached;
                 fetched += catchup_fetched;
@@ -2179,5 +2548,233 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         phase_timings: &mut phase_timings,
     })
     .await?;
+    // A fresh resolve enforces trustPolicy=no-downgrade while picking
+    // versions from packuments. If an existing lockfile fed the resolver,
+    // `try_lockfile_reuse` may carry locked packages forward without
+    // fetching their packuments, so only the explicit lockfile validator
+    // may seed the cache in that path.
+    if can_seed_trust_policy_validation_from_resolve(
+        lockfile_enabled,
+        existing_for_resolver.is_some(),
+    ) {
+        maybe_record_lockfile_trust_policy_validation(
+            &cwd,
+            &graph,
+            opts.network_mode,
+            &dependency_policy,
+        );
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod trust_policy_validation_cache_tests {
+    use super::*;
+
+    fn write_project_npmrc(dir: &std::path::Path, registry: &str) {
+        std::fs::write(
+            dir.join(".npmrc"),
+            format!("cache-dir=.cache\nregistry={registry}\n"),
+        )
+        .unwrap();
+    }
+
+    fn graph_with_integrity(integrity: &str) -> aube_lockfile::LockfileGraph {
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph.importers.insert(
+            ".".into(),
+            vec![aube_lockfile::DirectDep {
+                name: "left-pad".into(),
+                dep_path: "left-pad@1.3.0".into(),
+                dep_type: aube_lockfile::DepType::Production,
+                specifier: Some("1.3.0".into()),
+            }],
+        );
+        graph.packages.insert(
+            "left-pad@1.3.0".into(),
+            aube_lockfile::LockedPackage {
+                name: "left-pad".into(),
+                version: "1.3.0".into(),
+                integrity: Some(integrity.into()),
+                dep_path: "left-pad@1.3.0".into(),
+                tarball_url: Some(
+                    "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz".into(),
+                ),
+                ..Default::default()
+            },
+        );
+        graph
+    }
+
+    fn no_downgrade_policy() -> aube_resolver::DependencyPolicy {
+        aube_resolver::DependencyPolicy {
+            trust_policy: aube_resolver::TrustPolicy::NoDowngrade,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trust_policy_validation_key_tracks_graph_policy_and_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_npmrc(dir.path(), "https://registry.npmjs.org/");
+        let graph = graph_with_integrity("sha512-one");
+        let policy = no_downgrade_policy();
+        let key = trust_policy_validation_cache_key(
+            dir.path(),
+            &graph,
+            aube_registry::NetworkMode::Online,
+            &policy,
+        )
+        .unwrap();
+
+        let changed_graph = graph_with_integrity("sha512-two");
+        let changed_graph_key = trust_policy_validation_cache_key(
+            dir.path(),
+            &changed_graph,
+            aube_registry::NetworkMode::Online,
+            &policy,
+        )
+        .unwrap();
+        assert_ne!(key, changed_graph_key);
+
+        let mut changed_policy = policy.clone();
+        changed_policy.trust_policy_ignore_after = Some(1);
+        let changed_policy_key = trust_policy_validation_cache_key(
+            dir.path(),
+            &graph,
+            aube_registry::NetworkMode::Online,
+            &changed_policy,
+        )
+        .unwrap();
+        assert_ne!(key, changed_policy_key);
+
+        write_project_npmrc(dir.path(), "https://registry.example.test/");
+        let changed_registry_key = trust_policy_validation_cache_key(
+            dir.path(),
+            &graph,
+            aube_registry::NetworkMode::Online,
+            &policy,
+        )
+        .unwrap();
+        assert_ne!(key, changed_registry_key);
+    }
+
+    #[test]
+    fn trust_policy_validation_key_skips_disabled_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_npmrc(dir.path(), "https://registry.npmjs.org/");
+        let graph = graph_with_integrity("sha512-one");
+        let mut policy = no_downgrade_policy();
+        policy.trust_policy = aube_resolver::TrustPolicy::Off;
+
+        assert!(
+            trust_policy_validation_cache_key(
+                dir.path(),
+                &graph,
+                aube_registry::NetworkMode::Online,
+                &policy,
+            )
+            .is_none()
+        );
+        assert!(
+            trust_policy_validation_cache_key(
+                dir.path(),
+                &graph,
+                aube_registry::NetworkMode::Offline,
+                &no_downgrade_policy(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn trust_policy_validation_cache_hit_checks_key_and_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_npmrc(dir.path(), "https://registry.npmjs.org/");
+
+        record_lockfile_trust_policy_validation(dir.path(), "fresh");
+        assert!(trust_policy_validation_cache_hit(dir.path(), "fresh"));
+        assert!(!trust_policy_validation_cache_hit(dir.path(), "other"));
+
+        let stale_stamp = TrustPolicyValidationStamp {
+            key: "stale".into(),
+            validated_at_secs: unix_time_secs()
+                .unwrap()
+                .saturating_sub(TRUST_POLICY_VALIDATION_CACHE_TTL.as_secs() + 1),
+        };
+        let stale_bytes = serde_json::to_vec(&stale_stamp).unwrap();
+        aube_util::fs_atomic::atomic_write(
+            &trust_policy_validation_cache_path(dir.path(), "stale"),
+            &stale_bytes,
+        )
+        .unwrap();
+        assert!(!trust_policy_validation_cache_hit(dir.path(), "stale"));
+
+        let future_stamp = TrustPolicyValidationStamp {
+            key: "future".into(),
+            validated_at_secs: unix_time_secs()
+                .unwrap()
+                .saturating_add(TRUST_POLICY_VALIDATION_CACHE_TTL.as_secs() + 1),
+        };
+        let future_bytes = serde_json::to_vec(&future_stamp).unwrap();
+        aube_util::fs_atomic::atomic_write(
+            &trust_policy_validation_cache_path(dir.path(), "future"),
+            &future_bytes,
+        )
+        .unwrap();
+        assert!(!trust_policy_validation_cache_hit(dir.path(), "future"));
+    }
+
+    #[test]
+    fn resolve_seeds_trust_policy_cache_only_without_existing_lockfile() {
+        assert!(can_seed_trust_policy_validation_from_resolve(true, false));
+        assert!(!can_seed_trust_policy_validation_from_resolve(true, true));
+        assert!(!can_seed_trust_policy_validation_from_resolve(false, false));
+    }
+}
+
+#[cfg(test)]
+mod computed_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn computed_integrity_updates_peer_variants() {
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph.packages.insert(
+            "consumer@1.0.0(peer@2.0.0)".into(),
+            aube_lockfile::LockedPackage {
+                name: "consumer".into(),
+                version: "1.0.0".into(),
+                dep_path: "consumer@1.0.0(peer@2.0.0)".into(),
+                ..Default::default()
+            },
+        );
+        graph.packages.insert(
+            "already@1.0.0".into(),
+            aube_lockfile::LockedPackage {
+                name: "already".into(),
+                version: "1.0.0".into(),
+                dep_path: "already@1.0.0".into(),
+                integrity: Some("sha512-existing".into()),
+                ..Default::default()
+            },
+        );
+        let computed = BTreeMap::from([
+            ("consumer@1.0.0".into(), "sha512-computed".into()),
+            ("already@1.0.0".into(), "sha512-new".into()),
+        ]);
+
+        apply_computed_integrities(&mut graph, &computed);
+
+        assert_eq!(
+            graph.packages["consumer@1.0.0(peer@2.0.0)"]
+                .integrity
+                .as_deref(),
+            Some("sha512-computed")
+        );
+        assert_eq!(
+            graph.packages["already@1.0.0"].integrity.as_deref(),
+            Some("sha512-existing")
+        );
+    }
 }

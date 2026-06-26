@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.25.1](https://github.com/jdx/aube/compare/aube-resolver-v1.25.0...aube-resolver-v1.25.1) - 2026-06-25
+
+### Other
+
+- *(resolver)* share ancestor chains via Arc instead of per-dep deep clone ([#949](https://github.com/jdx/aube/pull/949))
+- refresh benchmarks for v1.25.0 ([#947](https://github.com/jdx/aube/pull/947))
+
+## [1.25.0](https://github.com/jdx/aube/compare/aube-resolver-v1.24.0...aube-resolver-v1.25.0) - 2026-06-25
+
+### Added
+
+- *(runtime)* add shell-activated tool shims ([#945](https://github.com/jdx/aube/pull/945))
+- *(resolver)* support globs and version unions in minimumReleaseAgeExclude ([#941](https://github.com/jdx/aube/pull/941))
+
+### Other
+
+- *(resolver)* index existing-lockfile scans by name ([#930](https://github.com/jdx/aube/pull/930))
+- refresh benchmarks for v1.24.0 ([#937](https://github.com/jdx/aube/pull/937))
+
+## [1.24.0](https://github.com/jdx/aube/compare/aube-resolver-v1.23.0...aube-resolver-v1.24.0) - 2026-06-23
+
+### Fixed
+
+- *(install)* validate trust policy on lockfile reuse ([#929](https://github.com/jdx/aube/pull/929))
+
+### Other
+
+- refresh benchmarks for v1.23.0 ([#922](https://github.com/jdx/aube/pull/922))
+
 ## [1.23.0](https://github.com/jdx/aube/compare/aube-resolver-v1.22.0...aube-resolver-v1.23.0) - 2026-06-21
 
 ### Other

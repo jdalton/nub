@@ -1,4 +1,7 @@
 use super::*;
+use aube_lockfile::dep_path_filename::{
+    DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH, dep_path_to_filename,
+};
 use aube_lockfile::{DepType, DirectDep, LockedPackage, LockfileGraph};
 use aube_store::Store;
 
@@ -92,16 +95,173 @@ fn make_graph() -> LockfileGraph {
 fn test_detect_strategy() {
     let dir = tempfile::tempdir().unwrap();
     let strategy = Linker::detect_strategy(dir.path());
-    // The probe returns whichever low-cost strategy the filesystem
-    // supports: `Reflink` on CoW filesystems (APFS/btrfs/xfs — the
-    // common dev-machine case), `Hardlink` on same-mount non-CoW
-    // filesystems (ext4/NTFS), or `Copy` as the last resort. All three
-    // are valid verdicts; the test just pins that probing succeeds and
-    // returns a real strategy rather than panicking. On Windows the
-    // probe never returns `Reflink` (hardlink-first there), but that's
-    // a tighter assertion than this cross-platform test needs.
+    // The probe resolves a same-FS success to the OS-specific `auto`
+    // strategy and a cross-FS failure to `Copy`. On macOS the same-FS
+    // strategy is `ReflinkAuto` (APFS clonefile, with the auto-only
+    // hardlink-before-copy fallback), elsewhere `Hardlink`. Whether the
+    // tempdir's FS supports the same-mount link depends on the runner, so
+    // accept the same-FS strategy or `Copy`, but reject the *other* OS's
+    // same-FS strategy — that would mean the cfg gate resolved on the
+    // wrong target. The probe must never yield the plain `Reflink`
+    // explicit selections use.
     match strategy {
-        LinkStrategy::Reflink | LinkStrategy::Hardlink | LinkStrategy::Copy => {}
+        LinkStrategy::Copy => {}
+        LinkStrategy::Reflink => {
+            panic!("`auto` probe must resolve same-FS to ReflinkAuto, never plain Reflink")
+        }
+        #[cfg(target_os = "macos")]
+        LinkStrategy::ReflinkAuto => {}
+        #[cfg(target_os = "macos")]
+        LinkStrategy::Hardlink => panic!("macOS `auto` must resolve same-FS to ReflinkAuto"),
+        #[cfg(not(target_os = "macos"))]
+        LinkStrategy::Hardlink => {}
+        #[cfg(not(target_os = "macos"))]
+        LinkStrategy::ReflinkAuto => panic!("non-macOS `auto` must resolve same-FS to Hardlink"),
+    }
+}
+
+// Representative dep_paths exercising every branch of
+// `dep_path_to_filename`: plain, scoped (`/` → `+`), peer-context
+// (parens flatten to `_`), uppercase (forces the BLAKE3 short-hash),
+// and a long peer graph (overflows max_length → truncate + hash).
+const ENCODE_FIXTURES: &[&str] = &[
+    "foo@1.0.0",
+    "@scope/bar@2.0.0",
+    "baz@3.0.0(react@18.2.0)",
+    "@ng/Core@17.0.0",
+    "@fig/eslint-config-autocomplete@2.0.0(@typescript-eslint+eslint-plugin@7.18.0(@typescript-eslint+parser@7.18.0(eslint@8.57.1))(eslint@8.57.1))(@typescript-eslint+parser@7.18.0(eslint@8.57.1))(@withfig+eslint-plugin-fig-linter@1.4.1)(eslint@8.57.1)(eslint-plugin-compat@4.2.0(eslint@8.57.1))(typescript@5.9.3)",
+];
+
+// The link step's serial pre-pass now computes each package's local
+// `.aube/<entry>` name and its virtual-store subdir once and threads
+// them into the par_iter (and on into `ensure_in_virtual_store`),
+// replacing what used to be 2-3 redundant `dep_path_to_filename`
+// encodes per package. The hoist is only output-preserving if the
+// value carried forward is byte-identical to what each eliminated
+// recompute site would have produced.
+//
+// The eliminated sites all bottomed out at the SAME primitive
+// composition: the local `.aube/` link name was
+// `dep_path_to_filename(dep_path, max)`, and the shared-store target
+// (the par_iter's `global_entry` and the now-removed `subdir` encode
+// inside the public `ensure_in_virtual_store`) was
+// `dep_path_to_filename(hashes.hashed_dep_path(dep_path), max)`. So the
+// non-vacuous check is to recompute each carried value INDEPENDENTLY
+// from `dep_path_to_filename` (and `GraphHashes::hashed_dep_path`)
+// directly — NOT by re-calling the very wrapper under test — and assert
+// the linker's `aube_dir_entry_name` / `virtual_store_subdir` outputs
+// equal it. A `dep_path_to_filename(dep_path, max)` is what the linker
+// builds at the eliminated `aube_dir.join(self.aube_dir_entry_name(..))`
+// and `self.virtual_store.join(self.virtual_store_subdir(..))` sites, so
+// if the hoist ever carried a value that diverged from that primitive,
+// these fail.
+
+fn linker_for_encode_test(dir: &Path, hashes: Option<GraphHashes>) -> Linker {
+    let store = Store::at(dir.join("store/files"));
+    let mut linker = Linker::new(&store, LinkStrategy::Copy);
+    if let Some(h) = hashes {
+        linker = linker.with_graph_hashes(h);
+    }
+    linker
+}
+
+#[test]
+fn precomputed_entry_name_and_subdir_match_recompute_unhashed() {
+    let dir = tempfile::tempdir().unwrap();
+    let linker = linker_for_encode_test(dir.path(), None);
+
+    for dep_path in ENCODE_FIXTURES {
+        // The values the pre-pass carries forward into the par_iter and
+        // on into `ensure_in_virtual_store_with_subdir`.
+        let precomputed_entry = linker.aube_dir_entry_name(dep_path);
+        let precomputed_subdir = linker.virtual_store_subdir(dep_path);
+
+        // Independent recompute of what the eliminated recompute sites
+        // produced: both the `.aube/` link name and (in the unhashed
+        // mode, where `hashed_dep_path` is the identity) the shared-store
+        // subdir bottom out at the same bare-dep_path encode. Built from
+        // the primitive directly, NOT by re-calling the linker wrapper,
+        // so this catches the hoist carrying any value that diverged from
+        // what the original `aube_dir.join(aube_dir_entry_name(..))` /
+        // `virtual_store.join(virtual_store_subdir(..))` sites encoded.
+        let recompute = dep_path_to_filename(dep_path, DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH);
+        assert_eq!(
+            precomputed_entry, recompute,
+            "entry name diverged from the bare-dep_path encode for {dep_path}"
+        );
+        assert_eq!(
+            precomputed_subdir, recompute,
+            "unhashed subdir diverged from the bare-dep_path encode for {dep_path}"
+        );
+
+        // Cross-check: with no hash fold the two carried values must
+        // coincide, so a hoist that swapped entry for subdir (or vice
+        // versa) in the unhashed path would still produce correct output
+        // here — the hashed test below is what pins their separation.
+        assert_eq!(
+            precomputed_entry, precomputed_subdir,
+            "entry name and subdir must coincide in the unhashed mode for {dep_path}"
+        );
+    }
+}
+
+#[test]
+fn precomputed_subdir_matches_recompute_with_graph_hashes() {
+    // With graph hashes installed, `virtual_store_subdir` folds the
+    // per-dep_path hash into the leaf before encoding, so it diverges
+    // from `aube_dir_entry_name` (which never applies the hash). The
+    // hoist carries the *subdir* (hashed) into `ensure_in_virtual_store`
+    // and the *entry name* (unhashed) into the local `.aube/` link —
+    // mixing them up would be a behavior change. Pin that each carried
+    // value matches its independent primitive recompute and that the two
+    // are distinct under hashing.
+    let dir = tempfile::tempdir().unwrap();
+    let mut node_hash = std::collections::BTreeMap::new();
+    for (i, dep_path) in ENCODE_FIXTURES.iter().enumerate() {
+        // A deterministic non-empty hex hash per dep_path.
+        node_hash.insert(
+            (*dep_path).to_string(),
+            format!("{:016x}{:016x}", 0x0123_4567_89ab_cdefu64, i as u64),
+        );
+    }
+    let hashes = GraphHashes { node_hash };
+    let linker = linker_for_encode_test(dir.path(), Some(hashes.clone()));
+
+    for dep_path in ENCODE_FIXTURES {
+        let entry = linker.aube_dir_entry_name(dep_path);
+        let subdir = linker.virtual_store_subdir(dep_path);
+
+        // Independent recompute of the eliminated sites: the `.aube/`
+        // link name is the bare-dep_path encode, while the shared-store
+        // subdir is the encode of the hash-folded dep_path. Both built
+        // from the primitives directly (`dep_path_to_filename` and
+        // `hashed_dep_path`), NOT by re-calling the wrappers under test.
+        let entry_recompute = dep_path_to_filename(dep_path, DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH);
+        let subdir_recompute = dep_path_to_filename(
+            &hashes.hashed_dep_path(dep_path),
+            DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH,
+        );
+        assert_eq!(
+            entry, entry_recompute,
+            "entry name diverged from the bare-dep_path encode for {dep_path}"
+        );
+        assert_eq!(
+            subdir, subdir_recompute,
+            "hashed subdir diverged from the hash-folded encode for {dep_path}"
+        );
+
+        // And the hash genuinely makes the subdir differ from the entry
+        // name, so the two values are not interchangeable — proving the
+        // hoist must carry them separately. For short names the subdir
+        // gains a visible `-<hex>` leaf suffix the entry lacks; for the
+        // long peer-graph fixture the suffix is truncated off, but the
+        // entry and subdir still differ because the BLAKE3 short-hash is
+        // computed over different inputs (the hash-folded path vs. the
+        // bare one), so the trailing hash diverges either way.
+        assert_ne!(
+            entry, subdir,
+            "graph hash should make subdir differ from entry name for {dep_path}"
+        );
     }
 }
 
@@ -175,6 +335,92 @@ fn test_link_all_handles_self_referential_dep_at_different_version() {
     let host_index =
         project_dir.join("node_modules/.aube/react_ujs@3.3.0/node_modules/react_ujs/index.js");
     assert!(host_index.exists(), "host package files must be present");
+}
+
+#[test]
+fn test_ensure_in_aube_dir_handles_concurrent_same_dep_path() {
+    const THREADS: usize = 16;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    let aube_dir = project_dir.join("node_modules/.aube");
+    std::fs::create_dir_all(&aube_dir).unwrap();
+
+    let store = Store::at(dir.path().join("store/files"));
+    let mut index = PackageIndex::default();
+    let pkg_json = store
+        .import_bytes(b"{\"name\":\"debug\",\"version\":\"4.4.0\"}", false)
+        .unwrap();
+    index.insert("package.json".to_string(), pkg_json);
+    for i in 0..128 {
+        let stored = store
+            .import_bytes(format!("module.exports = {i};").as_bytes(), false)
+            .unwrap();
+        index.insert(format!("files/{i}.js"), stored);
+    }
+
+    let pkg = LockedPackage {
+        name: "debug".to_string(),
+        version: "4.4.0".to_string(),
+        integrity: None,
+        dependencies: BTreeMap::new(),
+        dep_path: "debug@4.4.0".to_string(),
+        ..Default::default()
+    };
+
+    let linker = std::sync::Arc::new(Linker::new_with_gvs(&store, LinkStrategy::Copy, false));
+    let index = std::sync::Arc::new(index);
+    let pkg = std::sync::Arc::new(pkg);
+    let aube_dir = std::sync::Arc::new(aube_dir);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let linker = linker.clone();
+            let index = index.clone();
+            let pkg = pkg.clone();
+            let aube_dir = aube_dir.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut stats = LinkStats::default();
+                linker
+                    .ensure_in_aube_dir(&aube_dir, "debug@4.4.0", &pkg, &index, &mut stats, None)
+                    .expect("duplicate materialization should be idempotent");
+                stats
+            })
+        })
+        .collect();
+
+    let stats = handles.into_iter().map(|h| h.join().unwrap()).fold(
+        LinkStats::default(),
+        |mut total, stats| {
+            total.packages_linked += stats.packages_linked;
+            total.packages_cached += stats.packages_cached;
+            total.files_linked += stats.files_linked;
+            total
+        },
+    );
+
+    assert_eq!(stats.packages_linked, 1);
+    assert_eq!(stats.packages_cached, THREADS - 1);
+    assert_eq!(stats.files_linked, index.len());
+    assert!(
+        aube_dir
+            .join("debug@4.4.0/node_modules/debug/files/127.js")
+            .exists(),
+        "winning materialization must be usable"
+    );
+    assert!(
+        std::fs::read_dir(aube_dir.as_ref())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-")),
+        "losing staging directories must be cleaned up"
+    );
 }
 
 #[test]
@@ -288,6 +534,104 @@ fn test_link_file_fresh_hardlink_short_circuits_when_source_missing() {
             Error::MissingStoreFile { store_path: p, rel_path } if p == &store_path && rel_path == "hello.txt"
         ),
         "expected MissingStoreFile from Hardlink branch, got {err:?}"
+    );
+}
+
+/// RAII guard that serializes `FORCE_REFLINK_FAILURE` across the parallel
+/// test runner and always restores the flag — even if the body panics.
+///
+/// `FORCE_REFLINK_FAILURE` is a process-wide `AtomicBool`, so two reflink
+/// fallback tests running concurrently could otherwise observe each other's
+/// `store(false)` mid-`link_file_fresh` (a reflink-capable FS would then take
+/// the real clonefile path and skew the inode assertion), and a bare manual
+/// reset would leak the `true` state to the next test on a panic. Holding the
+/// `Mutex` for the whole forced-failure window mutually excludes the tests; the
+/// `Drop` impl makes the reset panic-safe.
+#[cfg(unix)]
+struct ForcedReflinkFailure {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl ForcedReflinkFailure {
+    fn engage() -> Self {
+        use std::sync::atomic::Ordering;
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // Recover from a poisoned lock: a prior test panicking inside the guard
+        // is exactly the case this exists for, and the `Drop` reset still ran.
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::materialize::FORCE_REFLINK_FAILURE.store(true, Ordering::Relaxed);
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForcedReflinkFailure {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        crate::materialize::FORCE_REFLINK_FAILURE.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Materialize one file under `strategy` with the reflink attempt forced
+/// to fail, then report whether the result is a hardlink (same inode as
+/// the source) or a copy (distinct inode). Isolates the clonefile-failure
+/// fallback so the split between `ReflinkAuto` and explicit `Reflink` is
+/// observable on any filesystem, including reflink-capable APFS/btrfs CI.
+#[cfg(unix)]
+fn realized_inode_matches_source_on_reflink_failure(strategy: LinkStrategy) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path().join("store/files"));
+    // >16 KiB so the macOS small-file copy shortcut does not pre-empt the
+    // reflink path under test.
+    let content = vec![b'x'; 32 * 1024];
+    let stored = store.import_bytes(&content, false).unwrap();
+    let store_path = stored.store_path.clone();
+
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_dir).unwrap();
+    let dst = dst_dir.join("payload.bin");
+
+    let linker = Linker::new_with_gvs(&store, strategy, true);
+    let result = {
+        // Hold the guard across the materialize so a sibling test can't flip
+        // the global flag mid-call; the flag is restored on drop, panic-safe.
+        let _forced = ForcedReflinkFailure::engage();
+        linker.link_file_fresh(&stored, "payload.bin", &dst)
+    };
+    result.expect("a reflink strategy must still materialize the file via its fallback");
+
+    // Data integrity holds whichever fallback fired.
+    assert_eq!(std::fs::read(&dst).unwrap(), content);
+
+    std::fs::metadata(&store_path).unwrap().ino() == std::fs::metadata(&dst).unwrap().ino()
+}
+
+#[test]
+#[cfg(unix)]
+fn test_reflink_auto_falls_back_to_hardlink_not_copy() {
+    // `auto` on a same-FS macOS target resolves to `ReflinkAuto`; the
+    // probe already proved the target shares a mount, so a clonefile
+    // failure (non-APFS same-FS volume, e.g. HFS+) must degrade to a
+    // zero-cost hardlink before a per-file copy.
+    assert!(
+        realized_inode_matches_source_on_reflink_failure(LinkStrategy::ReflinkAuto),
+        "ReflinkAuto must fall back to a hardlink (same inode), not a copy, on reflink failure"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_explicit_reflink_falls_back_to_copy_not_hardlink() {
+    // Explicit `clone` / `clone-or-copy` map to `Reflink`, whose
+    // documented contract is reflink with a plain *copy* fallback. They
+    // must NOT take the auto-only hardlink step on a clonefile failure —
+    // the result is a distinct inode (copy), never the source's inode.
+    assert!(
+        !realized_inode_matches_source_on_reflink_failure(LinkStrategy::Reflink),
+        "explicit Reflink must fall back to a copy (distinct inode), not a hardlink"
     );
 }
 

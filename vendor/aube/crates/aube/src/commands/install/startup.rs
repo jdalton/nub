@@ -34,16 +34,25 @@ pub(super) fn try_install_fast_path(
     mode: FrozenMode,
     modules_cache_sweep_default: bool,
 ) -> bool {
-    if restore_missing_lockfile_fast_path_eligible(cwd, opts, mode, modules_cache_sweep_default) {
-        emit_up_to_date(cwd);
-        return true;
-    }
-
-    if !install_fast_path_eligible(cwd, opts, mode, modules_cache_sweep_default) {
+    let dangerously_allow_all_builds = resolve_dangerously_allow_all_builds(cwd, opts);
+    if !install_fast_path_eligible(
+        cwd,
+        opts,
+        mode,
+        modules_cache_sweep_default,
+        dangerously_allow_all_builds,
+    ) {
         return false;
     }
     emit_up_to_date(cwd);
     true
+}
+
+fn resolve_dangerously_allow_all_builds(cwd: &Path, opts: &InstallOptions) -> bool {
+    let files = super::super::FileSources::load(cwd);
+    let raw_workspace = aube_manifest::workspace::load_raw(cwd).unwrap_or_default();
+    let ctx = files.ctx(&raw_workspace, &opts.env_snapshot, &opts.cli_flags);
+    aube_settings::resolved::dangerously_allow_all_builds(&ctx)
 }
 
 fn install_fast_path_eligible(
@@ -51,6 +60,7 @@ fn install_fast_path_eligible(
     opts: &InstallOptions,
     mode: FrozenMode,
     modules_cache_sweep_default: bool,
+    dangerously_allow_all_builds: bool,
 ) -> bool {
     let preconditions_met = matches!(mode, FrozenMode::Frozen | FrozenMode::Prefer)
         && !opts.force
@@ -58,10 +68,13 @@ fn install_fast_path_eligible(
         && !opts.dep_selection.is_filtered()
         && !opts.merge_git_branch_lockfiles
         && !opts.strict_no_lockfile
-        && !opts.dangerously_allow_all_builds
+        && !dangerously_allow_all_builds
         && opts.workspace_filter.is_empty()
         && modules_cache_sweep_default;
     if !preconditions_met {
+        return false;
+    }
+    if trust_policy_requires_validation(cwd, opts) {
         return false;
     }
     // Surface *why* the warm path was missed at debug level — the state
@@ -77,22 +90,18 @@ fn install_fast_path_eligible(
     }
 }
 
-fn restore_missing_lockfile_fast_path_eligible(
-    cwd: &Path,
-    opts: &InstallOptions,
-    mode: FrozenMode,
-    modules_cache_sweep_default: bool,
-) -> bool {
-    matches!(mode, FrozenMode::No)
-        && !opts.force
-        && !opts.lockfile_only
-        && !opts.dep_selection.is_filtered()
-        && !opts.merge_git_branch_lockfiles
-        && !opts.strict_no_lockfile
-        && !opts.dangerously_allow_all_builds
-        && opts.workspace_filter.is_empty()
-        && modules_cache_sweep_default
-        && state::restore_missing_lockfile_if_fresh(cwd, &opts.cli_flags)
+fn trust_policy_requires_validation(cwd: &Path, opts: &InstallOptions) -> bool {
+    if opts.network_mode == aube_registry::NetworkMode::Offline {
+        return false;
+    }
+    let files = crate::commands::FileSources::load(cwd);
+    let raw_workspace = aube_manifest::workspace::load_raw(cwd).unwrap_or_default();
+    let ctx = files.ctx(&raw_workspace, &opts.env_snapshot, &opts.cli_flags);
+    aube_settings::resolved::paranoid(&ctx)
+        || matches!(
+            aube_settings::resolved::trust_policy(&ctx),
+            aube_settings::resolved::TrustPolicy::NoDowngrade
+        )
 }
 
 fn emit_up_to_date(cwd: &Path) {
