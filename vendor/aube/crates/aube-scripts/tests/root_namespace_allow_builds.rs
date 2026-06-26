@@ -23,6 +23,7 @@ static ROOT_TOOL: Embedder = Embedder {
     config_env_prefix: None,
     cache_namespace: "roottool",
     data_namespace: "roottool",
+    managed_config_system_dir: Some("roottool"),
     canonical_lockfile_always_wins: true,
     runtime_switching: true,
     self_engines_check: true,

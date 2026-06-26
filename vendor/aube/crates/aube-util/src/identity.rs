@@ -116,6 +116,17 @@ pub struct Embedder {
     pub cache_namespace: &'static str,
     /// Leaf directory name under the OS data/state root, e.g. `"aube"`.
     pub data_namespace: &'static str,
+    /// Leaf directory under the system config root (`/etc`) for the admin-managed
+    /// config file (`/etc/<dir>/managed.toml`), e.g. `Some("aube")` →
+    /// `/etc/aube/managed.toml`. `None` skips the system-managed read entirely —
+    /// the tool consults only the env-overridden managed path
+    /// (`{config_env_prefix}_MANAGED_CONFIG_PATH`) and never a system file.
+    ///
+    /// This is a *system* path an admin (or a co-installed tool) populates, so
+    /// it must follow the active brand: a host must not silently inherit another
+    /// tool's `/etc/<other>/managed.toml`. Distinct from the env-overridden
+    /// managed path, which already follows [`config_env_prefix`](Self::config_env_prefix).
+    pub managed_config_system_dir: Option<&'static str>,
 
     // --- embedder-fixed behavior toggles (not user-tunable) ---
     /// When `true` (aube's default), this tool's canonical lockfile
@@ -244,6 +255,7 @@ pub const AUBE: Embedder = Embedder {
     config_env_prefix: Some("AUBE"),
     cache_namespace: "aube",
     data_namespace: "aube",
+    managed_config_system_dir: Some("aube"),
     canonical_lockfile_always_wins: true,
     runtime_switching: true,
     self_engines_check: true,
@@ -414,6 +426,7 @@ mod tests {
         assert_eq!(id.config_env_prefix, Some("AUBE"));
         assert_eq!(id.cache_namespace, "aube");
         assert_eq!(id.data_namespace, "aube");
+        assert_eq!(id.managed_config_system_dir, Some("aube"));
         assert!(id.canonical_lockfile_always_wins);
         assert!(id.runtime_switching);
         assert!(id.self_engines_check);

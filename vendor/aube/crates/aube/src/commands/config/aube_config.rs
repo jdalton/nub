@@ -103,13 +103,37 @@ pub(crate) fn project_aube_config_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".config").join("aube").join("config.toml")
 }
 
-pub(crate) fn system_managed_aube_config_path() -> PathBuf {
-    PathBuf::from("/etc").join("aube").join("managed.toml")
+/// System-managed config path (`/etc/<dir>/managed.toml`), where `<dir>` is the
+/// active embedder's [`managed_config_system_dir`]. `None` when the embedder
+/// opts out of a system-managed surface — the tool then never reads a system
+/// `/etc/<other>/managed.toml`, so a host cannot silently inherit another
+/// tool's admin policy. Standalone aube derives `/etc/aube/managed.toml`
+/// byte-for-byte (its profile sets `Some("aube")`).
+///
+/// [`managed_config_system_dir`]: aube_util::Embedder::managed_config_system_dir
+pub(crate) fn system_managed_aube_config_path() -> Option<PathBuf> {
+    aube_util::embedder()
+        .managed_config_system_dir
+        .map(|dir| PathBuf::from("/etc").join(dir).join("managed.toml"))
+}
+
+/// Name of the env var that overrides the managed-config path, branded to the
+/// active embedder's [`config_env_prefix`] (e.g. `AUBE_MANAGED_CONFIG_PATH` for
+/// standalone aube, `NUB_MANAGED_CONFIG_PATH` under nub). Built from the live
+/// prefix so a warning names the var the tool actually reads and no static
+/// `AUBE_`-branded token leaks under an embedder.
+///
+/// [`config_env_prefix`]: aube_util::Embedder::config_env_prefix
+fn managed_config_env_var() -> String {
+    let prefix = aube_util::embedder().config_env_prefix.unwrap_or("AUBE");
+    format!("{prefix}_MANAGED_CONFIG_PATH")
 }
 
 pub(crate) fn load_managed_entries() -> Vec<(String, String)> {
     let mut out = Vec::new();
-    out.extend(load_entries_at(&system_managed_aube_config_path()));
+    if let Some(system_path) = system_managed_aube_config_path() {
+        out.extend(load_entries_at(&system_path));
+    }
     if let Some(path) = aube_util::env::config_env("MANAGED_CONFIG_PATH")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
@@ -117,11 +141,13 @@ pub(crate) fn load_managed_entries() -> Vec<(String, String)> {
         match path.try_exists() {
             Ok(true) => out.extend(load_entries_at(&path)),
             Ok(false) => tracing::warn!(
-                "managed config path from AUBE_MANAGED_CONFIG_PATH does not exist: {}",
+                "managed config path from {} does not exist: {}",
+                managed_config_env_var(),
                 path.display()
             ),
             Err(err) => tracing::warn!(
-                "failed to check managed config path from AUBE_MANAGED_CONFIG_PATH at {}: {err}",
+                "failed to check managed config path from {} at {}: {err}",
+                managed_config_env_var(),
                 path.display()
             ),
         }
@@ -330,6 +356,29 @@ mod tests {
             edit.entries(),
             vec![("minimumReleaseAge".to_string(), "2880".to_string())]
         );
+    }
+
+    /// Default-preserving contract for the profile-derived managed-config
+    /// paths: under the default (AUBE) profile the system path is exactly
+    /// `/etc/aube/managed.toml` and the env-override var is exactly
+    /// `AUBE_MANAGED_CONFIG_PATH`, byte-for-byte as before the path was routed
+    /// through the embedder profile. This also exercises the SHARED derivation
+    /// — `/etc/{dir}/managed.toml` from `managed_config_system_dir`, and
+    /// `{prefix}_MANAGED_CONFIG_PATH` from `config_env_prefix` — so any other
+    /// profile's path follows purely from its field values. The nub branch's
+    /// field values (`managed_config_system_dir: Some("nub")` →
+    /// `/etc/nub/managed.toml`, `config_env_prefix: Some("NUB")` →
+    /// `NUB_MANAGED_CONFIG_PATH`) are pinned by the compile-time assertion in
+    /// nub's `pm_engine::identity` and its end-to-end brand sweep; they can't be
+    /// asserted here because registering a non-AUBE profile would flip the
+    /// process-global `OnceLock` fallback this test depends on.
+    #[test]
+    fn managed_config_paths_are_aube_branded_under_default_profile() {
+        assert_eq!(
+            system_managed_aube_config_path(),
+            Some(PathBuf::from("/etc/aube/managed.toml"))
+        );
+        assert_eq!(managed_config_env_var(), "AUBE_MANAGED_CONFIG_PATH");
     }
 
     #[cfg(unix)]

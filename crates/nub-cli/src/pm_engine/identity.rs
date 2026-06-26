@@ -66,6 +66,12 @@
 /// - `data_namespace` = `"nub"` — global CAS store at
 ///   `$XDG_DATA_HOME/nub/store/v1`, nub's own XDG namespace (matches the
 ///   `storeDir` embedder default and `store path` output).
+/// - `managed_config_system_dir` = `Some("nub")` — the admin-managed config
+///   file is read from nub's OWN system path (`/etc/nub/managed.toml`), never
+///   aube's `/etc/aube/managed.toml`. A machine with a co-installed standalone
+///   aube cannot make nub silently inherit its `/etc/aube` policy: the brand
+///   boundary holds on the system path the same way it already held on the env
+///   override (`NUB_MANAGED_CONFIG_PATH`, via `config_env_prefix`).
 /// - `canonical_lockfile_always_wins` = `false` — `lock.yaml` never silently
 ///   outranks a foreign lockfile beside it; that state is the loud
 ///   ambiguity/contradiction error (was
@@ -121,6 +127,7 @@ pub(crate) const NUB: aube_util::Embedder = aube_util::Embedder {
     config_env_prefix: Some("NUB"),
     cache_namespace: "nub/pm",
     data_namespace: "nub",
+    managed_config_system_dir: Some("nub"),
     canonical_lockfile_always_wins: false,
     runtime_switching: false,
     self_engines_check: false,
@@ -155,6 +162,7 @@ const _: () = {
     assert!(matches!(NUB.lockfile_basename.as_bytes(), b"lock.yaml"));
     assert!(matches!(NUB.cache_namespace.as_bytes(), b"nub/pm"));
     assert!(matches!(NUB.data_namespace.as_bytes(), b"nub"));
+    assert!(matches!(NUB.managed_config_system_dir, Some(d) if matches!(d.as_bytes(), b"nub")));
     assert!(matches!(NUB.manifest_namespace.as_bytes(), b""));
     assert!(NUB.workspace_yaml.is_none());
     assert!(NUB.env_prefix.is_none());

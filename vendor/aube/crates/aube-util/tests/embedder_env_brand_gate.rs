@@ -32,6 +32,7 @@ static NUBLIKE: Embedder = Embedder {
     config_env_prefix: Some("NUB"),
     cache_namespace: "nublike",
     data_namespace: "nublike",
+    managed_config_system_dir: Some("nublike"),
     canonical_lockfile_always_wins: false,
     runtime_switching: false,
     self_engines_check: false,

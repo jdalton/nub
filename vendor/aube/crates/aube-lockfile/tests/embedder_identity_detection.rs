@@ -32,6 +32,7 @@ static MYTOOL: Embedder = Embedder {
     config_env_prefix: Some("MYTOOL"),
     cache_namespace: "mytool",
     data_namespace: "mytool",
+    managed_config_system_dir: Some("mytool"),
     canonical_lockfile_always_wins: false,
     runtime_switching: true,
     self_engines_check: true,

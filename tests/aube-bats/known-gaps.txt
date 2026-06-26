@@ -43,5 +43,13 @@ lockfile_dir.bats|aube install --lockfile-dir: refuses to write a lockfile alrea
 lockfile_dir.bats|aube install --lockfile-dir: refuses to clobber a parent dir that is itself a project|--lockfile-dir not wired
 lockfile_dir.bats|aube install --lockfile-dir: warm install reads the relocated lockfile|--lockfile-dir not wired
 
+# ── install --dry-run not wired (new 1.25.x resolution-preview surface) ─────
+install.bats|aube install --dry-run resolves without writing lockfile or node_modules|install --dry-run not wired
+install.bats|aube install --dry-run --frozen-lockfile fails without lockfile|install --dry-run not wired
+install.bats|aube install --dry-run in CI resolves without lockfile|install --dry-run not wired
+install.bats|aube install --dry-run in CI resolves drifted lockfile|install --dry-run not wired
+install.bats|aube install --dry-run with fresh lockfile still reports skipped fetch and link|install --dry-run not wired
+lockfile_settings.bats|lockfile=false + --dry-run resolves without lockfile-only conflict|install --dry-run not wired
+
 # ── exit-code mapping ───────────────────────────────────────────────────────
 lockfile_settings.bats|lockfile tarball URLs are verified against registry metadata before fetch|expected failure exit not produced (engine exit-code mapping gap)

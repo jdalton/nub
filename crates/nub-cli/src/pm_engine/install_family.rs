@@ -1570,15 +1570,23 @@ mod tests {
             42
         });
         assert_eq!(value, 42);
-        // ends_with, not equality: fd 1 redirection is process-global, so the
-        // libtest harness's own progress lines ("test … ok") from parallel
-        // tests can land in the capture window ahead of our write. The
-        // contract under test — the raw write survives the capture and the
-        // rewrite reaches it — is fully pinned by the suffix.
+        // `contains`, not `ends_with`/equality: fd 1 redirection is
+        // process-global, so the libtest harness's own progress lines
+        // ("test … ok") from parallel tests can land anywhere in the capture
+        // window — before OR after our write — so neither a prefix nor a
+        // suffix check is stable. The contract under test is narrow and fully
+        // pinned by presence: the raw write survives the capture, the rewrite
+        // reaches it (the rewritten `nub install` line is present), and the
+        // rewrite neutralized the engine's `aube` brand (the un-rewritten
+        // `aube install` form is absent).
         let rewritten = present::rewrite(&captured);
         assert!(
-            rewritten.ends_with("Run `nub install` to execute their scripts.\n"),
-            "captured+rewritten stream must end with the rewritten engine line, got: {rewritten:?}"
+            rewritten.contains("Run `nub install` to execute their scripts.\n"),
+            "captured+rewritten stream must contain the rewritten engine line, got: {rewritten:?}"
+        );
+        assert!(
+            !rewritten.contains("Run `aube install`"),
+            "rewrite must neutralize the engine's aube brand, got: {rewritten:?}"
         );
     }
 }

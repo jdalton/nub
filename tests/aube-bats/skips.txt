@@ -11,7 +11,6 @@ install.bats|aube install creates node_modules|virtual store lands at node_modul
 install.bats|aube install creates .aube virtual store|virtual store lands at node_modules/.nub
 install.bats|aube install creates transitive dep symlinks in .aube|virtual store lands at node_modules/.nub
 install.bats|aube install writes state at node_modules/.aube-state|engine state stem follows nub's store naming (rename of the leaf-fixed .aube-state basename is tracked separately)
-install.bats|aube install --no-frozen-lockfile restores missing lockfile from fresh state|asserts the node_modules/.aube-state path
 install.bats|aube install self-heals when a CAS shard goes missing under a cached index|asserts the node_modules/.aube path
 install.bats|aube install preserves npm-alias as folder on fresh resolve|walks the node_modules/.aube tree
 add.bats|aube add jsr: resolves against the @jsr scope and writes jsr:<range>|asserts the node_modules/.aube path
@@ -49,6 +48,7 @@ add.bats|aube add --save-peer writes only peerDependencies and does not install|
 # like aube-workspace.yaml above. Frozen installs see "no lockfile", ci can't
 # install from it, update can't refresh it.
 install.bats|aube install --frozen-lockfile works|fixture's committed aube-lock.yaml is invisible: nub's canonical lockfile name is lock.yaml
+install.bats|aube install --no-frozen-lockfile re-resolves when lockfile is missing|asserts aube-lock.yaml is rewritten; nub's canonical lockfile name is lock.yaml (1.25.1 renamed this test, dropping its old .aube-state assertion)
 install.bats|aube install surfaces lockfile parse errors instead of silently re-resolving|garbage written into aube-lock.yaml is never read (file invisible under nub's lock name)
 install.bats|aube install --frozen-lockfile errors when lockfile is stale|fixture's committed aube-lock.yaml is invisible: nub's canonical lockfile name is lock.yaml
 install.bats|aube install --frozen-lockfile succeeds when lockfile is fresh|fixture's committed aube-lock.yaml is invisible: nub's canonical lockfile name is lock.yaml
