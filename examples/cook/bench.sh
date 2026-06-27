@@ -86,6 +86,12 @@ run_group() {
 
   echo "── $label  (arg=$arg) ─────────────────────────────────────────"
 
+  # ── One-time BUILD costs, all OUTSIDE the timed loop below. hyperfine times
+  #    only the RUNS, so cook's number is the cooked binary's *runtime* startup
+  #    (the compiled program booting + initializing its modules), NOT this
+  #    `perry compile` step; likewise the snapshot/compile-cache numbers are read
+  #    cost, not the build below. Nothing here is in any reported bar.
+
   # Build the cooked native binary (the same compile `nub cook` runs).
   timeout 180 "$PERRY_BIN" compile "$script" -o "$cooked" >/dev/null 2>&1
   chmod +x "$cooked"

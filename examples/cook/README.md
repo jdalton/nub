@@ -25,6 +25,24 @@ Five ways to start the same script, measured cold (a fresh process per run) with
 
 ![cold start across approaches](cold-start.svg)
 
+**Every number below is RUN cost, never build cost.** The cooked native binary
+(`perry compile`), the V8 snapshot blob (`node --build-snapshot`), and the
+compile-cache prime are all built **once, in setup, outside the timed loop** (the
+"one-time BUILD costs" block in [`bench.sh`](bench.sh)'s `run_group`); hyperfine
+times only the runs that follow.
+So cook's number is the **cooked binary's own startup at runtime** — the compiled
+program booting and initializing its modules — **not** the `perry compile` step.
+The one-time build costs are listed [below](#one-time-costs-not-in-the-cold-start-bars)
+and are not in any bar.
+
+**Both groups are SHORT, startup-dominated tasks. "Heavy" means a big IMPORT
+GRAPH, not a longer-running program.** The compute in both `fib` and `heavy` is
+deliberately tiny; the only axis that changes between them is *how much code there
+is to load*. `heavy`'s argument is kept small on purpose — Node's `heavy` time is
+flat from `HN=1` to `HN≈1000`, so the ~83 ms is the cost of parsing, compiling,
+and instantiating 60 modules at startup, **not** the loop. Read the fib↔heavy
+axis as *amount of code to load*, never as *time to run*.
+
 | approach | what it removes from startup |
 | --- | --- |
 | **node** | nothing — the baseline (native `.mts` type-stripping) |
@@ -64,9 +82,10 @@ across 60 ESM modules, so parse/compile/instantiate is a real cost):
 Three honest readings of this data:
 
 1. **cook removes the runtime, so it owns the trivial case.** On `fib` there is
-   almost no code to parse — the cost is the V8/Node process boot itself, and
-   only cook eliminates that. It starts in ~12 ms regardless of script size, a
-   flat ~5× under plain Node.
+   almost no code to load — the cost is the V8/Node process boot itself, and only
+   cook eliminates that. It starts in ~12 ms regardless of how much *compute* the
+   script does, a flat ~5× under plain Node. (How much *code* it loads is a
+   different axis — see reading 3.)
 2. **Snapshot and compile-cache scale with code, not boot — so they grow on the
    heavy script.** Neither removes the Node process; they only cut
    parse/compile/instantiate. On trivial `fib` that part is small, so the win is
@@ -77,16 +96,57 @@ Three honest readings of this data:
    compile-cache 1.55×). This is the case they exist for: short scripts with a
    real module graph.
 3. **cook is slower on the heavy script here — and that's reported, not hidden.**
-   The perry build used (0.5.1189) carries a per-module initialization cost in
-   the produced binary that grows with the module count; a 60-module binary pays
-   ~190 ms of it at startup, which swamps the runtime-removal win. cook's
-   sweet spot is small, self-contained scripts (a CLI, a tool, a single hot
-   path), not a large module graph — at least with this perry build.
+   The root cause is precise: cook wins by *removing the runtime*, but the
+   perry-generated binary **initializes each module at its own startup**, so its
+   cold-start scales with the module count. On `fib` (no imports) that scaling
+   term is zero and cook starts in ~12 ms; on the 60-module graph the binary pays
+   ~190 ms of per-module init at boot, which swamps the runtime-removal win and
+   puts it behind node/snapshot/compile-cache. This is not "perry is slow" — it is
+   "cook's cold-start = a tiny fixed floor + a per-module-init cost × module
+   count," and the second term dominates once the import graph is large. cook's
+   sweet spot is therefore small, self-contained scripts (a CLI, a tool, a single
+   hot path), not a large module graph — at least with this perry build. A
+   module-count scaling sweep that isolates the per-module slope is
+   [below](#the-per-module-init-cost-a-scaling-sweep).
 
 `tsx` is in the chart as the reproducible stand-in for a "TypeScript via a Node
 loader hook" tier (the role nub's own `nub <file>` run path fills). It tracks
 plain Node within noise here because the script transpiles trivially; a loader's
 cost shows up on heavier transpile work, not on this fixture.
+
+### The per-module-init cost: a scaling sweep
+
+The `fib`↔`heavy` pair is two points; to confirm the regression is per-module
+init scaling — and to measure its slope — [`scaling-sweep.sh`](scaling-sweep.sh)
+sweeps the module count K and times the cooked binary's cold start against plain
+node at each K. Every K uses the same trivial 8-functions-per-module fixture
+([`heavy/scaling-gen.mjs`](heavy/scaling-gen.mjs)) and the same small compute arg,
+so each run stays startup-dominated; the only thing that changes is *how many
+modules there are to load*. Each row is `hyperfine --warmup 5 --min-runs 40`
+cold start (perry 0.5.1189, Node v22.21.1, macOS arm64):
+
+| K (modules) | functions | cook cold start | node cold start |
+| --- | --- | --- | --- |
+| 1 | 8 | 13.1 ms ± 1.3 | 53.6 ms ± 28.1 |
+| 5 | 40 | 18.5 ms ± 3.1 | 53.9 ms ± 2.3 |
+| 15 | 120 | 58.8 ms ± 1.4 | 59.8 ms ± 2.5 |
+| 30 | 240 | 115.4 ms ± 2.0 | 62.2 ms ± 1.9 |
+| 45 | 360 | 167.5 ms ± 1.8 | 71.0 ms ± 1.8 |
+| 60 | 480 | 207.3 ms ± 4.4 | 83.9 ms ± 3.0 |
+
+A least-squares fit on the per-K means makes the two startup models explicit:
+
+- **cook** = a ~8 ms fixed floor + **3.43 ms per module** (R² = 0.996). The floor
+  matches the trivial-`fib` cook number (no imports → no per-module term); the
+  slope is the per-module init the binary pays at boot.
+- **node** = a ~51 ms fixed boot + **0.49 ms per module** (R² = 0.95). Node's boot
+  is the expensive part, but its per-module cost is ~7× lower than cook's.
+- **Crossover at K ≈ 15 modules** (~120 functions): below it cook's tiny floor
+  wins; above it cook's steep per-module slope dominates and node pulls ahead.
+
+So the regression is not a fixed penalty — it is `cook = small-floor +
+high-per-module × K` vs `node = high-floor + low-per-module × K`, two lines that
+cross. cook owns everything left of the crossover and loses to the right of it.
 
 ### One-time costs (not in the cold-start bars)
 
