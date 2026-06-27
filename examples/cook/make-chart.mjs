@@ -126,7 +126,7 @@ const H = g2.endY + 34;
 const svg = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="cold start across approaches, fib and import-heavy scripts, lower is better">
   <rect x="0" y="0" width="${W}" height="${H}" rx="8" fill="#ffffff"/>
   <text x="${LABEL_X}" y="24" text-anchor="end" font-size="15" font-weight="600" fill="${INK}" font-family="${FONT}">cold start</text>
-  <text x="${BAR_X}" y="24" font-size="13" fill="${MUTE}" font-family="${FONT}">five startup strategies, one script per group — lower is better</text>
+  <text x="${BAR_X}" y="24" font-size="13" fill="${MUTE}" font-family="${FONT}">cook (AOT native) vs node vs nub — lower is better</text>
   ${g1.svg}
   ${g2.svg}
   <text x="14" y="${H - 12}" font-size="11.5" fill="${MUTE}" font-family="${FONT}">cook = perry native AOT (what nub cook produces)</text>

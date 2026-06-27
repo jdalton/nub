@@ -7,173 +7,79 @@ is **cold-start latency**: a native binary skips V8 warmup, the module graph, an
 transpilation entirely. Run once to compile + verify; every run after is a cache
 hit.
 
-This example doubles as a **map of the Node startup-optimization landscape**. The
-[benchmark below](#the-startup-landscape-cold-start) puts cook next to plain Node,
-a TypeScript loader (tsx), and the two startup levers Node ships natively — a
-**V8 startup snapshot** and the **V8 compile cache** — across two scripts. The
-short version: each lever cuts a *different* part of startup, so each wins on a
-different workload, and the chart shows exactly where.
-
 cook attempts the whole TypeScript family — `.ts`, `.mts` (ESM), `.cts` (CJS),
 and `.tsx` — plus plain JavaScript. PerryTS's compiler handles all of them;
 anything it can't handle falls back to Node (see below).
 
-## The startup landscape (cold start)
+## Cold start: cook vs node vs nub
 
-Five ways to start the same script, measured cold (a fresh process per run) with
-`hyperfine --warmup 5 -N`, on macOS arm64, **Node v26.3.1**, perry 0.5.1189:
+The three ways to start the same script: the cooked native binary, plain `node`,
+and `nub` (transpile + Node — the normal `nub <file>` run path). Measured cold (a
+fresh process per run) with `hyperfine --warmup 5 -N` (≥40 runs), on macOS arm64,
+**Node v22.21.1**, perry 0.5.1206:
 
-![cold start across approaches](cold-start.svg)
+![cold start: cook vs node vs nub, fib and import-heavy scripts](cold-start.svg)
 
-**Every number below is RUN cost, never build cost.** The cooked native binary
-(`perry compile`), the V8 snapshot blob (`node --build-snapshot`), and the
-compile-cache prime are all built **once, in setup, outside the timed loop** (the
-"one-time BUILD costs" block in [`bench.sh`](bench.sh)'s `run_group`); hyperfine
-times only the runs that follow.
-So cook's number is the **cooked binary's own startup at runtime** — the compiled
-program booting and initializing its modules — **not** the `perry compile` step.
-The one-time build costs are listed [below](#one-time-costs-not-in-the-cold-start-bars)
-and are not in any bar.
+**Every number is RUN cost, never build cost.** The cooked native binary
+(`perry compile`) is built **once, in setup, outside the timed loop** (the
+"BUILD costs" block in [`bench.sh`](bench.sh)); hyperfine times only the runs that
+follow. So cook's number is the **cooked binary's own startup at runtime** — the
+compiled program booting and initializing its modules — **not** the `perry compile`
+step.
 
 **Both groups are SHORT, startup-dominated tasks. "Heavy" means a big IMPORT
 GRAPH, not a longer-running program.** The compute in both `fib` and `heavy` is
 deliberately tiny; the only axis that changes between them is *how much code there
-is to load*. `heavy`'s argument is kept small on purpose — Node's `heavy` time is
-flat from `HN=1` to `HN≈1000`, so the ~83 ms is the cost of parsing, compiling,
-and instantiating 60 modules at startup, **not** the loop. Read the fib↔heavy
-axis as *amount of code to load*, never as *time to run*.
+is to load and enumerate*. `heavy`'s argument is kept small on purpose — Node's
+`heavy` time is flat from `HN=1` to `HN≈1000`, so the ~75 ms is the cost of
+parsing, compiling, and instantiating 60 modules at startup, **not** the loop.
 
-| approach | what it removes from startup |
-| --- | --- |
-| **node** | nothing — the baseline (native `.mts` type-stripping) |
-| **cook** (perry native AOT) | the entire V8/Node runtime — there is no Node process |
-| **tsx** | nothing; *adds* a TypeScript loader hook on top of Node |
-| **v8 snapshot** | parse + compile + instantiate (a pre-baked heap), but **not** the process boot |
-| **v8 compile-cache** | parse + compile (a warm code cache), but **not** instantiate or the boot |
+### Trivial script
+
+[`fib.ts`](fib.ts) — first 30 Fibonacci numbers, no imports, startup-dominated:
+
+| approach | cold start | vs node |
+| --- | --- | --- |
+| cook | 12.2 ms ± 1.1 | **3.64× faster** |
+| nub | 43.3 ms ± 1.6 | 1.03× (≈ node) |
+| node | 44.5 ms ± 1.6 | — |
+
+There is almost no code to load — the cost is the V8/Node process boot itself, and
+only cook eliminates that. cook starts in ~12 ms; `nub` tracks plain Node within
+noise here because the script transpiles trivially (a loader's cost shows up on
+heavier transpile work, not on this fixture).
+
+### Import-heavy script
+
+[`heavy/heavy.mts`](heavy/heavy.mts) — 480 functions across 60 ESM modules, behind
+an `export *` barrel, enumerated with `Object.values`:
+
+| approach | cold start | vs node |
+| --- | --- | --- |
+| cook | 12.7 ms ± 1.2 | **5.97× faster** |
+| node | 76.0 ms ± 1.6 | — |
+
+cook stays at its ~12 ms floor: module init is cheap (60 modules initialize in a
+few ms), so removing the runtime wins on the import-heavy script too.
+
+### A note on a prior regression
+
+An earlier version of this benchmark showed cook **slower** than node on the heavy
+script (~203 ms, 0.41× node) and attributed it to per-module init scaling with
+module count. That attribution was wrong. Profiling for
+[PerryTS/perry#5736](https://github.com/PerryTS/perry/issues/5736) showed module
+init is near-free (~0.02 ms/module); the cost was `Object.values`/`Object.entries`
+over the wide star-export barrel namespace, which was **O(modules²)** in PerryTS's
+`own_key_present`. [PerryTS#5738](https://github.com/PerryTS/perry/pull/5738) made
+that path O(1)-per-key on wide objects — on the issue's repro, K=240 dropped from
+140 ms to 12 ms and the per-module slope went flat. With that fix (perry 0.5.1206),
+the heavy fixture's enumeration is ~12.7 ms, so cook now leads node by ~6×.
 
 The reproducer is [`bench.sh`](bench.sh) (`./examples/cook/bench.sh`), which builds
-each artifact, checks every approach prints identical output, runs the two
+the cooked binary, checks all three approaches print identical output, runs the two
 hyperfine groups, and regenerates the chart with [`make-chart.mjs`](make-chart.mjs).
-
-### What the numbers say
-
-**Trivial script** ([`fib.mts`](fib.mts) — first 30 Fibonacci numbers, no
-imports, startup-dominated):
-
-| approach | cold start | vs node |
-| --- | --- | --- |
-| cook | 11.6 ms ± 1.3 | **5.05× faster** |
-| v8 snapshot | 36.9 ms ± 1.9 | 1.58× faster |
-| v8 compile-cache | 45.4 ms ± 3.0 | 1.29× faster |
-| tsx | 56.5 ms ± 2.2 | 1.03× (≈ node) |
-| node | 58.3 ms ± 3.4 | — |
-
-**Import-heavy script** ([`heavy/heavy.mts`](heavy/heavy.mts) — 480 functions
-across 60 ESM modules, so parse/compile/instantiate is a real cost):
-
-| approach | cold start | vs node |
-| --- | --- | --- |
-| v8 snapshot | 39.3 ms ± 2.6 | **2.12× faster** |
-| v8 compile-cache | 53.5 ms ± 2.7 | 1.55× faster |
-| node | 83.1 ms ± 2.9 | — |
-| tsx | 85.8 ms ± 2.9 | 0.97× (≈ node) |
-| cook | 203.5 ms ± 5.8 | 0.41× (slower) |
-
-Three honest readings of this data:
-
-1. **cook removes the runtime, so it owns the trivial case.** On `fib` there is
-   almost no code to load — the cost is the V8/Node process boot itself, and only
-   cook eliminates that. It starts in ~12 ms regardless of how much *compute* the
-   script does, a flat ~5× under plain Node. (How much *code* it loads is a
-   different axis — see reading 3.)
-2. **Snapshot and compile-cache scale with code, not boot — so they grow on the
-   heavy script.** Neither removes the Node process; they only cut
-   parse/compile/instantiate. On trivial `fib` that part is small, so the win is
-   modest (snapshot 1.58×, compile-cache 1.29×) — though notably **not** within
-   noise: a snapshot also bakes in Node's *own* bootstrap heap, which it skips
-   re-compiling on every run. On the import-heavy script the parse/compile cost
-   is large, and the same two levers pull clearly ahead (snapshot **2.12×**,
-   compile-cache 1.55×). This is the case they exist for: short scripts with a
-   real module graph.
-3. **cook is slower on the heavy script here — and that's reported, not hidden.**
-   The root cause is precise: cook wins by *removing the runtime*, but the
-   perry-generated binary **initializes each module at its own startup**, so its
-   cold-start scales with the module count. On `fib` (no imports) that scaling
-   term is zero and cook starts in ~12 ms; on the 60-module graph the binary pays
-   ~190 ms of per-module init at boot, which swamps the runtime-removal win and
-   puts it behind node/snapshot/compile-cache. This is not "perry is slow" — it is
-   "cook's cold-start = a tiny fixed floor + a per-module-init cost × module
-   count," and the second term dominates once the import graph is large. cook's
-   sweet spot is therefore small, self-contained scripts (a CLI, a tool, a single
-   hot path), not a large module graph — at least with this perry build. A
-   module-count scaling sweep that isolates the per-module slope is
-   [below](#the-per-module-init-cost-a-scaling-sweep).
-
-`tsx` is in the chart as the reproducible stand-in for a "TypeScript via a Node
-loader hook" tier (the role nub's own `nub <file>` run path fills). It tracks
-plain Node within noise here because the script transpiles trivially; a loader's
-cost shows up on heavier transpile work, not on this fixture.
-
-### The per-module-init cost: a scaling sweep
-
-The `fib`↔`heavy` pair is two points; to confirm the regression is per-module
-init scaling — and to measure its slope — [`scaling-sweep.sh`](scaling-sweep.sh)
-sweeps the module count K and times the cooked binary's cold start against plain
-node at each K. Every K uses the same trivial 8-functions-per-module fixture
-([`heavy/scaling-gen.mjs`](heavy/scaling-gen.mjs)) and the same small compute arg,
-so each run stays startup-dominated; the only thing that changes is *how many
-modules there are to load*. Each row is `hyperfine --warmup 5 --min-runs 40`
-cold start (perry 0.5.1189, Node v22.21.1, macOS arm64):
-
-| K (modules) | functions | cook cold start | node cold start |
-| --- | --- | --- | --- |
-| 1 | 8 | 13.1 ms ± 1.3 | 53.6 ms ± 28.1 |
-| 5 | 40 | 18.5 ms ± 3.1 | 53.9 ms ± 2.3 |
-| 15 | 120 | 58.8 ms ± 1.4 | 59.8 ms ± 2.5 |
-| 30 | 240 | 115.4 ms ± 2.0 | 62.2 ms ± 1.9 |
-| 45 | 360 | 167.5 ms ± 1.8 | 71.0 ms ± 1.8 |
-| 60 | 480 | 207.3 ms ± 4.4 | 83.9 ms ± 3.0 |
-
-A least-squares fit on the per-K means makes the two startup models explicit:
-
-- **cook** = a ~8 ms fixed floor + **3.43 ms per module** (R² = 0.996). The floor
-  matches the trivial-`fib` cook number (no imports → no per-module term); the
-  slope is the per-module init the binary pays at boot.
-- **node** = a ~51 ms fixed boot + **0.49 ms per module** (R² = 0.95). Node's boot
-  is the expensive part, but its per-module cost is ~7× lower than cook's.
-- **Crossover at K ≈ 15 modules** (~120 functions): below it cook's tiny floor
-  wins; above it cook's steep per-module slope dominates and node pulls ahead.
-
-So the regression is not a fixed penalty — it is `cook = small-floor +
-high-per-module × K` vs `node = high-floor + low-per-module × K`, two lines that
-cross. cook owns everything left of the crossover and loses to the right of it.
-
-### One-time costs (not in the cold-start bars)
-
-Every approach above amortizes a setup step that the timed runs don't pay:
-
-- **cook** — the `perry compile` + verify (the first cook of a script). Amortized
-  by nub's persistent cache; an ephemeral environment (CI with no warm cache)
-  pays it every run.
-- **v8 snapshot** — `node --build-snapshot` produces the `.blob` once. The blob is
-  Node-version-specific.
-- **v8 compile-cache** — the first run populates `NODE_COMPILE_CACHE`; every run
-  after reads it. The benchmark primes it once before timing.
-
-### Why snapshot uses an inlined CJS entry
-
-A V8 startup snapshot is built from a **CommonJS, synchronous** entry: V8's
-`mksnapshot` cannot evaluate an ESM module graph at build time (`import()` reports
-`Not supported`). So the snapshot entries here
-([`fib-snapshot-entry.cjs`](fib-snapshot-entry.cjs),
-[`heavy/heavy-snapshot-entry.cjs`](heavy/heavy-snapshot-entry.cjs)) inline the
-same logic the `.mts` files run and register it with
-`v8.startupSnapshot.setDeserializeMainFunction`. The equivalence gate in
-`bench.sh` confirms the snapshot prints byte-identical output to plain Node before
-any timing. The heavy fixture and its snapshot entry are both regenerated from
-[`heavy/gen-mods.mjs`](heavy/gen-mods.mjs) — it emits the 60 modules, the barrel,
-and the inlined CJS snapshot entry from one source of truth, so the inlined
-functions can't drift from the modules.
+The heavy fixture's 60 modules + barrel are generated by
+[`heavy/gen-mods.mjs`](heavy/gen-mods.mjs).
 
 ## How it works
 
@@ -259,12 +165,10 @@ never trusts a freshly compiled binary on perry's word alone.
 Without either, `nub cook` prints a clear note and runs on Node instead.
 
 To reproduce the benchmark you also need [`hyperfine`](https://github.com/sharkdp/hyperfine),
-a Node ≥ 22.18 (native `.mts` type-stripping; the V8 compile cache needs ≥ 22.8),
-and — for the `tsx` row — a `tsx` install reachable from the example (`npm i tsx`
-in `examples/cook`, or set `TSX_LOADER`). The tsx row is skipped if absent.
-[`make-chart.mjs`](make-chart.mjs) rasterizes the `.png` via `rsvg-convert` or
-macOS `qlmanage` if present; the `.svg` is the source of truth and renders on
-GitHub directly.
+a Node ≥ 22.18 (native `.mts` type-stripping), and `nub` on `PATH` (or set
+`NUB_BIN`). [`make-chart.mjs`](make-chart.mjs) rasterizes the `.png` via
+`rsvg-convert` or macOS `qlmanage` if present; the `.svg` is the source of truth
+and renders on GitHub directly.
 
 ## Demo
 
@@ -310,11 +214,10 @@ The script still runs — the AOT path is an optimization, never a gate. Pass
   the LLVM compile, and the two verify runs) only amortizes from a **persistent
   warm cache**; an ephemeral environment (e.g. CI without a warm cache) pays the
   full cold cost on every run.
-- **cook's win is workload-shaped (see the benchmark).** It is largest on small,
-  self-contained scripts where the V8/Node boot dominates. A large module graph
-  can erase the win — and, with the perry build measured here, invert it (the
-  import-heavy row above). Measure your own script; don't assume cook is always
-  faster.
+- **cook's win is workload-shaped.** It is largest on short, startup-dominated
+  scripts where the V8/Node boot dominates. A compute-heavy or long-running script
+  shifts the balance toward steady-state throughput, where the runtime-removal win
+  matters less. Measure your own script.
 - **First-run double-run (side-effect caveat).** Verify-before-trust runs the
   script **twice** on its first cook — once as the cooked binary and once on
   Node — to confirm they behave identically. cook is therefore intended for
