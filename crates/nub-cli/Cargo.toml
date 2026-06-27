@@ -83,6 +83,20 @@ semver = "1"
 # source paths are unchanged.
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 sha2.workspace = true
+# `nub cook` PoC: a Rust content-addressed store for the AOT-compiled native
+# binary blobs (zkat's cacache port). cook uses ONLY the synchronous
+# `read_sync` / `write_sync` API — the cache read/write happens in-process,
+# with NO Node and NO JS anywhere in the cache path. default-features=false
+# drops the mmap stack; we keep cacache's default `async-std` backend because
+# cacache 13.1.0 has an upstream feature-gating bug — a truly async-free build
+# fails to compile (its `State` enum at content/write.rs:135 is gated
+# `any(async-std, tokio)`, but the `not(tokio)` `update_state` at line 428
+# references `State` unconditionally → E0425). `async-std` is cacache's
+# intended/default async backend so its feature wiring is the one that
+# actually compiles. cook never calls the async API — only `read_sync` /
+# `write_sync`, which run synchronously in-process and never spawn or touch a
+# runtime — so the cache path stays synchronous and Node-/JS-free regardless.
+cacache = { version = "=13.1.0", default-features = false, features = ["async-std"] }
 tracing.workspace = true
 tempfile = "3"
 toml.workspace = true

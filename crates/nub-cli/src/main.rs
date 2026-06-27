@@ -5,6 +5,7 @@
 
 mod agent;
 mod cli;
+mod cook;
 mod pm_engine;
 
 use anyhow::Result;

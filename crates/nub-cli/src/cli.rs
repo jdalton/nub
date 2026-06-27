@@ -481,6 +481,30 @@ pub enum Command {
         args: Vec<String>,
     },
 
+    /// AOT-compile a supported script to a fast-starting native binary (PoC).
+    ///
+    /// Asks PerryTS whether the script compiles; if so, compiles it once,
+    /// caches the binary, and runs it (~3× faster cold start). If the script
+    /// uses an unsupported API/package — or PerryTS / its toolchain is absent —
+    /// nub prints the diagnostics and falls back to running it on Node.
+    Cook {
+        /// Script to compile and run.
+        file: String,
+
+        /// Disable Nub's augmentation (and the cook AOT path): run plain Node.
+        #[arg(long)]
+        node: bool,
+
+        /// On a cook failure, dump PerryTS's raw stdout/stderr (default: a
+        /// concise pretty-printed cause). The script still runs on Node either way.
+        #[arg(long)]
+        debug: bool,
+
+        /// Remaining arguments forwarded to the compiled binary / script.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Run a node_modules/.bin binary (same as nubx).
     Exec {
         /// Binary name to execute.
@@ -907,7 +931,7 @@ struct ScriptExecOpts<'a> {
 /// Known subcommand names that clap should handle. `install`/`i`/`ci` route
 /// to the embedded aube install engine (src/pm_engine/).
 const SUBCOMMANDS: &[&str] = &[
-    "run", "watch", "exec", "upgrade", "help", "node", "pm", "agent", "install", "i", "ci",
+    "run", "watch", "cook", "exec", "upgrade", "help", "node", "pm", "agent", "install", "i", "ci",
 ];
 
 /// `pnpm install <pkg>` (and the `i` alias) is the add-to-dependencies form —
@@ -1593,6 +1617,10 @@ fn value_consuming_flags(subcommand: &str) -> &'static [&'static str] {
             "--cwd",
         ],
         "watch" => &["--cwd"],
+        // cook's own flags (`--node`/`--debug`) are booleans; only the global
+        // `--cwd` takes a following token, so it must be listed or `nub cook
+        // --cwd dir x.ts` would bind `dir` as the script positional.
+        "cook" => &["--cwd"],
         _ => &[],
     }
 }
@@ -1738,7 +1766,10 @@ fn dispatch_subcommand(rest: Vec<String>) -> Result<i32> {
         return crate::pm_engine::dispatch_verb(spec, &subcommand, &rest[1..], &pm);
     }
 
-    let forwards = matches!(subcommand.as_str(), "run" | "exec" | "watch" | "nubx");
+    let forwards = matches!(
+        subcommand.as_str(),
+        "run" | "exec" | "watch" | "nubx" | "cook"
+    );
 
     let (prefix, suffix) = if forwards {
         split_subcommand_argv(rest)
@@ -1855,6 +1886,44 @@ fn dispatch_subcommand(rest: Vec<String>) -> Result<i32> {
         Some(Command::Watch { file, mut args }) => {
             args.extend(suffix);
             run_watch(&file, &args)
+        }
+        Some(Command::Cook {
+            file,
+            node,
+            debug,
+            mut args,
+        }) => {
+            args.extend(suffix);
+            // The Node fallback reuses the exact `nub <file>` run path
+            // (run_file → run_file_in_dir → spawn_node), so a non-compilable
+            // script runs with full project context (pin/.env/PnP). The forwarded
+            // args ride after the file path, matching the file-run argv shape.
+            let node_args: Vec<String> = std::iter::once(file.clone())
+                .chain(args.iter().cloned())
+                .collect();
+            let fallback_args = node_args.clone();
+            let verify_args = node_args.clone();
+            // A truthy NODE_COMPAT forces compat tree-wide (the persistent
+            // `--node`) — cook IS an augmentation, so it must skip the AOT
+            // path under either signal, exactly as the file-run paths do.
+            let compat_mode = node || node_compat_env();
+            crate::cook::run(crate::cook::CookArgs {
+                script: &file,
+                forwarded_args: &args,
+                compat_mode,
+                debug,
+                // Inherited-stdio fallback: the script actually runs on Node.
+                // Thread `compat_mode` through so `--node` (the flag) disables
+                // augmentation on the fallback exactly as it does on the
+                // top-level file run — `run_file` would hardcode compat OFF,
+                // losing the flag (only the `NODE_COMPAT` env path survives,
+                // re-derived inside `run_file_in_dir`).
+                run_on_node: || run_file_with_compat(&fallback_args, compat_mode),
+                // Captured Node run for the verify-before-trust differential.
+                // Only reached in non-compat mode (cook short-circuits to the
+                // fallback above under compat), but thread the flag for symmetry.
+                run_on_node_captured: || run_file_captured_with_compat(&verify_args, compat_mode),
+            })
         }
         Some(Command::Exec {
             bin,
@@ -2253,11 +2322,60 @@ fn run_file_in_dir(args: &[String], compat_mode: bool, cwd: &Path) -> Result<i32
         env_vars: &env_vars,
         pnp: pnp_ctx.as_ref().map(|c| c.pnp_cjs.as_path()),
         cwd,
+        capture_stdout: false,
     };
 
     let result = nub_core::node::spawn::spawn_node(&config)?;
     // PATH shim cleanup is handled once at the top level (see `run`).
     Ok(nub_core::node::spawn::exit_code(&result))
+}
+
+/// Run `args` on the same Node path as `run_file`, but CAPTURE stdout + exit
+/// code instead of inheriting the terminal. The cook verify-before-trust
+/// probe (crate::cook) uses this to diff Node's output against the freshly
+/// cooked binary's — DRY: it reuses the exact augmentation pipeline a real
+/// `nub <file>` run would, so the reference output is faithful, just captured.
+/// Returns `(stdout_bytes, exit_code)`. `compat_mode` mirrors the per-invocation
+/// `--node` bit (OR'd with `NODE_COMPAT` below) so the captured reference matches
+/// whatever augmentation the inherited fallback would use.
+fn run_file_captured_with_compat(args: &[String], compat_mode: bool) -> Result<(Vec<u8>, i32)> {
+    let cwd = env::current_dir()?;
+    let compat_mode = compat_mode || node_compat_env();
+    check_manifest_json(&cwd)?;
+    let node = nub_core::node::discovery::discover_or_provision_node(&cwd)?;
+    if !compat_mode {
+        nub_core::node::discovery::check_min_version(&node)?;
+    }
+    let project = nub_core::workspace::detect::detect_project(&cwd);
+    let auto_env = if !compat_mode {
+        project
+            .as_ref()
+            .map(|p| nub_core::workspace::env::load_env_files(&p.root))
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let env_vars = merge_child_env(
+        auto_env,
+        env_file_flag_present(),
+        ENV_FILE_VARS.get().unwrap_or(&HashMap::new()),
+    );
+    let nub_binary = nub_core::node::spawn::current_nub_binary()?;
+    let pnp_ctx = nub_core::pnp::detect(&cwd);
+    let config = nub_core::node::spawn::SpawnConfig {
+        node: &node,
+        user_args: args,
+        compat_mode,
+        show_warnings: SHOW_WARNINGS.load(Ordering::Relaxed),
+        nub_binary: &nub_binary,
+        env_vars: &env_vars,
+        pnp: pnp_ctx.as_ref().map(|c| c.pnp_cjs.as_path()),
+        cwd: &cwd,
+        capture_stdout: true,
+    };
+    let result = nub_core::node::spawn::spawn_node(&config)?;
+    let code = nub_core::node::spawn::exit_code(&result);
+    Ok((result.stdout.unwrap_or_default(), code))
 }
 
 fn run_script(
@@ -7580,6 +7698,98 @@ mod tests {
         let (_, suffix) =
             split_subcommand_argv(["run", "build", "a", "b"].map(String::from).to_vec());
         assert_eq!(suffix, ["a", "b"]);
+    }
+
+    #[test]
+    fn cook_forwards_post_script_flags_instead_of_clap_stealing_them() {
+        // cook is a forwarding verb: a flag AFTER the script positional reaches
+        // the script/cooked binary verbatim, NOT clap's global `--help`/`--node`.
+        // Before the fix cook wasn't in the `forwards` matcher, so the split
+        // never ran and `nub cook x.ts --help` printed nub's global help. The
+        // assertions below exercise the REAL `split_subcommand_argv` + clap parse
+        // the dispatcher uses, so a regression that drops cook from `forwards`
+        // (→ empty suffix, `--help` reaching clap) fails this test.
+        //
+        // `--node` BEFORE the script is cook's own flag (sets compat); `--help`
+        // AFTER the script forwards to the script. The split puts the cook flag
+        // in the prefix (clap parses it) and the post-positional flag in the
+        // suffix (forwarded), matching the run/exec/watch contract.
+        let rest = vec![
+            "cook".into(),
+            "--node".into(),
+            "x.ts".into(),
+            "--help".into(),
+            "extra".into(),
+        ];
+        let (prefix, suffix) = split_subcommand_argv(rest);
+        assert_eq!(
+            prefix,
+            ["cook", "--node", "x.ts"],
+            "the prefix ends at the script positional, with cook's own --node ahead of it"
+        );
+        assert_eq!(
+            suffix,
+            ["--help", "extra"],
+            "post-script --help/args forward to the script, not clap"
+        );
+
+        // clap parses only the prefix; `--help` in the suffix can't be stolen.
+        let mut cmd = Cli::parse_from(std::iter::once("nub".to_string()).chain(prefix)).command;
+        match &mut cmd {
+            Some(Command::Cook {
+                file, node, args, ..
+            }) => {
+                assert_eq!(file, "x.ts", "the positional binds as the script");
+                assert!(
+                    *node,
+                    "cook's own --node (pre-positional) parses as the flag"
+                );
+                args.extend(suffix);
+                assert_eq!(
+                    *args,
+                    vec!["--help".to_string(), "extra".to_string()],
+                    "the forwarded suffix lands in cook's args, reaching the script"
+                );
+            }
+            other => panic!("expected Command::Cook, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cook_node_flag_and_env_both_derive_compat_for_the_fallback() {
+        // FIX A: the cook fallback must run PLAIN Node under BOTH `--node` (flag)
+        // and `NODE_COMPAT` (env). The dispatch derives `compat_mode = node ||
+        // node_compat_env()` and threads it into `run_file_with_compat(.., compat)`
+        // — the prior `run_file(..)` hardcoded compat OFF, so the flag form ran
+        // augmented Node (the env form survived only via run_file_in_dir's
+        // re-derivation). Lock both signals here; the augmentation kill-switch
+        // they reach is proved in nub-core (compat_mode_disables_all_augmentation).
+        let cli = parse(&["nub", "cook", "--node", "x.ts"]).unwrap();
+        let node = match cli.command {
+            Some(Command::Cook { node, ref file, .. }) => {
+                assert_eq!(file, "x.ts");
+                node
+            }
+            other => panic!("expected Command::Cook, got {other:?}"),
+        };
+        // Flag form: clap parses `--node` as `node=true`, so the dispatch's
+        // `compat_mode = node || node_compat_env()` is true regardless of env.
+        assert!(node, "cook's --node flag must parse as node=true");
+
+        // Env form: the production `node_compat_env()` recognizes a truthy
+        // `NODE_COMPAT`. Exercise the real parser (single-threaded within this
+        // test; restored before returning) so the env half of the OR isn't a
+        // stubbed re-implementation. `1`/`true`/`yes` are truthy; unset is false.
+        // SAFETY: set/removed within this single-threaded test only.
+        unsafe { env::set_var("NODE_COMPAT", "1") };
+        let env_truthy = node_compat_env();
+        unsafe { env::set_var("NODE_COMPAT", "0") };
+        let env_falsy = node_compat_env();
+        unsafe { env::remove_var("NODE_COMPAT") };
+        let env_unset = node_compat_env();
+        assert!(env_truthy, "NODE_COMPAT=1 → compat (env form)");
+        assert!(!env_falsy, "NODE_COMPAT=0 → not compat");
+        assert!(!env_unset, "NODE_COMPAT unset → not compat");
     }
 
     #[test]

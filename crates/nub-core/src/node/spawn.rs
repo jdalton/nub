@@ -359,11 +359,23 @@ pub struct SpawnConfig<'a> {
     /// a node bin run via `nub exec -r` executes IN the member, seeing its own
     /// `.env` / Node pin / `.bin` chain rather than the workspace root's.
     pub cwd: &'a Path,
+    /// Capture the child's stdout instead of inheriting it. Set ONLY by the
+    /// cook verify-before-trust probe (crates/nub-cli/src/cook.rs), which
+    /// needs Node's stdout bytes to diff against the cooked binary's. The
+    /// normal run path leaves this `false` so Node's stdio inherits the terminal
+    /// (interactive TTY handoff, signal forwarding) exactly as before. When
+    /// `true`, stdout is piped and returned in `SpawnResult.stdout`, stderr goes
+    /// to the inherited terminal (informational — not part of the diff), and the
+    /// interactive foreground/process-group machinery is skipped (a captured
+    /// probe is non-interactive by definition).
+    pub capture_stdout: bool,
 }
 
-/// The result of spawning a Node process.
+/// The result of spawning a Node process. `stdout` is `Some` only when the
+/// config requested `capture_stdout`.
 pub struct SpawnResult {
     pub status: ExitStatus,
+    pub stdout: Option<Vec<u8>>,
 }
 
 /// Spawn Node with Nub's augmentation pipeline.
@@ -771,10 +783,35 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // User args always pass through.
     cmd.args(config.user_args);
 
-    // Inherit stdio.
-    cmd.stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+    // Stdio. Normal run: inherit everything (interactive terminal). Capture
+    // mode (cook verify probe only): pipe stdout to read it back for the
+    // differential; stderr still inherits (warnings are informational, not part
+    // of the stdout diff); stdin is null (a verify probe is non-interactive).
+    if config.capture_stdout {
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+    } else {
+        cmd.stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+    }
+
+    // Capture mode is a self-contained probe: skip the interactive TTY
+    // foreground handoff and process-group signal forwarding (they exist to make
+    // an inherited interactive child behave; a piped, stdin-null probe has no
+    // terminal to hand off and no Ctrl-C to forward). Wait on the child directly
+    // and return its captured stdout.
+    if config.capture_stdout {
+        let output = cmd
+            .spawn()
+            .and_then(|c| c.wait_with_output())
+            .with_context(|| format!("failed to run {} (capture)", config.node.path))?;
+        return Ok(SpawnResult {
+            status: output.status,
+            stdout: Some(output.stdout),
+        });
+    }
 
     // Put the Node child in its OWN process group (setpgid at exec) so an
     // interactive Ctrl-C is delivered EXACTLY ONCE. Without this the child shares
@@ -814,7 +851,10 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // Stop forwarding to this (now-exited) group before returning. (No-op off Unix.)
     untrack_child();
 
-    Ok(SpawnResult { status })
+    Ok(SpawnResult {
+        status,
+        stdout: None,
+    })
 }
 
 /// RAII guard that removes the PATH shim directory on drop.
@@ -1726,6 +1766,55 @@ mod tests {
         );
         // An embedded double-quote in a spacey value is backslash-escaped.
         assert_eq!(node_options_quote(r#"/tmp/a "b" c"#), r#""/tmp/a \"b\" c""#);
+    }
+
+    #[test]
+    fn compat_mode_disables_all_augmentation() {
+        // The kill-switch contract behind `--node` / `NODE_COMPAT`: under compat,
+        // `compute_augmentation_env` returns None — NO preload, NODE_OPTIONS, or
+        // PATH shim is set up — plain Node. This is the seam the cook fallback
+        // rides through `run_file_with_compat`; the cli.rs `cook` dispatch must
+        // thread `compat_mode` here for the FLAG form (not just the env form) to
+        // reach this gate. The test is a genuine CONTRAST — it resolves a REAL
+        // preload so `compat=false` produces Some(...) — proving compat is what
+        // suppresses augmentation, not a missing install.
+        // Lay out a resolvable preload next to a fake nub binary: <tmp>/bin/nub
+        // with <tmp>/runtime/preload.{mjs,cjs} (find_preload walks up to runtime/).
+        // No tempfile dev-dep — matching this crate's convention (see config_cache).
+        let root = std::env::temp_dir().join(format!(
+            "nub-compat-augment-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let bin_dir = root.join("bin");
+        let runtime_dir = root.join("runtime");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(runtime_dir.join("preload.mjs"), b"// preload\n").unwrap();
+        std::fs::write(runtime_dir.join("preload.cjs"), b"// preload\n").unwrap();
+        let nub_bin = bin_dir.join("nub");
+        std::fs::write(&nub_bin, b"#!/bin/sh\n").unwrap();
+
+        let v = NodeVersion::new(22, 15, 0);
+
+        // Reentrancy is keyed on NODE_OPTIONS carrying OUR specific preload token;
+        // this temp preload's token won't be present in the test's env, so the
+        // non-compat path reaches a real injection (the contrast baseline).
+        let augmented = compute_augmentation_env(&nub_bin, v.clone(), false, None);
+        let compat = compute_augmentation_env(&nub_bin, v, true, None);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            augmented.is_some(),
+            "non-compat with a resolvable preload MUST augment (the contrast baseline)"
+        );
+        assert!(
+            compat.is_none(),
+            "compat_mode=true MUST suppress augmentation even when a preload resolves"
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ members = ["crates/nub-cache-key", "crates/nub-cli", "crates/nub-core"]
 # path dep that crosses the workspace boundary — the cache-key crate's
 # `workspace = true` inheritance resolves against THIS workspace, and nub-native
 # recompiles it under its own unwind profile for the final cdylib.
-exclude = ["vendor/aube", "crates/nub-native"]
+exclude = ["vendor/aube", "vendor/perry", "crates/nub-native"]
 resolver = "3"
 
 # Tier-0 release tuning. `panic = "abort"` drops the unwind tables/metadata from
