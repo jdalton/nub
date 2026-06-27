@@ -1,30 +1,81 @@
-<svg viewBox="0 0 720 228" width="720" height="228" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="cold start (fib.ts): nub cook 13.8 ms, node 28.1 ms, nub run 56.6 ms">
-  <rect x="0" y="0" width="720" height="228" rx="8" fill="#ffffff"/>
-  <text x="96" y="26" font-size="15" font-weight="600" fill="#1f2328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">cold start &#8212; nub cook (fib.ts), lower is better</text>
-  <text x="624" y="26" text-anchor="end" font-size="13" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">macOS arm64 &#183; hyperfine -N</text>
-  <!-- nub cook -->
-  <text x="96" y="67" text-anchor="end" dominant-baseline="central" font-size="14" font-weight="600" fill="#1f2328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">nub cook</text>
-  <rect x="110" y="56" width="514" height="22" rx="4" fill="#ffedd5"/>
-  <rect x="110" y="56" width="110.8" height="22" rx="4" fill="#fb8500"/>
-  <line x1="212.8" x2="228.8" y1="67" y2="67" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="212.8" x2="212.8" y1="63" y2="71" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="228.8" x2="228.8" y1="63" y2="71" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <text x="234.8" y="67" dominant-baseline="central" font-size="13.5" font-weight="600" fill="#bd5800" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">13.8 ms</text>
-  <!-- node -->
-  <text x="96" y="113" text-anchor="end" dominant-baseline="central" font-size="14" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">node</text>
-  <rect x="110" y="102" width="514" height="22" rx="4" fill="#eaeef2"/>
-  <rect x="110" y="102" width="225.7" height="22" rx="4" fill="#6e7781"/>
-  <line x1="323.6" x2="347.7" y1="113" y2="113" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="323.6" x2="323.6" y1="109" y2="117" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="347.7" x2="347.7" y1="109" y2="117" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <text x="353.7" y="113" dominant-baseline="central" font-size="13.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">28.1 ms</text>
-  <!-- nub (run) -->
-  <text x="96" y="159" text-anchor="end" dominant-baseline="central" font-size="14" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">nub (run)</text>
-  <rect x="110" y="148" width="514" height="22" rx="4" fill="#ddf4ff"/>
-  <rect x="110" y="148" width="454.6" height="22" rx="4" fill="#54aeff"/>
-  <line x1="540.5" x2="588.7" y1="159" y2="159" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="540.5" x2="540.5" y1="155" y2="163" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="588.7" x2="588.7" y1="155" y2="163" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <text x="594.7" y="159" dominant-baseline="central" font-size="13.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">56.6 ms</text>
-  <text x="96" y="216" font-size="12.5" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">native binary starts 2.04&#215; faster than Node &#183; bars = mean, whiskers = &#177;1&#963;</text>
+<svg viewBox="0 0 724 432" width="724" height="432" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="cold start across approaches, fib and import-heavy scripts, lower is better">
+  <rect x="0" y="0" width="724" height="432" rx="8" fill="#ffffff"/>
+  <text x="175" y="24" text-anchor="end" font-size="15" font-weight="600" fill="#1f2328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">cold start</text>
+  <text x="189" y="24" font-size="13" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">five startup strategies, one script per group — lower is better</text>
+  <text x="14" y="40" font-size="14" font-weight="600" fill="#1f2328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">fib (trivial)</text>
+  <text x="710" y="40" text-anchor="end" font-size="12" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">macOS arm64 · node v26.3.1 · hyperfine -N</text>
+  <text x="175" y="64" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="600" fill="#1f2328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">cook</text>
+  <rect x="189" y="54" width="360" height="20" rx="4" fill="#ffedd5"/>
+  <rect x="189" y="54" width="71.3" height="20" rx="4" fill="#fb8500"/>
+  <line x1="252.1" x2="268.5" y1="64" y2="64" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="252.1" x2="252.1" y1="60" y2="68" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="268.5" x2="268.5" y1="60" y2="68" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="266.3" y="64" dominant-baseline="central" font-size="12.5" font-weight="600" fill="#bd5800" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">11.6 ms (5.05× node)</text>
+  <text x="175" y="94" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">v8 snapshot</text>
+  <rect x="189" y="84" width="360" height="20" rx="4" fill="#eaeef2"/>
+  <rect x="189" y="84" width="227.8" height="20" rx="4" fill="#6e7781"/>
+  <line x1="404.7" x2="428.8" y1="94" y2="94" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="404.7" x2="404.7" y1="90" y2="98" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="428.8" x2="428.8" y1="90" y2="98" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="422.8" y="94" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">36.9 ms (1.58× node)</text>
+  <text x="175" y="124" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">v8 compile-cache</text>
+  <rect x="189" y="114" width="360" height="20" rx="4" fill="#eaeef2"/>
+  <rect x="189" y="114" width="280.1" height="20" rx="4" fill="#6e7781"/>
+  <line x1="450.7" x2="487.5" y1="124" y2="124" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="450.7" x2="450.7" y1="120" y2="128" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="487.5" x2="487.5" y1="120" y2="128" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="475.1" y="124" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">45.4 ms (1.29× node)</text>
+  <text x="175" y="154" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">tsx</text>
+  <rect x="189" y="144" width="360" height="20" rx="4" fill="#eaeef2"/>
+  <rect x="189" y="144" width="348.9" height="20" rx="4" fill="#6e7781"/>
+  <line x1="524.3" x2="551.5" y1="154" y2="154" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="524.3" x2="524.3" y1="150" y2="158" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="551.5" x2="551.5" y1="150" y2="158" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="543.9" y="154" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">56.5 ms (1.03× node)</text>
+  <text x="175" y="184" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">node</text>
+  <rect x="189" y="174" width="360" height="20" rx="4" fill="#eaeef2"/>
+  <rect x="189" y="174" width="360.0" height="20" rx="4" fill="#6e7781"/>
+  <line x1="527.9" x2="570.1" y1="184" y2="184" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="527.9" x2="527.9" y1="180" y2="188" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="570.1" x2="570.1" y1="180" y2="188" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="555.0" y="184" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">58.3 ms (1.00× node)</text>
+  <text x="14" y="234" font-size="14" font-weight="600" fill="#1f2328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">import-heavy (60 modules)</text>
+  <text x="710" y="234" text-anchor="end" font-size="12" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">lower is better</text>
+  <text x="175" y="258" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="600" fill="#1f2328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">v8 snapshot</text>
+  <rect x="189" y="248" width="360" height="20" rx="4" fill="#ffedd5"/>
+  <rect x="189" y="248" width="69.4" height="20" rx="4" fill="#fb8500"/>
+  <line x1="253.8" x2="263.1" y1="258" y2="258" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="253.8" x2="253.8" y1="254" y2="262" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="263.1" x2="263.1" y1="254" y2="262" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="264.4" y="258" dominant-baseline="central" font-size="12.5" font-weight="600" fill="#bd5800" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">39.3 ms (2.12× node)</text>
+  <text x="175" y="288" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">v8 compile-cache</text>
+  <rect x="189" y="278" width="360" height="20" rx="4" fill="#eaeef2"/>
+  <rect x="189" y="278" width="94.6" height="20" rx="4" fill="#6e7781"/>
+  <line x1="278.8" x2="288.4" y1="288" y2="288" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="278.8" x2="278.8" y1="284" y2="292" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="288.4" x2="288.4" y1="284" y2="292" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="289.6" y="288" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">53.5 ms (1.55× node)</text>
+  <text x="175" y="318" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">node</text>
+  <rect x="189" y="308" width="360" height="20" rx="4" fill="#eaeef2"/>
+  <rect x="189" y="308" width="147.0" height="20" rx="4" fill="#6e7781"/>
+  <line x1="330.9" x2="341.1" y1="318" y2="318" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="330.9" x2="330.9" y1="314" y2="322" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="341.1" x2="341.1" y1="314" y2="322" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="342.0" y="318" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">83.1 ms (1.00× node)</text>
+  <text x="175" y="348" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">tsx</text>
+  <rect x="189" y="338" width="360" height="20" rx="4" fill="#eaeef2"/>
+  <rect x="189" y="338" width="151.8" height="20" rx="4" fill="#6e7781"/>
+  <line x1="335.7" x2="345.9" y1="348" y2="348" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="335.7" x2="335.7" y1="344" y2="352" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="345.9" x2="345.9" y1="344" y2="352" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="346.8" y="348" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">85.8 ms (0.97× node)</text>
+  <text x="175" y="378" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">cook</text>
+  <rect x="189" y="368" width="360" height="20" rx="4" fill="#eaeef2"/>
+  <rect x="189" y="368" width="360.0" height="20" rx="4" fill="#6e7781"/>
+  <line x1="538.7" x2="559.3" y1="378" y2="378" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="538.7" x2="538.7" y1="374" y2="382" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="559.3" x2="559.3" y1="374" y2="382" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="555.0" y="378" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">203.5 ms (0.41× node)</text>
+  <text x="14" y="420" font-size="11.5" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">cook = perry native AOT (what nub cook produces)</text>
+  <text x="710" y="420" text-anchor="end" font-size="11.5" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">bars = mean · whiskers = ±1σ · orange = fastest in group</text>
 </svg>

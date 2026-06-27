@@ -2,24 +2,118 @@
 
 `nub cook <script>` AOT-compiles a supported TypeScript/JavaScript script to a
 native host executable via [PerryTS](https://github.com/PerryTS/perry), VERIFIES
-it against nub-augmented Node, caches the verified binary, and runs it. The payoff is
-**cold-start latency**: a native binary starts in ~14ms versus Node's ~28ms — no
-V8 warmup, no module graph, no transpile. Run once to compile + verify; every run
-after is a cache hit.
+it against nub-augmented Node, caches the verified binary, and runs it. The payoff
+is **cold-start latency**: a native binary skips V8 warmup, the module graph, and
+transpilation entirely. Run once to compile + verify; every run after is a cache
+hit.
+
+This example doubles as a **map of the Node startup-optimization landscape**. The
+[benchmark below](#the-startup-landscape-cold-start) puts cook next to plain Node,
+a TypeScript loader (tsx), and the two startup levers Node ships natively — a
+**V8 startup snapshot** and the **V8 compile cache** — across two scripts. The
+short version: each lever cuts a *different* part of startup, so each wins on a
+different workload, and the chart shows exactly where.
 
 cook attempts the whole TypeScript family — `.ts`, `.mts` (ESM), `.cts` (CJS),
-and `.tsx` — plus plain JavaScript. PerryTS's compiler handles all of them; the
-fixtures here cover `.ts`/`.mts`/`.cts`. Anything the compiler can't handle falls
-back to Node (see below).
+and `.tsx` — plus plain JavaScript. PerryTS's compiler handles all of them;
+anything it can't handle falls back to Node (see below).
 
-This is a proof of concept. The win we **measured** is cold start — **2.04× vs
-the Node floor** (below). We did not benchmark compute throughput or memory here,
-so this makes no compute/RAM claim; native AOT (no V8 heap, no JIT warmup,
-smaller RSS) plausibly helps those too. The boundary on whether `nub cook`
-applies is the **supported surface** — does PerryTS compile the script — not the
-workload's shape. PerryTS owns the "can this compile?" decision; nub asks it,
-then independently checks the compiled binary against nub's Node before trusting
-it.
+## The startup landscape (cold start)
+
+Five ways to start the same script, measured cold (a fresh process per run) with
+`hyperfine --warmup 5 -N`, on macOS arm64, **Node v26.3.1**, perry 0.5.1189:
+
+![cold start across approaches](cold-start.svg)
+
+| approach | what it removes from startup |
+| --- | --- |
+| **node** | nothing — the baseline (native `.mts` type-stripping) |
+| **cook** (perry native AOT) | the entire V8/Node runtime — there is no Node process |
+| **tsx** | nothing; *adds* a TypeScript loader hook on top of Node |
+| **v8 snapshot** | parse + compile + instantiate (a pre-baked heap), but **not** the process boot |
+| **v8 compile-cache** | parse + compile (a warm code cache), but **not** instantiate or the boot |
+
+The reproducer is [`bench.sh`](bench.sh) (`./examples/cook/bench.sh`), which builds
+each artifact, checks every approach prints identical output, runs the two
+hyperfine groups, and regenerates the chart with [`make-chart.mjs`](make-chart.mjs).
+
+### What the numbers say
+
+**Trivial script** ([`fib.mts`](fib.mts) — first 30 Fibonacci numbers, no
+imports, startup-dominated):
+
+| approach | cold start | vs node |
+| --- | --- | --- |
+| cook | 11.6 ms ± 1.3 | **5.05× faster** |
+| v8 snapshot | 36.9 ms ± 1.9 | 1.58× faster |
+| v8 compile-cache | 45.4 ms ± 3.0 | 1.29× faster |
+| tsx | 56.5 ms ± 2.2 | 1.03× (≈ node) |
+| node | 58.3 ms ± 3.4 | — |
+
+**Import-heavy script** ([`heavy/heavy.mts`](heavy/heavy.mts) — 480 functions
+across 60 ESM modules, so parse/compile/instantiate is a real cost):
+
+| approach | cold start | vs node |
+| --- | --- | --- |
+| v8 snapshot | 39.3 ms ± 2.6 | **2.12× faster** |
+| v8 compile-cache | 53.5 ms ± 2.7 | 1.55× faster |
+| node | 83.1 ms ± 2.9 | — |
+| tsx | 85.8 ms ± 2.9 | 0.97× (≈ node) |
+| cook | 203.5 ms ± 5.8 | 0.41× (slower) |
+
+Three honest readings of this data:
+
+1. **cook removes the runtime, so it owns the trivial case.** On `fib` there is
+   almost no code to parse — the cost is the V8/Node process boot itself, and
+   only cook eliminates that. It starts in ~12 ms regardless of script size, a
+   flat ~5× under plain Node.
+2. **Snapshot and compile-cache scale with code, not boot — so they grow on the
+   heavy script.** Neither removes the Node process; they only cut
+   parse/compile/instantiate. On trivial `fib` that part is small, so the win is
+   modest (snapshot 1.58×, compile-cache 1.29×) — though notably **not** within
+   noise: a snapshot also bakes in Node's *own* bootstrap heap, which it skips
+   re-compiling on every run. On the import-heavy script the parse/compile cost
+   is large, and the same two levers pull clearly ahead (snapshot **2.12×**,
+   compile-cache 1.55×). This is the case they exist for: short scripts with a
+   real module graph.
+3. **cook is slower on the heavy script here — and that's reported, not hidden.**
+   The perry build used (0.5.1189) carries a per-module initialization cost in
+   the produced binary that grows with the module count; a 60-module binary pays
+   ~190 ms of it at startup, which swamps the runtime-removal win. cook's
+   sweet spot is small, self-contained scripts (a CLI, a tool, a single hot
+   path), not a large module graph — at least with this perry build.
+
+`tsx` is in the chart as the reproducible stand-in for a "TypeScript via a Node
+loader hook" tier (the role nub's own `nub <file>` run path fills). It tracks
+plain Node within noise here because the script transpiles trivially; a loader's
+cost shows up on heavier transpile work, not on this fixture.
+
+### One-time costs (not in the cold-start bars)
+
+Every approach above amortizes a setup step that the timed runs don't pay:
+
+- **cook** — the `perry compile` + verify (the first cook of a script). Amortized
+  by nub's persistent cache; an ephemeral environment (CI with no warm cache)
+  pays it every run.
+- **v8 snapshot** — `node --build-snapshot` produces the `.blob` once. The blob is
+  Node-version-specific.
+- **v8 compile-cache** — the first run populates `NODE_COMPILE_CACHE`; every run
+  after reads it. The benchmark primes it once before timing.
+
+### Why snapshot uses an inlined CJS entry
+
+A V8 startup snapshot is built from a **CommonJS, synchronous** entry: V8's
+`mksnapshot` cannot evaluate an ESM module graph at build time (`import()` reports
+`Not supported`). So the snapshot entries here
+([`fib-snapshot-entry.cjs`](fib-snapshot-entry.cjs),
+[`heavy/heavy-snapshot-entry.cjs`](heavy/heavy-snapshot-entry.cjs)) inline the
+same logic the `.mts` files run and register it with
+`v8.startupSnapshot.setDeserializeMainFunction`. The equivalence gate in
+`bench.sh` confirms the snapshot prints byte-identical output to plain Node before
+any timing. The heavy fixture and its snapshot entry are both regenerated from
+[`heavy/gen-mods.mjs`](heavy/gen-mods.mjs) — it emits the 60 modules, the barrel,
+and the inlined CJS snapshot entry from one source of truth, so the inlined
+functions can't drift from the modules.
 
 ## How it works
 
@@ -104,27 +198,13 @@ never trusts a freshly compiled binary on perry's word alone.
 
 Without either, `nub cook` prints a clear note and runs on Node instead.
 
-### The vendored PerryTS (the benchmark target)
-
-The benchmark is pinned to a vendored PerryTS at [`vendor/perry`](../../vendor/perry),
-a git submodule. This pins the perry the numbers were measured against and makes
-"test latest" a one-line submodule bump rather than relying on whatever perry is
-installed locally. cook itself stays version-agnostic — it subprocess-calls perry
-and cache-keys on `perry --version`; the submodule is only the test/bench target.
-
-Build the vendored perry (its own target dir, so it never collides with nub's):
-
-```sh
-cd vendor/perry
-export CARGO_TARGET_DIR=/tmp/perry-target
-cargo build --release --bin perry            # the CLI
-cargo build --release -p perry-runtime-static # libperry_runtime.a (the link archive)
-```
-
-`perry compile` links against `libperry_runtime.a`, which the
-`perry-runtime-static` crate emits next to the `perry` binary — build both. To
-test a newer perry, `git -C vendor/perry fetch && git -C vendor/perry checkout
-<commit>`, rebuild, re-run [`bench.sh`](bench.sh), and commit the new gitlink.
+To reproduce the benchmark you also need [`hyperfine`](https://github.com/sharkdp/hyperfine),
+a Node ≥ 22.18 (native `.mts` type-stripping; the V8 compile cache needs ≥ 22.8),
+and — for the `tsx` row — a `tsx` install reachable from the example (`npm i tsx`
+in `examples/cook`, or set `TSX_LOADER`). The tsx row is skipped if absent.
+[`make-chart.mjs`](make-chart.mjs) rasterizes the `.png` via `rsvg-convert` or
+macOS `qlmanage` if present; the `.svg` is the source of truth and renders on
+GitHub directly.
 
 ## Demo
 
@@ -146,34 +226,6 @@ $ node fib.ts 10        # (via nub's normal run path)
 Every subsequent run is a cache hit — it execs the verified binary directly, with
 no perry and no Node involved.
 
-### Startup comparison
-
-The cooked native binary vs. plain Node (the floor) vs. running the same script
-through `nub <file>` (transpile + Node), measured with `hyperfine` against a
-**release** build of nub and the vendored PerryTS (macOS arm64, Node 22, perry
-0.5.1206 from `vendor/perry`):
-
-```
-$ hyperfine --warmup 5 -N './fib.cooked 30' 'node fib.mjs 30' 'nub fib.ts 30'
-Benchmark 1: ./fib.cooked 30
-  Time (mean ± σ):      13.8 ms ±   1.0 ms
-Benchmark 2: node fib.mjs 30
-  Time (mean ± σ):      28.1 ms ±   1.5 ms
-Benchmark 3: nub fib.ts 30
-  Time (mean ± σ):      56.6 ms ±   3.0 ms
-Summary
-  './fib.cooked 30' ran
-    2.04 ± 0.19 times faster than 'node fib.mjs 30'
-    4.12 ± 0.38 times faster than 'nub fib.ts 30'
-```
-
-About **2.04× faster cold start than plain Node** — the native binary skips V8
-warmup, the module graph, and transpilation entirely. The Node floor is the fair,
-conservative comparison; the `nub <file>` row also carries nub's transpile +
-augmentation preload, so read cook-vs-Node as the headline. Reproduce with
-[`bench.sh`](bench.sh), which compiles `fib.ts` with the vendored perry and runs
-the three-way `hyperfine`.
-
 ### Unsupported script — graceful Node fallback
 
 `unsupported.ts` uses `eval()`, which can't be AOT-compiled:
@@ -188,38 +240,21 @@ the answer is 42
 ```
 
 The script still runs — the AOT path is an optimization, never a gate. Pass
-`--debug` to dump PerryTS's raw output instead of the concise cause:
-
-```
-$ nub cook unsupported.ts --debug
-nub cook: unsupported.ts uses APIs PerryTS does not compile:
-  [D002] eval() cannot be compiled to native code (unsupported.ts:5)
---- perry check (raw, --debug) ---
-[stdout]
-{"code":"D002", … ,"message":"eval() cannot be compiled to native code …"}
-{"type":"summary","success":false, … }
-[stderr]
-Error: Check failed with errors
---- end perry output ---
-  This looks like a PerryTS gap — file an issue: https://github.com/PerryTS/perry/issues
-  Running on Node instead.
-the answer is 42
-```
+`--debug` to dump PerryTS's raw output instead of the concise cause.
 
 ## Caveats
 
-- **The boundary is the supported surface, not the workload shape.** The win we
-  **measured** here is cold start: **2.04× vs the Node floor** (`fib.ts`, below).
-  We did **not** benchmark compute throughput or memory, so this PoC makes no
-  compute/RAM claim — but native AOT (no V8 heap, no JIT warmup, smaller RSS)
-  plausibly helps those too, so we don't claim compute-heavy work sees "little to
-  no win." The real gate on whether `nub cook` applies is **does PerryTS compile
-  the script** — the supported surface — not whether the workload is
-  startup-bound or compute-bound. The cold-path cost (the check, the LLVM
-  compile, and the two verify runs) only amortizes from a **persistent warm
-  cache**; an ephemeral environment (e.g. CI without a warm cache) pays the full
-  cold cost on every run, so the startup win is for repeated local runs of a
-  stable script.
+- **The boundary is the supported surface, not the workload shape.** The gate on
+  whether `nub cook` applies is **does PerryTS compile the script** — not whether
+  the workload is startup-bound or compute-bound. The cold-path cost (the check,
+  the LLVM compile, and the two verify runs) only amortizes from a **persistent
+  warm cache**; an ephemeral environment (e.g. CI without a warm cache) pays the
+  full cold cost on every run.
+- **cook's win is workload-shaped (see the benchmark).** It is largest on small,
+  self-contained scripts where the V8/Node boot dominates. A large module graph
+  can erase the win — and, with the perry build measured here, invert it (the
+  import-heavy row above). Measure your own script; don't assume cook is always
+  faster.
 - **First-run double-run (side-effect caveat).** Verify-before-trust runs the
   script **twice** on its first cook — once as the cooked binary and once on
   Node — to confirm they behave identically. cook is therefore intended for
