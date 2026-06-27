@@ -14,9 +14,10 @@ anything it can't handle falls back to Node (see below).
 ## Cold start: cook vs node vs nub
 
 The three ways to start the same script: the cooked native binary, plain `node`,
-and `nub` (transpile + Node — the normal `nub <file>` run path). Measured cold (a
-fresh process per run) with `hyperfine --warmup 5 -N` (≥40 runs), on macOS arm64,
-**Node v26.4.0**, perry 0.5.1206:
+and `nub` (transpile + Node — the normal `nub <file>` run path). All three run the
+same `.mts` source. Measured cold (a fresh process per run) with
+`hyperfine --warmup 5 -N` (≥40 runs), on macOS arm64, **Node v26.4.0**,
+perry 0.5.1206:
 
 ![cold start: cook vs node vs nub, fib and import-heavy scripts](cold-start.svg)
 
@@ -31,21 +32,21 @@ step.
 GRAPH, not a longer-running program.** The compute in both `fib` and `heavy` is
 deliberately tiny; the only axis that changes between them is *how much code there
 is to load and enumerate*. `heavy`'s argument is kept small on purpose — Node's
-`heavy` time is flat from `HN=1` to `HN≈1000`, so the ~83 ms is the cost of
+`heavy` time is flat from `HN=1` to `HN≈1000`, so the ~82 ms is the cost of
 parsing, compiling, and instantiating 60 modules at startup, **not** the loop.
 
 ### Trivial script
 
-[`fib.ts`](fib.ts) — first 30 Fibonacci numbers, no imports, startup-dominated:
+[`fib.mts`](fib.mts) — first 30 Fibonacci numbers, no imports, startup-dominated:
 
 | approach | cold start | vs node |
 | --- | --- | --- |
-| cook | 12.7 ms ± 1.2 | **4.43× faster** |
-| node | 56.2 ms ± 2.3 | — |
-| nub | 65.7 ms ± 2.7 | 0.86× node |
+| cook | 11.0 ms ± 1.1 | **5.07× faster** |
+| node | 55.9 ms ± 3.3 | — |
+| nub | 64.0 ms ± 2.8 | 0.87× node |
 
 There is almost no code to load — the cost is the V8/Node process boot itself, and
-only cook eliminates that. cook starts in ~12 ms. `nub` runs ~10 ms behind plain
+only cook eliminates that. cook starts in ~11 ms. `nub` runs ~8 ms behind plain
 Node on this fixture: the script transpiles trivially, so nub's number is plain
 Node's boot plus the run-path's preload overhead — the loader cost that this
 trivial script can't amortize. cook is the only approach that removes the runtime
@@ -58,10 +59,10 @@ an `export *` barrel, enumerated with `Object.values`:
 
 | approach | cold start | vs node |
 | --- | --- | --- |
-| cook | 13.2 ms ± 1.1 | **6.29× faster** |
-| node | 83.0 ms ± 2.2 | — |
+| cook | 11.6 ms ± 1.1 | **7.03× faster** |
+| node | 81.6 ms ± 2.8 | — |
 
-cook stays at its ~13 ms floor: module init is cheap (60 modules initialize in a
+cook stays at its ~12 ms floor: module init is cheap (60 modules initialize in a
 few ms), so removing the runtime wins on the import-heavy script too.
 
 ### A note on a prior regression
@@ -75,7 +76,7 @@ over the wide star-export barrel namespace, which was **O(modules²)** in PerryT
 `own_key_present`. [PerryTS#5738](https://github.com/PerryTS/perry/pull/5738) made
 that path O(1)-per-key on wide objects — on the issue's repro, K=240 dropped from
 140 ms to 12 ms and the per-module slope went flat. With that fix (perry 0.5.1206),
-the heavy fixture's enumeration is ~13.2 ms, so cook now leads node by ~6×.
+the heavy fixture's enumeration is ~11.6 ms, so cook now leads node by ~7×.
 
 The reproducer is [`bench.sh`](bench.sh) (`./examples/cook/bench.sh`), which builds
 the cooked binary, checks all three approaches print identical output, runs the two
@@ -177,7 +178,7 @@ and renders on GitHub directly.
 ### Supported script — compiled, verified, cached
 
 ```
-$ nub cook fib.ts 10
+$ nub cook fib.mts 10
 0 1 1 2 3 5 8 13 21 34
 ```
 
@@ -185,7 +186,7 @@ The first run compiles, verifies against Node, and caches. Output is identical t
 Node:
 
 ```
-$ node fib.ts 10        # (via nub's normal run path)
+$ node fib.mts 10        # (via nub's normal run path)
 0 1 1 2 3 5 8 13 21 34
 ```
 

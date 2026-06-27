@@ -6,41 +6,41 @@
   <text x="710" y="40" text-anchor="end" font-size="12" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">macOS arm64 · node v26.4.0 · hyperfine -N</text>
   <text x="175" y="64" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="600" fill="#1f2328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">cook</text>
   <rect x="189" y="54" width="360" height="20" rx="4" fill="#ffedd5"/>
-  <rect x="189" y="54" width="69.5" height="20" rx="4" fill="#fb8500"/>
-  <line x1="252.0" x2="265.0" y1="64" y2="64" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="252.0" x2="252.0" y1="60" y2="68" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="265.0" x2="265.0" y1="60" y2="68" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <text x="264.5" y="64" dominant-baseline="central" font-size="12.5" font-weight="600" fill="#bd5800" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">12.7 ms (4.43× node)</text>
+  <rect x="189" y="54" width="62.1" height="20" rx="4" fill="#fb8500"/>
+  <line x1="244.8" x2="257.4" y1="64" y2="64" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="244.8" x2="244.8" y1="60" y2="68" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="257.4" x2="257.4" y1="60" y2="68" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="257.1" y="64" dominant-baseline="central" font-size="12.5" font-weight="600" fill="#bd5800" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">11.0 ms (5.07× node)</text>
   <text x="175" y="94" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">node</text>
   <rect x="189" y="84" width="360" height="20" rx="4" fill="#eaeef2"/>
-  <rect x="189" y="84" width="308.0" height="20" rx="4" fill="#6e7781"/>
-  <line x1="484.5" x2="509.4" y1="94" y2="94" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="484.5" x2="484.5" y1="90" y2="98" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="509.4" x2="509.4" y1="90" y2="98" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <text x="503.0" y="94" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">56.2 ms (1.00× node)</text>
+  <rect x="189" y="84" width="314.6" height="20" rx="4" fill="#6e7781"/>
+  <line x1="485.1" x2="522.1" y1="94" y2="94" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="485.1" x2="485.1" y1="90" y2="98" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="522.1" x2="522.1" y1="90" y2="98" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="509.6" y="94" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">55.9 ms (1.00× node)</text>
   <text x="175" y="124" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">nub</text>
   <rect x="189" y="114" width="360" height="20" rx="4" fill="#eaeef2"/>
   <rect x="189" y="114" width="360.0" height="20" rx="4" fill="#6e7781"/>
-  <line x1="534.2" x2="563.8" y1="124" y2="124" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="534.2" x2="534.2" y1="120" y2="128" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="563.8" x2="563.8" y1="120" y2="128" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <text x="555.0" y="124" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">65.7 ms (0.86× node)</text>
+  <line x1="533.3" x2="564.7" y1="124" y2="124" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="533.3" x2="533.3" y1="120" y2="128" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="564.7" x2="564.7" y1="120" y2="128" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="555.0" y="124" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">64.0 ms (0.87× node)</text>
   <text x="14" y="174" font-size="14" font-weight="600" fill="#1f2328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">import-heavy (60 modules)</text>
   <text x="710" y="174" text-anchor="end" font-size="12" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">lower is better</text>
   <text x="175" y="198" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="600" fill="#1f2328" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">cook</text>
   <rect x="189" y="188" width="360" height="20" rx="4" fill="#ffedd5"/>
-  <rect x="189" y="188" width="57.3" height="20" rx="4" fill="#fb8500"/>
-  <line x1="241.3" x2="251.2" y1="198" y2="198" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="241.3" x2="241.3" y1="194" y2="202" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="251.2" x2="251.2" y1="194" y2="202" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <text x="252.3" y="198" dominant-baseline="central" font-size="12.5" font-weight="600" fill="#bd5800" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">13.2 ms (6.29× node)</text>
+  <rect x="189" y="188" width="51.2" height="20" rx="4" fill="#fb8500"/>
+  <line x1="235.5" x2="244.9" y1="198" y2="198" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="235.5" x2="235.5" y1="194" y2="202" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="244.9" x2="244.9" y1="194" y2="202" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="246.2" y="198" dominant-baseline="central" font-size="12.5" font-weight="600" fill="#bd5800" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">11.6 ms (7.03× node)</text>
   <text x="175" y="228" text-anchor="end" dominant-baseline="central" font-size="13.5" font-weight="400" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">node</text>
   <rect x="189" y="218" width="360" height="20" rx="4" fill="#eaeef2"/>
   <rect x="189" y="218" width="360.0" height="20" rx="4" fill="#6e7781"/>
-  <line x1="539.5" x2="558.5" y1="228" y2="228" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="539.5" x2="539.5" y1="224" y2="232" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <line x1="558.5" x2="558.5" y1="224" y2="232" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
-  <text x="555.0" y="228" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">83.0 ms (1.00× node)</text>
+  <line x1="536.4" x2="561.6" y1="228" y2="228" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="536.4" x2="536.4" y1="224" y2="232" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <line x1="561.6" x2="561.6" y1="224" y2="232" stroke="#1f2328" stroke-opacity="0.32" stroke-width="1.5"/>
+  <text x="555.0" y="228" dominant-baseline="central" font-size="12.5" font-weight="500" fill="#57606a" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">81.6 ms (1.00× node)</text>
   <text x="14" y="270" font-size="11.5" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">cook = perry native AOT (what nub cook produces)</text>
   <text x="710" y="270" text-anchor="end" font-size="11.5" fill="#6e7781" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">bars = mean · whiskers = ±1σ · orange = fastest in group</text>
 </svg>

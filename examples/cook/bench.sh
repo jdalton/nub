@@ -22,7 +22,7 @@
 #                         exactly what `nub cook` produces (cook wraps perry); the
 #                         bench calls perry directly so it needs no nub-cook build.
 #   2. node             — `node script.mts`  (baseline; native .mts type-stripping)
-#   3. nub              — `nub script.ts`    (transpile + Node — the normal run path)
+#   3. nub              — `nub script.mts`   (transpile + Node — the normal run path)
 #
 # Two groups:
 #   - fib   (trivial): startup-dominated, almost no code to load — cook removes the
@@ -66,7 +66,7 @@ chmod +x "$cooked"
 # Equivalence gate: cook, node, and nub must print identical stdout before timing.
 want="$("$NODE_BIN" "$here/fib.mts" "$N")"
 got_cook="$("$cooked" "$N")"
-got_nub="$("$NUB_BIN" "$here/fib.ts" "$N")"
+got_nub="$("$NUB_BIN" "$here/fib.mts" "$N")"
 [ "$got_cook" = "$want" ] || { echo "DIVERGENCE: cook != node" >&2; exit 1; }
 [ "$got_nub"  = "$want" ] || { echo "DIVERGENCE: nub != node"  >&2; exit 1; }
 echo "equivalence: cook, node, nub print identical output ✓"
@@ -74,7 +74,7 @@ echo "equivalence: cook, node, nub print identical output ✓"
 hyperfine --warmup 5 --min-runs "$RUNS" -N --export-json "$here/results-fib.json" \
   -n "cook" "$cooked $N" \
   -n "node" "$NODE_BIN $here/fib.mts $N" \
-  -n "nub"  "$NUB_BIN $here/fib.ts $N"
+  -n "nub"  "$NUB_BIN $here/fib.mts $N"
 echo
 
 # ── heavy (60-module import graph) — cook vs node ────────────────────────────
