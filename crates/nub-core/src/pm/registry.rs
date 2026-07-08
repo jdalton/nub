@@ -1189,11 +1189,7 @@ mod tests {
 
         // Absolute path AT the project `.npmrc` → trusted.
         assert!(
-            auth_file_trusts_project(
-                dir.join(".npmrc").to_str().unwrap(),
-                &dir,
-                &dir,
-            ),
+            auth_file_trusts_project(dir.join(".npmrc").to_str().unwrap(), &dir, &dir),
             "the project's own .npmrc path must trust it"
         );
         // Relative `.npmrc` resolved against cwd == root → trusted.
@@ -1208,11 +1204,7 @@ mod tests {
         );
         // A path that doesn't exist → fail-closed (untrusted).
         assert!(
-            !auth_file_trusts_project(
-                dir.join("missing.npmrc").to_str().unwrap(),
-                &dir,
-                &dir,
-            ),
+            !auth_file_trusts_project(dir.join("missing.npmrc").to_str().unwrap(), &dir, &dir),
             "an unresolvable path must fail closed"
         );
 
