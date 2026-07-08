@@ -10,7 +10,7 @@
 //! `dist.shasum` (sha1) is the fail-closed fallback for ancient publishes that
 //! predate `integrity`.
 
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -102,7 +102,7 @@ pub fn registry_config(root: &std::path::Path) -> RegistryConfig {
     // `.npmrc` (repo-controlled) and the USER `~/.npmrc` (operator-controlled) are
     // read SEPARATELY so their values can carry different trust for `${VAR}`
     // expansion (see [`project_npmrc_trusted`] / [`resolve_base`]).
-    let project_trusted = project_npmrc_trusted();
+    let project_trusted = project_npmrc_trusted(root);
     let user_registry = home_npmrc().and_then(|p| read_npmrc_key(&p, "registry"));
     let base = resolve_base(
         env_nonempty("npm_config_registry"),
@@ -120,16 +120,46 @@ pub fn registry_config(root: &std::path::Path) -> RegistryConfig {
 /// to interpolate a secret from the caller's environment into a registry URL or
 /// auth credential bound for an attacker-chosen host. That interpolation happens
 /// before any lifecycle script runs, so script-blocking can't stop it; the only
-/// defense is to not expand it. This is the pnpm GHSA-3qhv-2rgh-x77r class (fixed
-/// in pnpm 10.34.2 / 11.5.3).
+/// defense is to not expand it. This is the pnpm GHSA-3qhv-2rgh-x77r class:
+/// https://github.com/pnpm/pnpm/security/advisories/GHSA-3qhv-2rgh-x77r (fixed in
+/// pnpm 10.34.2 and 11.5.3).
 ///
-/// Opt back in the pnpm-compatible way: set `PNPM_CONFIG_NPMRC_AUTH_FILE` in the
-/// ENVIRONMENT (CI that trusts its own checkout does this). Because the flag comes
-/// from the environment and never from a repo file, a cloned/PR'd repo cannot set
-/// it for you. The USER `~/.npmrc` is always trusted regardless — it is the
+/// Opt back in the pnpm-compatible way: `PNPM_CONFIG_NPMRC_AUTH_FILE` (pnpm's
+/// `npmrcAuthFile`) is a PATH to the trusted auth file, not a boolean. pnpm
+/// re-trusts the project `.npmrc` ONLY when that path resolves to the project's
+/// own `.npmrc` (`PNPM_CONFIG_NPMRC_AUTH_FILE=.npmrc`, relative to the working
+/// dir) — a value pointing elsewhere (an absolute CI secret file) names a
+/// different trusted file and leaves the repo `.npmrc` UNtrusted. So gate on the
+/// resolved path matching `<root>/.npmrc`, never on mere presence — presence-trust
+/// would re-open the exfiltration for anyone who set the var to a non-project
+/// path. The flag comes from the ENVIRONMENT (a cloned/PR'd repo can't set it for
+/// you), and the USER `~/.npmrc` is always trusted regardless — it is the
 /// operator's own file, the home of the normal `${NPM_TOKEN}` pattern.
-fn project_npmrc_trusted() -> bool {
-    env_nonempty("PNPM_CONFIG_NPMRC_AUTH_FILE").is_some()
+fn project_npmrc_trusted(root: &std::path::Path) -> bool {
+    let Some(raw) = env_nonempty("PNPM_CONFIG_NPMRC_AUTH_FILE") else {
+        return false;
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    auth_file_trusts_project(&raw, &cwd, root)
+}
+
+/// PURE: does the configured `PNPM_CONFIG_NPMRC_AUTH_FILE` path point AT the
+/// project's own `<root>/.npmrc`? A relative value resolves against `cwd` (pnpm's
+/// rule). Comparison is fail-CLOSED: it trusts only when both paths canonicalize
+/// to the same real file; if either can't be canonicalized (e.g. the file doesn't
+/// exist), it returns false rather than risk trusting a repo-controlled file.
+fn auth_file_trusts_project(configured: &str, cwd: &Path, root: &Path) -> bool {
+    let p = Path::new(configured);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    let project = root.join(".npmrc");
+    match (resolved.canonicalize(), project.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The user-level `~/.npmrc` path, if a home directory resolves.
@@ -1140,6 +1170,53 @@ mod tests {
             base, "https://evil.example/${NPM_TOKEN}",
             "an untrusted project `.npmrc` registry must keep `${{NPM_TOKEN}}` literal"
         );
+    }
+
+    /// The pnpm trust flag is a PATH, not a boolean: it re-trusts the project
+    /// `.npmrc` ONLY when it resolves to that exact file. A value pointing at a
+    /// different auth file must leave the repo `.npmrc` untrusted, or the
+    /// GHSA-3qhv-2rgh-x77r exfiltration reopens for anyone with a non-project
+    /// `PNPM_CONFIG_NPMRC_AUTH_FILE`.
+    #[test]
+    fn auth_file_trusts_project_only_on_exact_path_match() {
+        let dir = std::env::temp_dir().join(format!("nub-authfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".npmrc"), "registry=https://r.example/\n").unwrap();
+        // A different, real auth file elsewhere — the legitimate non-project use.
+        let other = dir.join("creds.npmrc");
+        std::fs::write(&other, "//r.example/:_authToken=tok\n").unwrap();
+
+        // Absolute path AT the project `.npmrc` → trusted.
+        assert!(
+            auth_file_trusts_project(
+                dir.join(".npmrc").to_str().unwrap(),
+                &dir,
+                &dir,
+            ),
+            "the project's own .npmrc path must trust it"
+        );
+        // Relative `.npmrc` resolved against cwd == root → trusted.
+        assert!(
+            auth_file_trusts_project(".npmrc", &dir, &dir),
+            "a relative `.npmrc` against the project dir must trust it"
+        );
+        // A different auth file → NOT trusted (the reopened-exfiltration case).
+        assert!(
+            !auth_file_trusts_project(other.to_str().unwrap(), &dir, &dir),
+            "a non-project auth file must leave the repo .npmrc untrusted"
+        );
+        // A path that doesn't exist → fail-closed (untrusted).
+        assert!(
+            !auth_file_trusts_project(
+                dir.join("missing.npmrc").to_str().unwrap(),
+                &dir,
+                &dir,
+            ),
+            "an unresolvable path must fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The USER `~/.npmrc` is operator-controlled, so its `registry` value IS
