@@ -1,0 +1,11 @@
+# Supply-chain soak for cargo's own dependency resolution — the same
+# 7-day rule the PM applies to npm deps via minimumReleaseAge: crate
+# versions published less than 7 days ago are pubtime-incompatible and
+# the resolver skips them unless already in Cargo.lock
+# (resolver.incompatible-publish-age defaults to "deny"). The unstable
+# feature is active because rust-toolchain.toml pins a nightly.
+[unstable]
+min-publish-age = true
+
+[registry]
+global-min-publish-age = "7 days"

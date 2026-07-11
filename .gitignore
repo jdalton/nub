@@ -19,6 +19,10 @@
 # (target/<profile>/libnub_native.*) would miss it.
 !crates/nub-native/.cargo/
 !crates/nub-native/.cargo/config.toml
+# Root .cargo/config.toml carries the min-publish-age soak window for
+# cargo's dependency resolution — tracked for the same reason as above.
+!.cargo/
+!.cargo/config.toml
 
 # Vendored aube is plain in-tree files (Pattern B) — track its ENTIRE tree,
 # including dot-prefixed entries the broad `.*` rule above would otherwise hide
