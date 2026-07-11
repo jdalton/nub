@@ -23,6 +23,8 @@
 # cargo's dependency resolution — tracked for the same reason as above.
 !.cargo/
 !.cargo/config.toml
+# Root .npmrc carries the npm-side soak window (min-release-age) — same regime.
+!.npmrc
 
 # Vendored aube is plain in-tree files (Pattern B) — track its ENTIRE tree,
 # including dot-prefixed entries the broad `.*` rule above would otherwise hide

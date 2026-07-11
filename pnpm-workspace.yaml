@@ -1,0 +1,16 @@
+# Catalog + npm-side soak surface (pnpm reads minimumReleaseAge in MINUTES
+# from here; nub's own PM engine reads the same file in user projects).
+# Managed by scripts/soak/soak.mts (`pnpm run soak` / `pnpm run soak:fix`).
+
+catalog:
+  taze: 19.14.1
+
+# Wait 7 days (10080 minutes) before installing newly published packages.
+minimumReleaseAge: 10080
+
+# Exclusions: bare names / scope globs express standing trust; version pins
+# are dated soak bypasses and REQUIRE, on the line above:
+#   # published: YYYY-MM-DD | removable: YYYY-MM-DD   (removable = published + 7d)
+# `pnpm run soak` rejects unannotated or expired pins; `soak:fix` prunes
+# expired ones.
+# minimumReleaseAgeExclude: []
