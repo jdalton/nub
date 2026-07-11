@@ -39,6 +39,12 @@ export const RUSTUP_CARGO = path.join(os.homedir(), '.cargo/bin/cargo')
 // exact versions under rack/<tool>/<version>/, flat PATH handles in bin/.
 export const EXTERNAL_TOOLS_JSON = path.join(REPO_ROOT, 'external-tools.json')
 
+// CI agent image that pre-bakes the pinned toolchain + sfw (null when the
+// repo has no such image — nub's docker/ images are product artifacts that
+// install released nub, not dev tooling).
+export const DOCKER_PREBAKE: string | null = null
+export const RUST_TOOLCHAIN_TOML = 'rust-toolchain.toml'
+
 const XDG_DATA_HOME = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local/share')
 export const DEV_TOOLS_DIR = path.join(XDG_DATA_HOME, 'nub/dev-tools')
 export const RACK_DIR = path.join(DEV_TOOLS_DIR, 'rack')
