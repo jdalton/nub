@@ -6,7 +6,8 @@ catalog:
   taze: 19.14.1
   untracked: 1.6.4
 
-# Wait 7 days (10080 minutes) before installing newly published packages.
+# Cooldown (minutes) before newly published packages install — value managed
+# by soak:fix; the window is SOAK_DAYS in scripts/soak/constants.mts.
 minimumReleaseAge: 10080
 
 # Exclusions: bare names / scope globs express standing trust; version pins

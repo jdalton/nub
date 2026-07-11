@@ -904,9 +904,9 @@ jobs:
           cache-dependency-path: site/pnpm-lock.yaml
       - name: soak + external-tool pin gates
         run: |
-          node scripts/soak/soak.mts --check
-          node scripts/soak/external-tools.mts --check
-          node --test scripts/soak/*.test.mts
+          pnpm run soak
+          pnpm run tools:check
+          pnpm run test:scripts
       # The checker slugifies headings with github-slugger (a transitive site
       # dep) to match the rendered anchors exactly; install the site workspace
       # so it resolves. --frozen-lockfile keeps it deterministic.

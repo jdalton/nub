@@ -40,11 +40,13 @@ on:
     branches: [main]
     paths:
       - "docker/**"
+      - ".dockerignore"
       - ".github/workflows/docker.yml"
   pull_request:
     branches: [main]
     paths:
       - "docker/**"
+      - ".dockerignore"
       - ".github/workflows/docker.yml"
   # The publish path. release.yml's `docker` job calls this as a reusable workflow
   # after publish-npm (see the WHY-workflow_call note in the header). A maintainer

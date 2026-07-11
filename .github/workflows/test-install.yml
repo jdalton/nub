@@ -22,8 +22,6 @@ permissions: {}
 jobs:
   os:
     name: ${{ matrix.os }}
-    permissions:
-      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +31,8 @@ jobs:
         # paths.
         os: [ubuntu-latest, macos-14, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
         with:
@@ -43,8 +43,7 @@ jobs:
       - name: Install @nubjs/nub@${{ inputs.version }}
         env:
           NUB_VERSION: ${{ inputs.version }}
-        # zizmor: ignore[adhoc-packages] installing the published package under test is the point of this workflow
-        run: npm install -g "@nubjs/nub@$NUB_VERSION"
+        run: npm install -g "@nubjs/nub@$NUB_VERSION" # zizmor: ignore[adhoc-packages] installing the published package under test is the point of this workflow
       - name: Smoke
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/smoke.sh"
@@ -52,9 +51,9 @@ jobs:
   musl:
     name: linux-musl
     runs-on: ubuntu-latest
-    container: node:22-alpine
     permissions:
       contents: read
+    container: node:22-alpine
     steps:
       - name: Toolchain (bash + git)
         run: apk add --no-cache bash git
@@ -64,8 +63,7 @@ jobs:
       - name: Install @nubjs/nub@${{ inputs.version }}
         env:
           NUB_VERSION: ${{ inputs.version }}
-        # zizmor: ignore[adhoc-packages] installing the published package under test is the point of this workflow
-        run: npm install -g "@nubjs/nub@$NUB_VERSION"
+        run: npm install -g "@nubjs/nub@$NUB_VERSION" # zizmor: ignore[adhoc-packages] installing the published package under test is the point of this workflow
       - name: Smoke (musl)
         shell: bash
         run: bash "$GITHUB_WORKSPACE/.github/scripts/smoke.sh"

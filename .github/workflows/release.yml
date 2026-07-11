@@ -456,8 +456,7 @@ jobs:
 
       - name: Stage vendored runtime node_modules (embedded into the binary)
         shell: bash
-        # zizmor: ignore[adhoc-packages] the npm install below is pinned to the exact versions the pnpm lockfile installed (read via ver()); --no-save vendoring is the point
-        run: |
+        run: | # zizmor: ignore[adhoc-packages] the npm install below is pinned to the exact versions the pnpm lockfile installed (read via ver()); --no-save vendoring is the point
           # Vendor the pure-JS runtime deps into runtime/node_modules at the EXACT
           # versions installed in the workspace (so a shipped nub's transpile output
           # is byte-identical to dev's). Read versions by relative-FILE require from
@@ -1034,8 +1033,7 @@ jobs:
         # every attempt (real breakage is not masked — all 12 must fail to report red).
         # The retry re-runs npm install each attempt so the binary resolves fresh.
         shell: bash
-        # zizmor: ignore[adhoc-packages] installs the package this run just published to smoke it; no lockfile applies to a global install
-        run: |
+        run: | # zizmor: ignore[adhoc-packages] installs the package this run just published to smoke it; no lockfile applies to a global install
           MAX=12; attempt=0
           while true; do
             attempt=$((attempt + 1))
@@ -1078,8 +1076,7 @@ jobs:
         # Up to 12 attempts with stepped backoff (30 s × first 3 retries, then 60 s)
         # ≈ 9.5 min max window. A genuine bad release fails every attempt.
         shell: bash
-        # zizmor: ignore[adhoc-packages] installs the package this run just published to smoke it; no lockfile applies to a global install
-        run: |
+        run: | # zizmor: ignore[adhoc-packages] installs the package this run just published to smoke it; no lockfile applies to a global install
           MAX=12; attempt=0
           while true; do
             attempt=$((attempt + 1))

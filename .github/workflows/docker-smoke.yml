@@ -20,6 +20,7 @@ on:
       - "runtime/**"
       - "vendor/aube/**"
       - "tests/docker-smoke/**"
+      - ".dockerignore"
       - ".github/workflows/docker-smoke.yml"
   pull_request:
     branches: [main]
@@ -28,6 +29,7 @@ on:
       - "runtime/**"
       - "vendor/aube/**"
       - "tests/docker-smoke/**"
+      - ".dockerignore"
       - ".github/workflows/docker-smoke.yml"
 
 concurrency:
