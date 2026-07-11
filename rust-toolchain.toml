@@ -1,0 +1,7 @@
+# Pinned exact stable so every workspace in the repo (nub, nub-native,
+# nub-phantom, vendor/aube) builds with one toolchain. 1.95 is the floor
+# for core::hint::cold_path(), used on rare arms of hot install loops in
+# the vendored aube engine.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
