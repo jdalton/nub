@@ -542,6 +542,11 @@ jobs:
     needs: matrix-plan
     if: needs.matrix-plan.outputs.run_rust == 'true'
     runs-on: ${{ matrix.os }}
+    # SOCKET_SECURITY_KEY repo secret feeds both names sfw reads; empty until
+    # the secret lands — sfw then runs its keyless free tier.
+    env:
+      SOCKET_API_KEY: ${{ secrets.SOCKET_SECURITY_KEY }}
+      SOCKET_API_TOKEN: ${{ secrets.SOCKET_SECURITY_KEY }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.matrix-plan.outputs.test) }}
@@ -654,6 +659,10 @@ jobs:
             echo "TEST_NODE_BIN_20_11_0=$dir_20_11"
             echo "TEST_NODE_BIN_26_5_0=$dir_26_5"
           } >> "$GITHUB_ENV"
+      - name: socket firewall shims
+        run: |
+          node scripts/soak/external-tools.mts --install sfw --shims
+          node scripts/soak/external-tools.mts --print-bin >> "$GITHUB_PATH"
       - run: pnpm install --frozen-lockfile
       # The data-format loader tests need the nub-native addon (the npm yaml/toml/
       # json5 parser fallback isn't a dev dep). Built in DEBUG, not release: the
@@ -836,6 +845,10 @@ jobs:
           node-version: "24"
           cache: "pnpm"
           cache-dependency-path: site/pnpm-lock.yaml
+      - name: soak + external-tool pin gates
+        run: |
+          node scripts/soak/soak.mts --check
+          node scripts/soak/external-tools.mts --check
       # The checker slugifies headings with github-slugger (a transitive site
       # dep) to match the rendered anchors exactly; install the site workspace
       # so it resolves. --frozen-lockfile keeps it deterministic.
