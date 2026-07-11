@@ -924,6 +924,7 @@ yarn.lock
 !crates/nub-native/.cargo
 !jsbi
 !lodash
+!tests/docker-smoke
 !undici-types
 !urlpattern-polyfill
 !vendor/aube/.cargo
