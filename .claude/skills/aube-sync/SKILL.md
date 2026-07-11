@@ -120,7 +120,8 @@ Because the invariant held (`nub-fork` tip tree == `vendor/aube` before the merg
 ```sh
 rm -rf /tmp/merged && mkdir -p /tmp/merged
 git archive <merge-commit-sha> | tar -x -C /tmp/merged
-rsync -a --delete /tmp/merged/ <nub-worktree>/vendor/aube/
+# Guard: an empty /tmp/merged (failed archive) + --delete would EMPTY vendor/aube.
+test -n "$(ls -A /tmp/merged)" && rsync -a --delete /tmp/merged/ <nub-worktree>/vendor/aube/
 git -C <nub-worktree> add vendor/aube
 git -C <nub-worktree> status --short vendor/aube   # == the upstream delta filelist, nothing else
 ```
