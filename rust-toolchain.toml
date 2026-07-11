@@ -1,7 +1,9 @@
-# Pinned exact stable so every workspace in the repo (nub, nub-native,
-# nub-phantom, vendor/aube) builds with one toolchain. 1.95 is the floor
-# for core::hint::cold_path(), used on rare arms of hot install loops in
-# the vendored aube engine.
+# Pinned dated nightly, adopted under a 7-day soak: the pin is the newest
+# nightly at least 7 days old on the adoption date (2026-07-11); bumps
+# follow the same rule. One exact toolchain covers every workspace in the
+# repo (nub, nub-native, nub-phantom, vendor/aube). rust-version stays the
+# stable msrv floor (1.95, for core::hint::cold_path() on rare arms of hot
+# install loops in the vendored aube engine).
 [toolchain]
-channel = "1.95.0"
+channel = "nightly-2026-07-04"
 components = ["rustfmt", "clippy"]
