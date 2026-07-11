@@ -93,6 +93,8 @@ jobs:
             dockerfile: docker/Dockerfile.alpine
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          persist-credentials: false
 
       # QEMU enables the linux/arm64 leg of the multi-arch push on an amd64 runner.
       - name: Set up QEMU
@@ -166,9 +168,10 @@ jobs:
       - name: Compute push tags
         if: inputs.nub_version != '' && vars.DOCKER_IMAGE != ''
         id: tags
+        env:
+          IMG: ${{ vars.DOCKER_IMAGE }}
+          VER: ${{ steps.ver.outputs.value }}
         run: |
-          IMG="${{ vars.DOCKER_IMAGE }}"
-          VER="${{ steps.ver.outputs.value }}"
           if [ "${{ matrix.variant }}" = "slim" ]; then
             echo "list=${IMG}:latest,${IMG}:${VER},${IMG}:slim,${IMG}:${VER}-slim" >> "$GITHUB_OUTPUT"
           else
