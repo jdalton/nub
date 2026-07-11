@@ -43,7 +43,6 @@ export const EXTERNAL_TOOLS_JSON = path.join(REPO_ROOT, 'external-tools.json')
 // repo has no such image — nub's docker/ images are product artifacts that
 // install released nub, not dev tooling).
 export const DOCKER_PREBAKE: string | null = null
-export const RUST_TOOLCHAIN_TOML = 'rust-toolchain.toml'
 
 // .dockerignore managed by `untracked` (docker-smoke + the from-source
 // image COPY the repo, so the managed exclusions shape their contexts).
