@@ -16,9 +16,9 @@ against it:
 |---|---|---|
 | `.cargo/config.toml` | `global-min-publish-age` | `"N days"` |
 | `rust-toolchain.toml` | nightly channel date vs `# adopted:` line | days |
-| `pnpm-workspace.yaml` | `minimumReleaseAge` | minutes |
+| `tools/pnpm-workspace.yaml` | `minimumReleaseAge` | minutes |
 | `.npmrc` | `min-release-age` | days |
-| `taze.config.mts` | `maturityPeriod` | imports `SOAK_DAYS` |
+| `tools/taze.config.mts` | `maturityPeriod` | imports `SOAK_DAYS` |
 | `external-tools.json` | `soakBypass` annotations | days |
 
 ## Commands (package.json scripts — the code lives in `scripts/soak/`)
@@ -48,7 +48,7 @@ committed, reviewable change, never a silent one.
 
 ## Skip the soak for ONE package (dated, temporary)
 
-Add to `minimumReleaseAgeExclude` in `pnpm-workspace.yaml` with the
+Add to `minimumReleaseAgeExclude` in `tools/pnpm-workspace.yaml` with the
 annotation on the line above (block list only — flow `[..]` is rejected
 because a comment line can't attach to an inline entry):
 

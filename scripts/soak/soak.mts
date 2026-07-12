@@ -7,9 +7,9 @@
  *
  *   - `.cargo/config.toml`        `global-min-publish-age` + `[unstable] min-publish-age`
  *   - `rust-toolchain.toml`       nightly channel vs `# adopted:` (dated-nightly soak)
- *   - `pnpm-workspace.yaml`  `minimumReleaseAge` (minutes) + annotated excludes
+ *   - `tools/pnpm-workspace.yaml`  `minimumReleaseAge` (minutes) + annotated excludes
  *   - `.npmrc`               `min-release-age` (days)
- *   - `taze.config.mts`      imports SOAK_DAYS (existence + import check)
+ *   - `tools/taze.config.mts`      imports SOAK_DAYS (existence + import check)
  *
  *   `--check` (default) fails loud with What / Saw / Wanted / Fix on drift.
  *   `--fix` rewrites window values in place and prunes excludes whose

@@ -23,7 +23,6 @@
     "urlpattern-polyfill": "^10.1.0"
   },
   "devDependencies": {
-    "taze": "19.14.1",
     "untracked": "1.6.4"
   },
   "scripts": {

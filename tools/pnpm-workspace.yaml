@@ -1,10 +1,14 @@
-# Catalog + npm-side soak surface (pnpm reads minimumReleaseAge in MINUTES
-# from here; nub's own PM engine reads the same file in user projects).
-# Managed by scripts/soak/soak.mts (`pnpm run soak` / `pnpm run soak:fix`).
+# pnpm-side soak surface + catalog (pnpm reads minimumReleaseAge in MINUTES
+# from a workspace yaml ONLY — .npmrc is ignored for it). Managed by
+# scripts/soak/soak.mts (`pnpm run soak` / `pnpm run soak:fix`).
+#
+# This file deliberately lives in tools/, not the repo root: nub treats a
+# workspace yaml beside a pnpm lockfile as a workspace-root marker, and one at
+# the root redirects the test matrix's older-Node legs through the root
+# engines (see ../.npmrc for the full story).
 
 catalog:
   taze: 19.14.1
-  untracked: 1.6.4
 
 # Cooldown (minutes) before newly published packages install — value managed
 # by soak:fix; the window is SOAK_DAYS in scripts/soak/constants.mts.

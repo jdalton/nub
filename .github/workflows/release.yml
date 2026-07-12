@@ -284,8 +284,8 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5 # zizmor: ignore[cache-poisoning] test gate only; node_modules here only feed cargo test
         with:
           node-version: "24"
-          cache: "pnpm"
-      - run: pnpm install --frozen-lockfile
+          cache: "npm"
+      - run: npm ci
       # The data-format loader tests (data_format_loaders, and the env-* tests whose
       # fixture imports a .json5/.yaml file) need the nub-native addon — the npm
       # parser fallback (yaml/@iarna/toml/json5) isn't a dev dependency, so without
@@ -401,10 +401,10 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5 # zizmor: ignore[cache-poisoning] tag runs restore only caches saved by main/tag runs (PR caches are branch-isolated), so seeding requires push access
         with:
           node-version: "24"
-          cache: "pnpm"
+          cache: "npm"
 
       - name: Install JS dependencies
-        run: pnpm install --frozen-lockfile
+        run: npm ci
 
       - name: Install cross
         if: matrix.cross

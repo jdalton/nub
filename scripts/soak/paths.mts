@@ -13,19 +13,23 @@ import { fileURLToPath } from 'node:url'
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 
-// Soak surfaces (repo-relative). nub's npm package lives at the repo root,
-// so the workspace yaml / npmrc / taze config are root files.
+// Soak surfaces (repo-relative). The repo ROOT is npm-only (.npmrc,
+// package-lock.json — wpt-worker runs a root npm ci); the pnpm-side soak
+// (workspace yaml with catalog + minimumReleaseAge, taze) is anchored in
+// tools/ so the workspace yaml never marks the repo root as a workspace —
+// nub would inherit the root engines and redirect the test matrix's
+// older-Node legs (see .npmrc for the full story).
 export const SURFACES = {
   cargoConfig: '.cargo/config.toml',
   npmrc: '.npmrc',
-  workspaceYaml: 'pnpm-workspace.yaml',
-  tazeConfig: 'taze.config.mts',
+  workspaceYaml: 'tools/pnpm-workspace.yaml',
+  tazeConfig: 'tools/taze.config.mts',
   toolchainToml: 'rust-toolchain.toml',
 }
 
 // The directory holding the npm package the soak governs (taze runs here,
 // the repo's installer refreshes this package's lockfile).
-export const NPM_PKG_DIR = REPO_ROOT
+export const NPM_PKG_DIR = path.join(REPO_ROOT, 'tools')
 
 // Lockfile refreshers tried in order after taze rewrites package.json.
 export const NPM_INSTALLERS: string[][] = [['pnpm', 'install']]
