@@ -32,6 +32,8 @@
     "deps:update": "node scripts/soak/update-deps.mts",
     "tools:check": "node scripts/soak/external-tools.mts --check",
     "tools:install": "node scripts/soak/external-tools.mts --install-all --shims",
+    "remotes:check": "node scripts/soak/remotes.mts --check",
+    "remotes:fix": "node scripts/soak/remotes.mts --fix",
     "dockerignore:update": "untracked --write .dockerignore",
     "test:scripts": "node --test scripts/soak/*.test.mts"
   },
