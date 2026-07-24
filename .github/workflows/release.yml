@@ -39,7 +39,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5 # zizmor: ignore[cache-poisoning] verify is a check-only gate; nothing built here is published
@@ -104,7 +104,7 @@ jobs:
       AUBE_PRIMER_TOP: "2000"
       AUBE_PRIMER_VERSION_CAP: "100"
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5 # zizmor: ignore[cache-poisoning] this job runs no package install (generate-primer.mjs uses node: builtins only), so the default cache is unused
@@ -270,13 +270,13 @@ jobs:
       # fan-out (regressed during the 2026-06 repo move; tracked separately). It
       # still runs in ci.yml as its own must-pass signal, just not in the publish
       # critical path.
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
       - name: Init node-suite submodule (shallow)
         run: git submodule update --init --depth 1 tests/node-suite
         shell: bash
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable # zizmor: ignore[impostor-commit,ref-version-mismatch] dtolnay force-pushes its version tags, so pinned SHAs go unreachable; commit verified genuine upstream
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2 # zizmor: ignore[cache-poisoning] test gate only; objects compiled here never reach published artifacts
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320  # v5
         with:
@@ -326,10 +326,10 @@ jobs:
       contents: read
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable # zizmor: ignore[impostor-commit,ref-version-mismatch] dtolnay force-pushes its version tags, so pinned SHAs go unreachable; commit verified genuine upstream
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2 # zizmor: ignore[cache-poisoning] conformance gate; the debug binary built here is exercised, not published
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5 # zizmor: ignore[cache-poisoning] conformance gate; nothing built here is published
         with:
@@ -368,7 +368,7 @@ jobs:
       matrix: ${{ fromJSON(needs.verify.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
 
@@ -386,7 +386,7 @@ jobs:
           name: metadata-primer
           path: vendor/aube/crates/aube-resolver/data
 
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable # zizmor: ignore[impostor-commit,ref-version-mismatch] dtolnay force-pushes its version tags, so pinned SHAs go unreachable; commit verified genuine upstream
         with:
           targets: ${{ matrix.target }}
 
@@ -720,7 +720,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5 # zizmor: ignore[cache-poisoning] this job installs nothing; the published bits come from the build artifacts, not the cache
@@ -825,7 +825,7 @@ jobs:
       # Creates/updates the GitHub Release and uploads/re-uploads its assets.
       contents: write
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
       - name: Download all platform artifacts
@@ -1017,7 +1017,7 @@ jobs:
         os: [ubuntu-latest, macos-14, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5 # zizmor: ignore[cache-poisoning] post-publish smoke of the already-published package; this job publishes nothing
@@ -1067,7 +1067,7 @@ jobs:
     steps:
       - name: Toolchain (bash + git for checkout/smoke)
         run: apk add --no-cache bash git
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
       - name: Install from npm and smoke (with propagation-race retry)
@@ -1111,7 +1111,7 @@ jobs:
       contents: read
     steps:
       # Check out the nub repo for the formula generator script.
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
 
@@ -1134,7 +1134,7 @@ jobs:
 
       - name: Check out the tap
         if: steps.gate.outputs.enabled == 'true'
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5 # zizmor: ignore[artipacked] the commit-and-push step below pushes with this checkout's persisted HOMEBREW_TAP_TOKEN
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1 # zizmor: ignore[artipacked] the commit-and-push step below pushes with this checkout's persisted HOMEBREW_TAP_TOKEN
         with:
           repository: nubjs/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
