@@ -18,10 +18,11 @@ pub use detect::{
 };
 pub use drift::DriftStatus;
 pub use io::{
-    Error, LockfileKind, active_lockfile_has_conflict_markers, aube_lock_filename,
+    Error, LockfileKind, ParseOptions, active_lockfile_has_conflict_markers, aube_lock_filename,
     build_canonical_map, detect_existing_lockfile_kind, parse_for_import, parse_json,
-    parse_lockfile, parse_lockfile_with_kind, pnpm_lock_filename, read_lockfile, write_lockfile,
-    write_lockfile_as, write_lockfile_preserving_existing,
+    parse_lockfile, parse_lockfile_with_kind, parse_lockfile_with_kind_and_options,
+    pnpm_lock_filename, read_lockfile, write_lockfile, write_lockfile_as,
+    write_lockfile_preserving_existing,
 };
 pub(crate) use io::{atomic_write_lockfile, current_git_branch};
 pub use merge::{MergeReport, merge_branch_lockfiles};
@@ -31,6 +32,8 @@ pub use source::{
     parse_git_spec, parse_hosted_git, parse_hosted_git_tarball, resolve_dep_edge,
     shared_local_dep_path,
 };
+
+pub(crate) const EXTRA_PRESERVE_TARBALL_URL: &str = "__aube_preserve_tarball_url";
 
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -122,10 +125,10 @@ pub struct LockfileGraph {
     /// release.
     pub bun_config_version: Option<u32>,
     /// Top-level `patchedDependencies:` block mirrored by bun 1.1+ and
-    /// pnpm 9+. Key: selector (`lodash@4.17.21`), value: relative patch
-    /// file path (`patches/lodash@4.17.21.patch`). Round-tripped
-    /// verbatim so a parse/write cycle doesn't silently drop user
-    /// patches from the lockfile.
+    /// pnpm 9+. Key: selector (`lodash@4.17.21`); value is the relative
+    /// patch path for bun/fresh resolution or pnpm's patch-content hash
+    /// when parsed from a pnpm lockfile. The pnpm writer resolves paths
+    /// to hashes before serializing.
     pub patched_dependencies: BTreeMap<String, String>,
     /// Sidecar of [`Self::patched_dependencies`]: the sha256 hex of
     /// each patch file's contents, keyed by the same selector. pnpm 10
@@ -296,8 +299,8 @@ pub struct DirectDep {
     pub dep_type: DepType,
     /// The specifier as written in package.json at the time the lockfile was
     /// generated (e.g., `"^4.17.0"`). Used by drift detection to compare against
-    /// the current manifest. Only populated by formats that record it
-    /// (pnpm-lock.yaml v9). `None` for npm/yarn/bun lockfiles.
+    /// the current manifest. Populated by formats that record it
+    /// (pnpm importers and npm root/workspace package entries).
     pub specifier: Option<String>,
 }
 
@@ -460,6 +463,20 @@ pub struct LockedPackage {
     /// preserves third-party pnpm lockfiles that mark registry-shaped
     /// tarballs as hosted git.
     pub registry_git_hosted: bool,
+    /// Write-time signal: always emit `resolution.tarball` for this package
+    /// because its resolved registry host is NOT what `.npmrc`/config would
+    /// derive (a pnpm `namedRegistries` alias routed it to a different host).
+    /// The default writer omits `tarball` for registry packages whose URL has
+    /// the derivable `/-/<name>-<ver>.tgz` shape and reconstructs it from the
+    /// configured registry at install time — but that reconstruction uses the
+    /// DEFAULT registry and would 404 for a named-registry package, so a frozen
+    /// install must read the persisted URL. Set by the resolver's finalize pass
+    /// (which has the registry config to compare hosts); `false` for standalone
+    /// aube and every config-derivable registry/scoped-registry package, so the
+    /// lockfile output is unchanged there. Not itself a lockfile field — it is
+    /// re-derived on every resolve, and a package that lands with it set simply
+    /// writes the `tarball` it already carries.
+    pub force_tarball_url: bool,
     /// For npm-alias deps (`"h3-v2": "npm:h3@2.0.1-rc.20"`): the real
     /// package name on the registry (`"h3"`). `None` means the entry
     /// is not aliased and `name` already holds the registry name.
@@ -600,6 +617,22 @@ impl LockedPackage {
             .map(|source| format!("{}@{}", self.registry_name(), source.specifier()))
     }
 
+    /// Repository-wide approval key for a Git-backed package source.
+    ///
+    /// Unlike [`Self::source_approval_key`], this deliberately omits the
+    /// resolved commit. It is only used for an explicit `allowBuilds`
+    /// `git+<repository>` rule, never for package-name approval.
+    pub fn git_repository_approval_key(&self) -> Option<String> {
+        let LocalSource::Git(git) = self.local_source.as_ref()? else {
+            return None;
+        };
+        Some(format!(
+            "{}@git+{}",
+            self.registry_name(),
+            git.url.strip_prefix("git+").unwrap_or(&git.url)
+        ))
+    }
+
     /// Declared peer ranges with pnpm's meta-only peers folded in as `*`.
     ///
     /// pnpm records a `peerDependencies: { x: '*' }` entry for every
@@ -641,6 +674,7 @@ mod locked_package_tests {
             bundled_dependencies: Vec::new(),
             tarball_url: None,
             registry_git_hosted: false,
+            force_tarball_url: false,
             alias_of: None,
             yarn_checksum: None,
             engines: BTreeMap::new(),
@@ -691,6 +725,40 @@ mod locked_package_tests {
         assert_eq!(
             pkg.source_approval_key(),
             Some("pkg@https://example.com/pkg.tgz".to_string())
+        );
+    }
+
+    #[test]
+    fn git_repository_approval_key_omits_resolved_commit() {
+        let mut pkg = pkg();
+        pkg.local_source = Some(LocalSource::Git(GitSource {
+            url: "https://github.com/acme/pkg.git".to_string(),
+            committish: Some("main".to_string()),
+            resolved: "0123456789012345678901234567890123456789".to_string(),
+            integrity: None,
+            subpath: None,
+        }));
+
+        assert_eq!(
+            pkg.git_repository_approval_key(),
+            Some("pkg@git+https://github.com/acme/pkg.git".to_string())
+        );
+    }
+
+    #[test]
+    fn git_repository_approval_key_normalizes_an_existing_git_prefix() {
+        let mut pkg = pkg();
+        pkg.local_source = Some(LocalSource::Git(GitSource {
+            url: "git+ssh://git@github.com/acme/pkg.git".to_string(),
+            committish: None,
+            resolved: "0123456789012345678901234567890123456789".to_string(),
+            integrity: None,
+            subpath: None,
+        }));
+
+        assert_eq!(
+            pkg.git_repository_approval_key(),
+            Some("pkg@git+ssh://git@github.com/acme/pkg.git".to_string())
         );
     }
 }

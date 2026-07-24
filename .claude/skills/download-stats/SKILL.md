@@ -1,6 +1,8 @@
 ---
 name: download-stats
 description: Generate all-time download-stats CSVs for nub across its distribution channels (npm + GitHub release assets, which subsume Homebrew). Invoke (via the Skill tool) when asked to check, chart, or export download numbers, install counts, or adoption stats. Encodes the channel map, each channel's real granularity and lag, and the checksum-asset inflation gotcha.
+metadata:
+  internal: true
 ---
 
 # download-stats — pull nub's download numbers into CSVs

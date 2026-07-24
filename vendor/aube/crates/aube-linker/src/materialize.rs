@@ -625,7 +625,6 @@ impl Linker {
             let target = pkg_nm_dir.join(rel_path);
 
             if let Err(e) = self.link_file_fresh(stored, rel_path, &target) {
-                core::hint::cold_path();
                 if let Error::MissingStoreFile { .. } = &e {
                     invalidate_stale_index_for_package(&self.store, pkg, self.index_read_key(pkg));
                 }
@@ -751,17 +750,20 @@ impl Linker {
             // `pkg_nm_parent` is `<base_dir>/<subdir>/node_modules/`, so
             // two parents deep brings us to `<base_dir>/` where all
             // sibling subdirs live side-by-side.
-            let virtual_root = pkg_nm_parent
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or(&pkg_nm_parent);
-            let sibling_abs = virtual_root
-                .join(&sibling_subdir)
-                .join("node_modules")
-                .join(dep_name);
-            let link_parent = symlink_path.parent().unwrap_or(&pkg_nm_parent);
-            let target = pathdiff::diff_paths(&sibling_abs, link_parent)
-                .unwrap_or_else(|| sibling_abs.clone());
+            #[cfg(not(windows))]
+            let target = {
+                let virtual_root = pkg_nm_parent
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap_or(&pkg_nm_parent);
+                let sibling_abs = virtual_root
+                    .join(&sibling_subdir)
+                    .join("node_modules")
+                    .join(dep_name);
+                let link_parent = symlink_path.parent().unwrap_or(&pkg_nm_parent);
+                pathdiff::diff_paths(&sibling_abs, link_parent)
+                    .unwrap_or_else(|| sibling_abs.clone())
+            };
 
             // Staged materialization writes into `.tmp-<pid>-<id>/`,
             // then atomic-renames into `final_base_dir/<subdir>/`.
@@ -860,7 +862,6 @@ impl Linker {
                     }
                 };
                 if let Err(e) = reflink_result {
-                    core::hint::cold_path();
                     // Source-missing short-circuit avoids the misleading
                     // "fell back to copy" trace and the redundant copy
                     // attempt that would just ENOENT for the same reason.
@@ -916,7 +917,6 @@ impl Linker {
             }
             LinkStrategy::Hardlink => {
                 if let Err(e) = std::fs::hard_link(&stored.store_path, dst) {
-                    core::hint::cold_path();
                     if !stored.store_path.exists() {
                         return Err(missing_source());
                     }
@@ -1219,7 +1219,6 @@ impl Linker {
         for (rel_path, stored) in index {
             let target = tmp.join(rel_path);
             if let Err(e) = self.link_file_fresh(stored, rel_path, &target) {
-                core::hint::cold_path();
                 let _ = std::fs::remove_dir_all(&tmp);
                 if let Error::MissingStoreFile { .. } = &e {
                     invalidate_stale_index_for_package(&self.store, pkg, self.index_read_key(pkg));

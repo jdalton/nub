@@ -125,6 +125,7 @@ Like Corepack's shims, `nub` itself auto-installs Node versions as needed. When 
 - `package.json#/devEngines/runtime`
 - `.node-version`
 - `.nvmrc`
+- `.tool-versions` — the asdf/mise file; its `nodejs` line
 - `package.json#/engines/node` (a range)
 - the `node` on your `PATH`, when nothing is pinned
 
@@ -170,6 +171,10 @@ nub --import ./instrument.js server.ts
 nub script.ts --port 3000 --verbose
 echo 'console.log(1 + 1)' | nub -
 ```
+
+<Callout title="Debugging in VS Code">
+Point VS Code's debugger at the `nub` binary to run a program through Nub with breakpoints and stepping. See [Debugging](/docs/runtime/debugging).
+</Callout>
 
 ## Compatibility mode
 
