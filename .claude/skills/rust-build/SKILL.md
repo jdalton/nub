@@ -28,7 +28,10 @@ scripts/rust-build.sh test  -p nub-cli --test integration
 scripts/rust-build.sh clippy --all-targets --all-features -- -D warnings
 ```
 
-It prints which target dir it chose and why, then execs `cargo` with `CARGO_TARGET_DIR` set. Nothing else changes — same profiles, same args.
+It prints which target dir it chose and why, then execs `cargo` with `CARGO_TARGET_DIR` set. Same profiles, same args — plus two default-on contention controls (added 2026-07-23 after ~20 concurrent agent builds drove the 10-core host to load ~190):
+
+- **QoS clamp (darwin only):** cargo runs under `taskpolicy -c utility`, so interactive work always preempts fleet builds; an uncontended build still gets all cores. `NUB_BUILD_FG=1` opts out for a latency-sensitive foreground build.
+- **Default job cap on big hosts (>8 cores):** `CARGO_BUILD_JOBS = ncpu-4` unless the caller already chose (pre-set `CARGO_BUILD_JOBS`, `NUB_BUILD_JOBS`, or an explicit `-j`/`--jobs` flag — cargo's CLI flag outranks the env var).
 
 ## Why one shared target dir
 
