@@ -87,7 +87,17 @@ fn resolve_home() -> miette::Result<PathBuf> {
     platform_default()
 }
 
-#[cfg(target_os = "linux")]
+/// Resolve the global prefix root. This is distinct from `globalBinDir`:
+/// users may point global bin symlinks somewhere else while the prefix
+/// itself still comes from `AUBE_HOME` / `PNPM_HOME` / the platform default.
+pub fn prefix_dir() -> miette::Result<PathBuf> {
+    resolve_home()
+}
+
+// Android is the Termux/CLI case: bionic userland with a Linux-shaped
+// HOME/XDG layout, so it shares the linux default rather than needing
+// its own arm.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn platform_default() -> miette::Result<PathBuf> {
     if let Some(xdg) = aube_util::env::xdg_data_home() {
         return Ok(xdg.join("pnpm"));
@@ -382,13 +392,23 @@ pub fn unlink_bins(install_dir: &Path, bin_dir: &Path, bin_names: &[String]) {
                 continue;
             };
             // The .cmd shim embeds the target as `"%~dp0\<rel_path>"`.
-            // Extract the relative path from the ELSE branch (the one
-            // without `.exe`), which looks like:
-            //   prog "%~dp0\<rel_target>" %*
+            // Two shapes:
+            //   - node shim: extract from the ELSE branch (`prog "%~dp0\
+            //     <rel>" %*`), skipping the IF-branch `"%~dp0\node.exe"`.
+            //   - direct-exec shim for a native bin (#394): the whole file
+            //     is `@"%~dp0\<rel>" %*` — a line that STARTS with `@"%~dp0\`,
+            //     which the node shim never produces. Its `<rel>` typically
+            //     ends in `.exe`, so it must be matched by shape, not by the
+            //     `.exe"` filter below (which would drop it and skip the
+            //     ownership check, over-removing another install's bin).
             let owned = content
                 .lines()
                 .filter_map(|line| {
                     let line = line.trim();
+                    if let Some(after) = line.strip_prefix("@\"%~dp0\\") {
+                        let end = after.find('"')?;
+                        return Some(after[..end].to_string());
+                    }
                     // Match the fallback line: `prog "%~dp0\<path>" %*`
                     // Skip lines containing `.exe"` (those are the IF branch).
                     if line.contains("%~dp0\\") && !line.contains(".exe\"") {

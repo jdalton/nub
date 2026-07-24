@@ -1,0 +1,24 @@
+---
+title: "Nub 0.4.3"
+description: Installs the full workspace-member set in Yarn Berry monorepos, aborts on unrecognized bun.lock sources, and updates the docs and benchmark numbers.
+author: The Nub Team
+date: 2026-07-08
+---
+
+A patch release centered on Yarn Berry workspace compatibility, with a lockfile-safety fix and documentation updates.
+
+## Yarn Berry workspaces install every member
+
+A Yarn-incumbent Berry monorepo previously installed only the root's dependencies and silently skipped every workspace member, exiting 0 — leaving packages a member depended on entirely absent. The Berry lockfile records only resolutions, not importer structure, so the reader had synthesized just the root importer.
+
+The reader now reconstructs member importers from the root `package.json` `workspaces` globs and each member's own `package.json`, mirroring the classic Yarn reader. Reading the manifests keeps the dev/prod dependency split exact. A 114-member monorepo now enumerates all of its members. ([#374](https://github.com/nubjs/nub/pull/374), closes [#373](https://github.com/nubjs/nub/issues/373))
+
+## bun.lock sources fail loudly
+
+A `bun.lock` entry with an unrecognized source protocol now aborts at plan time with `ERR_NUB_LOCKFILE_UNSUPPORTED_SOURCE`, instead of silently reclassifying it to a registry pin that could 404 partway through the install. Optional dependencies still warn and skip. ([#363](https://github.com/nubjs/nub/pull/363))
+
+## Documentation and benchmarks
+
+The blog gained a [technical write-up on the global virtual store](/blog/unblocking-the-global-virtual-store) ([#348](https://github.com/nubjs/nub/pull/348)), the site's warm-install benchmark numbers were updated to Linux CI runs on a large fixture ([#377](https://github.com/nubjs/nub/pull/377)), and the prose guide picked up a long-form narrative section ([#378](https://github.com/nubjs/nub/pull/378)).
+
+The [full release notes](https://github.com/nubjs/nub/releases/tag/v0.4.3) list every change in this release.

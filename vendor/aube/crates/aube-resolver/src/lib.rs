@@ -26,10 +26,11 @@ pub use local_source::resolve_exec_script_path;
 pub use package_ext::is_deprecation_allowed;
 pub use peer_context::{
     AutoInstalledPeers, PeerContextOptions, UnmetPeer, apply_peer_contexts, detect_unmet_peers,
-    hoist_auto_installed_peers, remove_auto_installed_peers,
+    hoist_auto_installed_peers, peer_pass_for_import, remove_auto_installed_peers,
 };
 pub use platform::{SupportedArchitectures, is_supported};
 pub use primer::{PruneStats as PrimerPruneStats, prune_cache as prune_primer_cache};
+pub use semver_util::{PickResult, pick_version_for_add};
 pub use trust::{
     MissingTimeDetails as MissingTrustTimeDetails, TrustCheckError, TrustDowngradeDetails,
     check_no_downgrade,
@@ -78,7 +79,7 @@ use peer_context::{
     dedupe_peer_variants, effective_peer_suffix, is_hashed_peer_suffix,
 };
 #[cfg(test)]
-use semver_util::{PickResult, pick_version, strip_alias_prefix};
+use semver_util::{pick_version, strip_alias_prefix};
 #[cfg(test)]
 use types::format_iso8601_utc;
 
@@ -164,6 +165,13 @@ pub struct Resolver {
     /// `original_specifier` so the lockfile importer keeps the
     /// reference verbatim.
     catalogs: BTreeMap<String, BTreeMap<String, String>>,
+    /// `namedRegistries` alias→registry-URL map (pnpm-compat). A task whose
+    /// range is `<alias>:<spec>` where `<alias>` is a key here is rewritten to
+    /// the real package/range and its registry route recorded on the client
+    /// (see `preprocess_task`). Empty (the standalone-aube default) makes the
+    /// named-registry branch inert, so every `<alias>:` spec falls through
+    /// exactly as before.
+    named_registries: BTreeMap<String, String>,
     /// Optional `readPackage` hook, invoked once per resolved package
     /// before its transitive deps are enqueued. See [`ReadPackageHook`].
     /// Wired up by `aube` when a `.pnpmfile.cjs` is detected and

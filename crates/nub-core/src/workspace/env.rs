@@ -37,6 +37,15 @@ const ENV_FILE_DENYLIST: &[&str] = &[
     "NODE_REPL_EXTERNAL_MODULE",
 ];
 
+/// The runtime-control keys Nub refuses to source from env files.
+///
+/// The watch launcher uses this same canonical set to guard Node's raw
+/// `--env-file` path at the process boundary. Keep the policy defined here so
+/// parsed-map filtering and raw-file delegation cannot drift.
+pub fn denied_env_file_keys() -> &'static [&'static str] {
+    ENV_FILE_DENYLIST
+}
+
 /// Whether `key` is a denylisted runtime-control variable nub ignores from a
 /// `.env*` / `--env-file` source. ASCII case-insensitive — environment variable
 /// lookups are case-insensitive on Windows, so a lowercased spelling must not slip
@@ -99,6 +108,14 @@ pub fn read_env_file(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
+/// The canonical `NODE_ENV` values that may act as a mode fallback. Kept EXACT —
+/// `development` / `production` / `test`, no short forms — for parity with Next.js
+/// and Bun, which couple `.env.{mode}` to `NODE_ENV` only on these values. Any
+/// other `NODE_ENV` (e.g. `staging`) is ignored for file selection, so an
+/// arbitrary value can't silently flip the loaded file set (the footgun the modern
+/// ecosystem decoupled away); use `APP_ENV` for arbitrary modes.
+const CLAMPED_NODE_ENV_MODES: &[&str] = &["development", "production", "test"];
+
 /// The `.env*` filenames Nub loads, in descending priority order (the file
 /// listed first wins a key over later ones). Driven by the resolved *mode*. The
 /// `.env` / `.env.local` / `.env.{mode}` cascade mirrors the dotenv-flow / Next /
@@ -107,28 +124,37 @@ pub fn read_env_file(path: &Path) -> Option<String> {
 /// (first-writer-wins merge) and [`discover_env_files`] (the watch path's
 /// `--env-file` args), so this one function governs mode selection on both paths.
 ///
-/// Mode = `APP_ENV` when non-empty, else no mode. `APP_ENV` is the sole,
-/// framework-neutral selector (Vite, and others); to load a specific file
-/// directly, pass `--env-file <path>` (repeatable). `NODE_ENV` is deliberately NOT
-/// a mode source — nub treats it as the application's own dev/prod behavior
-/// variable, never a file selector (a non-dev/prod/test `NODE_ENV` used as a file
-/// selector silently flips frameworks into development mode, the footgun the
-/// modern ecosystem decoupled away). When `APP_ENV` is unset there is no mode, so
-/// only `.env` / `.env.local` load.
+/// Mode precedence: `APP_ENV` (non-empty) is the primary, framework-neutral
+/// selector (Vite and others) and wins even when `NODE_ENV` is also set. When
+/// `APP_ENV` is unset, `NODE_ENV` is a CLAMPED fallback — it selects a mode only
+/// when it is exactly `development` / `production` / `test`
+/// ([`CLAMPED_NODE_ENV_MODES`], Next.js / Bun parity). Any other `NODE_ENV` value
+/// yields no mode, as does both being unset — only `.env` / `.env.local` load. To
+/// load a specific file directly, pass `--env-file <path>` (repeatable).
 fn env_file_names() -> Vec<String> {
     env_file_names_for_mode(&resolve_env_mode())
 }
 
-/// Resolve the env-file mode from the ambient `APP_ENV`. Reads process env once;
-/// [`resolve_mode`] holds the pure logic (hermetically testable).
+/// Resolve the env-file mode from the ambient `APP_ENV` and `NODE_ENV`. Reads
+/// process env once; [`resolve_mode`] holds the pure logic (hermetically testable).
 fn resolve_env_mode() -> String {
-    resolve_mode(std::env::var("APP_ENV").ok())
+    resolve_mode(
+        std::env::var("APP_ENV").ok(),
+        std::env::var("NODE_ENV").ok(),
+    )
 }
 
-/// Pure mode resolution: `APP_ENV` when non-empty, else no mode. `NODE_ENV` is
-/// intentionally absent (see [`env_file_names`]).
-fn resolve_mode(app_env: Option<String>) -> String {
-    app_env.filter(|v| !v.is_empty()).unwrap_or_default()
+/// Pure mode resolution. `APP_ENV` (non-empty) is the primary selector and wins
+/// even when `NODE_ENV` is also set. Otherwise `NODE_ENV` is a clamped fallback:
+/// it yields a mode only when it is one of [`CLAMPED_NODE_ENV_MODES`]; any other
+/// value (`staging`, empty) — or both being unset — resolves to no mode.
+fn resolve_mode(app_env: Option<String>, node_env: Option<String>) -> String {
+    if let Some(app_env) = app_env.filter(|v| !v.is_empty()) {
+        return app_env;
+    }
+    node_env
+        .filter(|v| CLAMPED_NODE_ENV_MODES.contains(&v.as_str()))
+        .unwrap_or_default()
 }
 
 /// The `.env*` precedence list for a resolved mode. `is_test` (mode `test`) omits
@@ -225,12 +251,11 @@ pub fn load_env_files_raw(project_root: &Path) -> HashMap<String, String> {
 /// The raw loader, additionally reporting (1) whether a `.env` FILE declared
 /// `NODE_ENV` (always dropped — dotenv/@next/env/Vite parity, #263) and (2) which
 /// denylisted runtime-control keys were dropped ([`ENV_FILE_DENYLIST`]). Both
-/// drops happen HERE at load, so every consumer of the returned map —
-/// [`load_env_files`] (direct run/file injection) and [`load_env_files_raw`]
-/// (watch injection) — is covered by construction; a denylisted key can never
-/// enter the map that flows to a spawned child. The reports are consumed by
-/// [`load_env_files`] to warn; the plain [`load_env_files_raw`] wrapper discards
-/// them (the watch path defers the corresponding warnings to avoid false claims).
+/// drops happen HERE at load, so every consumer of the returned map is covered by
+/// construction. The reports are consumed by [`load_env_files`] to warn. The
+/// plain [`load_env_files_raw`] wrapper discards them because watch separately
+/// delegates the raw files to Node; that spawn boundary installs a stable guard
+/// for this same denylist before handing Node the paths.
 fn load_env_files_raw_reporting(
     project_root: &Path,
 ) -> (HashMap<String, String>, bool, Vec<String>) {
@@ -246,8 +271,10 @@ fn load_env_files_raw_reporting(
             for (key, value) in parse_env(&content) {
                 // Shell env wins: don't override existing env vars. An AMBIENT
                 // `NODE_ENV` (set in the real process env) therefore passes through
-                // untouched and still selects `.env.<NODE_ENV>` files above — only a
-                // `.env`-FILE `NODE_ENV` is dropped below.
+                // untouched and, when `APP_ENV` is unset and it is canonical
+                // (development/production/test), selects `.env.<NODE_ENV>` files above
+                // as the clamped fallback — only a `.env`-FILE `NODE_ENV` is dropped
+                // below.
                 if std::env::var_os(&key).is_some() {
                     continue;
                 }
@@ -312,8 +339,8 @@ pub fn load_env_files(project_root: &Path) -> HashMap<String, String> {
     // Warn only here — this map is injected straight into the child via
     // `Command::env`, so a dropped `.env` `NODE_ENV` / denylisted var truly never
     // reaches it. The watch path (plain `load_env_files_raw`) hands the files to
-    // Node's `--env-file` instead, so nub isn't the one ignoring them there and must
-    // not claim to.
+    // Node's `--env-file` behind a per-restart process guard, but avoids repeating
+    // this load-time warning for a long-lived watcher.
     if node_env_ignored {
         warn_node_env_from_dotenv_ignored();
     }
@@ -534,18 +561,37 @@ mod tests {
         );
     }
 
-    /// Mode selection is `APP_ENV` only: the non-empty ambient value is the mode,
-    /// else no mode. `NODE_ENV` is NOT a mode source, and there is no `--env` flag —
-    /// `resolve_mode` takes only `APP_ENV`, so nothing else can participate.
+    /// Mode precedence: `APP_ENV` (non-empty) is primary and wins even when
+    /// `NODE_ENV` is also set; otherwise `NODE_ENV` is a CLAMPED fallback that
+    /// selects only on the canonical `development`/`production`/`test` values. A
+    /// non-canonical `NODE_ENV` (`staging`) or both-unset yields no mode.
     #[test]
-    fn resolve_mode_is_app_env_only() {
+    fn resolve_mode_app_env_primary_node_env_clamped_fallback() {
         let s = |v: &str| Some(v.to_string());
-        // APP_ENV set → that mode.
-        assert_eq!(resolve_mode(s("production")), "production");
-        assert_eq!(resolve_mode(s("staging")), "staging");
-        // Unset or empty → no mode.
-        assert_eq!(resolve_mode(None), "");
-        assert_eq!(resolve_mode(s("")), "");
+
+        // APP_ENV set → that mode, even an arbitrary one (APP_ENV isn't clamped).
+        assert_eq!(resolve_mode(s("production"), None), "production");
+        assert_eq!(resolve_mode(s("staging"), None), "staging");
+        // APP_ENV wins over NODE_ENV when both are set.
+        assert_eq!(resolve_mode(s("staging"), s("production")), "staging");
+        assert_eq!(resolve_mode(s("production"), s("test")), "production");
+
+        // APP_ENV unset → NODE_ENV as a clamped fallback, canonical values only.
+        assert_eq!(resolve_mode(None, s("production")), "production");
+        assert_eq!(resolve_mode(None, s("development")), "development");
+        assert_eq!(resolve_mode(None, s("test")), "test");
+        // Empty APP_ENV is treated as unset, so the fallback still applies.
+        assert_eq!(resolve_mode(s(""), s("production")), "production");
+
+        // Non-canonical NODE_ENV is ignored for file selection (no arbitrary-value
+        // footgun) — and short forms are NOT accepted, matching Next.js/Bun.
+        assert_eq!(resolve_mode(None, s("staging")), "");
+        assert_eq!(resolve_mode(None, s("prod")), "");
+        assert_eq!(resolve_mode(None, s("dev")), "");
+        assert_eq!(resolve_mode(None, s("")), "");
+
+        // Both unset → no mode.
+        assert_eq!(resolve_mode(None, None), "");
     }
 
     /// A mode carrying a path separator (a hostile `APP_ENV`/`NODE_ENV`)
@@ -590,6 +636,45 @@ mod tests {
         assert_eq!(
             env_file_names_for_mode("test"),
             vec![".env.test.local", ".env.test", ".env"]
+        );
+    }
+
+    /// End-to-end file-set selection through the clamped `NODE_ENV` fallback,
+    /// composing `resolve_mode` with `env_file_names_for_mode` (hermetic — no
+    /// process env). `NODE_ENV=production` (APP_ENV unset) selects the production
+    /// cascade; `NODE_ENV=test` inherits the `.env.local` skip, consistent with
+    /// `APP_ENV=test`; a non-canonical `NODE_ENV=staging` selects no mode.
+    #[test]
+    fn clamped_node_env_fallback_selects_the_expected_file_set() {
+        let names = |app: Option<&str>, node: Option<&str>| {
+            env_file_names_for_mode(&resolve_mode(
+                app.map(str::to_string),
+                node.map(str::to_string),
+            ))
+        };
+
+        assert_eq!(
+            names(None, Some("production")),
+            vec![
+                ".env.production.local",
+                ".env.local",
+                ".env.production",
+                ".env"
+            ],
+        );
+        // NODE_ENV=test → the same `.env.local` skip as APP_ENV=test.
+        assert_eq!(
+            names(None, Some("test")),
+            vec![".env.test.local", ".env.test", ".env"],
+        );
+        // Non-canonical NODE_ENV → no mode: only the base cascade.
+        assert_eq!(names(None, Some("staging")), vec![".env.local", ".env"]);
+        // Both unset → no mode.
+        assert_eq!(names(None, None), vec![".env.local", ".env"]);
+        // APP_ENV wins even when NODE_ENV is also a canonical value.
+        assert_eq!(
+            names(Some("staging"), Some("production")),
+            vec![".env.staging.local", ".env.local", ".env.staging", ".env"],
         );
     }
 
@@ -899,10 +984,10 @@ mod tests {
 
     /// Env hygiene (Deno parity): a `.env` FILE must never inject a runtime-control
     /// var ([`ENV_FILE_DENYLIST`]) — those configure Node's own start-up, not the
-    /// user's program. `NODE_OPTIONS` is the load-bearing case and
-    /// `NODE_TLS_REJECT_UNAUTHORIZED` confirms the case-insensitive match; benign
-    /// siblings must still load. The strip runs in the shared per-file loop, so
-    /// `.env` coverage exercises it for every `.env*` file — mode-file SELECTION is a
+    /// user's program. Every canonical key is exercised directly, with one
+    /// mixed-case spelling to lock the case-insensitive match; benign siblings
+    /// must still load. The strip runs in the shared per-file loop, so `.env`
+    /// coverage exercises it for every `.env*` file — mode-file SELECTION is a
     /// separate concern (tested by `env_file_names*`) and needs no ambient env here.
     #[test]
     fn denylisted_runtime_control_vars_never_injected() {
@@ -911,21 +996,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(".env"),
-            "NODE_OPTIONS=--require ./x.js\nnode_tls_reject_unauthorized=0\nAPP_KEY=safe\n",
+            "NODE_OPTIONS=--require ./x.js\n\
+             node_tls_reject_unauthorized=0\n\
+             NODE_EXTRA_CA_CERTS=/x.pem\n\
+             NODE_REPL_EXTERNAL_MODULE=./repl.js\n\
+             APP_KEY=safe\n",
         )
         .unwrap();
 
         let base = load_env_files(&dir);
-        assert!(
-            !base.contains_key("NODE_OPTIONS"),
-            "a `.env` NODE_OPTIONS must not reach the child; got {base:?}"
-        );
-        assert!(
-            !base
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("NODE_TLS_REJECT_UNAUTHORIZED")),
-            "a `.env` NODE_TLS_REJECT_UNAUTHORIZED must be dropped case-insensitively; got {base:?}"
-        );
+        for denied in denied_env_file_keys() {
+            assert!(
+                !base.keys().any(|key| key.eq_ignore_ascii_case(denied)),
+                "a `.env` {denied} must not reach the child; got {base:?}"
+            );
+        }
         assert_eq!(
             base.get("APP_KEY").map(String::as_str),
             Some("safe"),

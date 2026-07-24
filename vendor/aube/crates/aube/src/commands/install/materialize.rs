@@ -14,6 +14,9 @@ pub(super) struct GvsPrewarmInputs {
     pub patch_hashes: std::collections::BTreeMap<String, String>,
     pub node_version: Option<String>,
     pub build_policy: std::sync::Arc<aube_scripts::BuildPolicy>,
+    /// See [`super::build_may_key_engine`] — the prewarm must key exactly as the
+    /// link phase will, or link discards these hashes and recomputes.
+    pub default_trust_enabled: bool,
     pub use_global_virtual_store_override: Option<bool>,
     /// The RESOLVED per-project virtual store dir (the same value the
     /// link phase applies via `with_aube_dir_override`). Threaded here
@@ -121,6 +124,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
         patch_hashes,
         node_version,
         build_policy,
+        default_trust_enabled,
         use_global_virtual_store_override,
         virtual_store_dir,
         supported_architectures,
@@ -213,14 +217,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
             "graph_hash_compute",
         );
         let allow = |pkg: &aube_lockfile::LockedPackage| {
-            matches!(
-                build_policy_for_hash.decide_package(
-                    pkg.registry_name(),
-                    &pkg.version,
-                    pkg.source_approval_key().as_deref(),
-                ),
-                aube_scripts::AllowDecision::Allow
-            )
+            super::build_may_key_engine(&build_policy_for_hash, pkg, default_trust_enabled)
         };
         let patch_hash_fn = |name: &str, version: &str| -> Option<String> {
             let key = format!("{name}@{version}");
@@ -356,6 +353,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
             let sem = sem.clone();
             let index = index.clone();
             let nested_link_targets = nested_link_targets.clone();
+            let graph = graph.clone();
             in_flight.push(tokio::spawn(async move {
                 let _diag_pkg =
                     aube_util::diag::Span::new(aube_util::diag::Category::Materialize, "package")
@@ -384,6 +382,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
                     linker
                         .ensure_in_virtual_store(
                             &dep_path,
+                            &graph,
                             &pkg,
                             &index,
                             &mut stats,
@@ -525,6 +524,7 @@ async fn run_aube_dir_materializer(
             let index = index.clone();
             let aube_dir = aube_dir.clone();
             let nested_link_targets = nested_link_targets.clone();
+            let graph = graph.clone();
             in_flight.spawn(async move {
                 let permit = sem.acquire().await;
                 let dep_path_for_err = dep_path.clone();
@@ -534,6 +534,7 @@ async fn run_aube_dir_materializer(
                         .ensure_in_aube_dir(
                             &aube_dir,
                             &dep_path,
+                            &graph,
                             &pkg,
                             &index,
                             &mut stats,

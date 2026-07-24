@@ -33,11 +33,17 @@ function versionRank(url: string): number {
 }
 
 export default function BlogIndex() {
+  // `date` accepts an ISO 8601 UTC timestamp (e.g. 2026-07-07T12:00:00Z) to
+  // order same-day posts; a date-only value parses as UTC midnight. Same-day
+  // release posts tie-break by version; the URL compare is a last-resort guard
+  // against nondeterministic file order.
   const posts = [...blog.getPages()].sort((a, b) => {
     const byDate =
       new Date(b.data.date ?? 0).getTime() -
       new Date(a.data.date ?? 0).getTime();
-    return byDate !== 0 ? byDate : versionRank(b.url) - versionRank(a.url);
+    if (byDate !== 0) return byDate;
+    const byVersion = versionRank(b.url) - versionRank(a.url);
+    return byVersion !== 0 ? byVersion : b.url.localeCompare(a.url);
   });
 
   return (

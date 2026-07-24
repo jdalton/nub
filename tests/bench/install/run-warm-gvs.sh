@@ -80,9 +80,12 @@ setup_workdir() {
   rm -rf "$workdir"
   cp -r "$FIXTURE_DIR/$fixture" "$workdir"
   rm -rf "$workdir/node_modules" 2>/dev/null || true
+  # nub installs from its NATIVE nub.lock, not the pnpm-lock.yaml compat-read — so
+  # strip every foreign lockfile from the nub leg (and nub.lock from the others).
   case "$tool" in
-    pnpm|nub) rm -f "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true ;;
-    bun)      rm -f "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" "$workdir/package-lock.json" 2>/dev/null || true ;;
+    nub)  rm -f "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true ;;
+    pnpm) rm -f "$workdir/nub.lock" "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true ;;
+    bun)  rm -f "$workdir/nub.lock" "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" "$workdir/package-lock.json" 2>/dev/null || true ;;
   esac
 }
 

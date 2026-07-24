@@ -125,9 +125,9 @@ fn format_unsupported(version: &NodeVersion, pin_source: Option<&str>) -> String
 ///
 /// 1. Resolve the pin chain: `package.json#devEngines.runtime` (#1, may refuse
 ///    when the declared runtime isn't Node) → `.node-version` (#2) → `.nvmrc`
-///    (#3) → `package.json#engines.node` (#4, a resolution range).
-///    `devEngines.runtime` `onFail: "warn"` notices print here (once per
-///    invocation), then resolution falls through.
+///    (#3) → `.tool-versions` (#4, asdf/mise) → `package.json#engines.node`
+///    (#5, a resolution range). `devEngines.runtime` `onFail: "warn"` notices
+///    print here (once per invocation), then resolution falls through.
 /// 2. If no pin: use `node` on PATH.
 /// 3. If pinned: PATH node satisfies → nub's own download store
 ///    (`~/.cache/nub/node/<version>/`) → nvm scan → error. (The download +
@@ -442,17 +442,21 @@ pub fn check_min_version(node: &ResolvedNode) -> Result<(), DiscoveryError> {
 }
 
 /// Walk up from `cwd` looking for a pin file. Returns the raw pin string, parsed
-/// pin, and the filename that produced it (`.node-version` or `.nvmrc`) for
-/// user-facing messages. Bounded by $HOME, filesystem root, and 16 ancestors.
+/// pin, and the filename that produced it (`.node-version`, `.nvmrc`, or
+/// `.tool-versions`) for user-facing messages. Bounded by $HOME, filesystem root,
+/// and 16 ancestors.
 ///
-/// Precedence within a directory is `.node-version` BEFORE `.nvmrc`, per
-/// `wiki/runtime/node-version-management.md` §"Resolution order" (#2 `.node-version`,
-/// #3 `.nvmrc`). `.node-version` is the tool-agnostic standard, so it wins when a
-/// project carries both. Precedence #1, `package.json#devEngines.runtime`, sits
-/// ABOVE both and #4, `package.json#engines.node`, BELOW both —
-/// [`resolve_pin_chain`] orders all four; this helper is only the pin-file
-/// middle of the chain.
-pub fn walk_up_for_pin(cwd: &Path) -> Option<(String, VersionPin, String)> {
+/// Precedence within a directory is `.node-version` BEFORE `.nvmrc` BEFORE
+/// `.tool-versions`, per `wiki/runtime/node-version-management.md` §"Resolution
+/// order" (#2 `.node-version`, #3 `.nvmrc`, #4 `.tool-versions`). It is a
+/// specificity-of-intent gradient: the Node-specific pin files outrank the
+/// polyglot asdf/mise file, whose `nodejs`/`node` line is one tool among many, so
+/// a deliberately-added `.node-version` wins when a project carries both. (A
+/// project with only `.tool-versions` — the common asdf/mise case — never hits the
+/// conflict.) Precedence #1, `package.json#devEngines.runtime`, sits ABOVE all
+/// three and #5, `package.json#engines.node`, BELOW them — [`resolve_pin_chain`]
+/// orders all five; this helper is only the pin-file middle of the chain.
+fn walk_up_for_pin(cwd: &Path) -> Option<(String, VersionPin, String)> {
     let home = dirs_next::home_dir();
     let mut dir = cwd.to_path_buf();
     let max_depth = 16;
@@ -491,6 +495,13 @@ pub fn walk_up_for_pin(cwd: &Path) -> Option<(String, VersionPin, String)> {
                     }
                 }
             }
+
+            // #4: `.tool-versions` (asdf/mise), checked AFTER the Node-specific pin
+            // files above so they win in a directory that carries both.
+            if let Some((raw, pin)) = tool_versions_node_pin(&dir) {
+                tracing::debug!(dir = %dir.display(), pin = raw, "found .tool-versions node pin");
+                return Some((raw, pin, ".tool-versions".to_string()));
+            }
         }
 
         // Stop at home dir or filesystem root.
@@ -502,16 +513,46 @@ pub fn walk_up_for_pin(cwd: &Path) -> Option<(String, VersionPin, String)> {
     None
 }
 
+/// Read the Node pin from an asdf/mise `.tool-versions` in `dir` (precedence #4).
+/// Returns the raw version token and parsed pin, or `None` when the file is
+/// absent, carries no Node line, or the version is one nub can't model.
+///
+/// `.tool-versions` is line-oriented — `<tool> <version...>`, `#` comments. The
+/// Node line's key is `nodejs` (asdf's plugin short-name) or `node` (a mise
+/// alias); accept either. A line may list fallback versions (`nodejs 20 18`); we
+/// take the first, matching how a single Node is provisioned. Non-modelable
+/// specifiers (`system`, `ref:<sha>`) fail [`VersionPin`] parsing and yield
+/// `None` here — the walk then falls through, exactly as an unparseable
+/// `.node-version` does. Only the Node line is read; every other tool in the file
+/// is ignored (nub provisions Node, not the whole toolchain).
+fn tool_versions_node_pin(dir: &Path) -> Option<(String, VersionPin)> {
+    let content = fs::read_to_string(dir.join(".tool-versions")).ok()?;
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+    for line in content.lines() {
+        // Drop an inline `# comment`; a version token never contains `#`.
+        let code = line.split('#').next().unwrap_or("");
+        let mut tokens = code.split_whitespace();
+        let Some(tool) = tokens.next() else { continue };
+        if tool != "nodejs" && tool != "node" {
+            continue;
+        }
+        let version = tokens.next()?;
+        let pin = version.parse::<VersionPin>().ok()?;
+        return Some((version.to_string(), pin));
+    }
+    None
+}
+
 /// Source label for the `devEngines.runtime` pin channel (precedence #1),
 /// shaped like the `package.json#engines.node` label.
 const DEV_ENGINES_RUNTIME_SOURCE: &str = "package.json#devEngines.runtime";
 
-/// Source label for the `engines.node` pin channel (precedence #4).
+/// Source label for the `engines.node` pin channel (precedence #5).
 const ENGINES_NODE_SOURCE: &str = "package.json#engines.node";
 
 /// The governing `package.json` for `cwd`, parsed: the WORKSPACE ROOT's manifest
 /// when one exists above `cwd`, else the nearest one. This is the one manifest
-/// both `devEngines.runtime` (#1) and `engines.node` (#4) read from.
+/// both `devEngines.runtime` (#1) and `engines.node` (#5) read from.
 ///
 /// Workspace-root, not nearest, deliberately: a monorepo pins its Node once at
 /// the root (pnpm — the field's model implementation — reads `devEngines.runtime`
@@ -532,7 +573,7 @@ fn project_manifest(cwd: &Path) -> Option<serde_json::Value> {
     }
 }
 
-/// Read `package.json#engines.node` (precedence #4, a semver *range*) from the
+/// Read `package.json#engines.node` (precedence #5, a semver *range*) from the
 /// governing manifest ([`project_manifest`]). Returns `(range, source_label)`,
 /// or `None` when the manifest has no `engines.node`.
 fn read_engines_node(cwd: &Path) -> Option<(String, String)> {
@@ -673,15 +714,16 @@ pub struct PinChain {
     /// `onFail: "warn"`, present-but-unusable version specs) — printed once per
     /// invocation by the entry point ([`discover_node`], or the `nub node`
     /// verbs when they resolve the chain themselves).
-    pub warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 /// The pin-source chain in spec precedence order
 /// (`wiki/runtime/node-version-management.md` §"Resolution order"):
 /// `package.json#devEngines.runtime` (#1) → `.node-version` (#2) → `.nvmrc`
-/// (#3) → `package.json#engines.node` (#4, a resolution range). Errs with
-/// [`DiscoveryError::RuntimeNotNode`] when `devEngines.runtime` declares a
-/// non-Node runtime that refuses (its default).
+/// (#3) → `.tool-versions` (#4, asdf/mise) → `package.json#engines.node`
+/// (#5, a resolution range). The middle three (#2–#4) resolve in
+/// [`walk_up_for_pin`]. Errs with [`DiscoveryError::RuntimeNotNode`] when
+/// `devEngines.runtime` declares a non-Node runtime that refuses (its default).
 pub fn resolve_pin_chain(cwd: &Path) -> Result<PinChain, DiscoveryError> {
     let mut warnings = Vec::new();
     let manifest = project_manifest(cwd);
@@ -709,7 +751,7 @@ pub fn resolve_pin_chain(cwd: &Path) -> Result<PinChain, DiscoveryError> {
             warnings,
         });
     }
-    // #4: engines.node — a resolution *range* ("resolve to the newest available
+    // #5: engines.node — a resolution *range* ("resolve to the newest available
     // version satisfying the range"). A PATH node inside the range satisfies it
     // like any range pin; provisioning resolves newest-satisfying.
     if let Some((range, source)) = read_engines_node(cwd) {
@@ -767,7 +809,7 @@ pub fn engines_disagreement_warning(cwd: &Path, node: &ResolvedNode) -> Option<S
         ));
     }
 
-    // The winning pin vs package.json#engines.node (#4) — unless engines.node
+    // The winning pin vs package.json#engines.node (#5) — unless engines.node
     // IS the winning source (it can't disagree with itself).
     if pin_source != ENGINES_NODE_SOURCE
         && let Some((range, engines_source)) = read_engines_node(cwd)
@@ -823,7 +865,8 @@ fn which_node() -> Result<PathBuf, DiscoveryError> {
 
 /// [`which_node`] against an explicit PATH + persistent-shim dir — the testable
 /// body. Two recursion guards: the per-invocation temp dirs (skipped by their
-/// `nub-node-shim-<pid>` name prefix) and the persistent global shim dir
+/// `nub-node-shim-` name prefix, covering randomized and legacy PID-only names)
+/// and the persistent global shim dir
 /// (skipped by CANONICAL-PATH equality, since it's a fixed possibly-symlinked
 /// path a name prefix can't catch).
 fn which_node_in(
@@ -1089,6 +1132,122 @@ fn write_version_cache(node_path: &Path, version: &NodeVersion) {
     data[key] = serde_json::json!({
         "version": version.to_string(),
         "mtime": mtime,
+    });
+
+    let _ = fs::write(
+        &cache,
+        serde_json::to_string_pretty(&data).unwrap_or_default(),
+    );
+}
+
+/// The set of flag NAMES the given Node binary accepts (its
+/// `process.allowedNodeEnvironmentFlags`) — the authoritative universe of flags
+/// nub may inject or propagate via `NODE_OPTIONS`. Spawns the binary once with a
+/// tiny `-e` probe and caches the result on disk keyed by (path, mtime), so every
+/// repeat call is spawn-free (one probe per binary, ever). Returns `None` if the
+/// probe cannot run or produces nothing usable — callers then fall back to plain
+/// version-band gating rather than dropping flags they still need.
+///
+/// ## Why an authoritative probe and not a static binary byte-scan
+/// The option names ARE embedded as string literals in the Node binary, so a
+/// `strings | grep` would appear to work — but a string match is not proof the
+/// option is a LIVE accepted flag (it can sit in help text or unrelated data), and
+/// injecting a non-accepted flag is the exact `node: bad option` startup abort this
+/// guards against. `allowedNodeEnvironmentFlags` is Node's own ground truth.
+///
+/// ## Why this is needed (the open-ended-`Unflag`-band hazard)
+/// Node does NOT keep every experimental flag forever. Most unflagged flags survive
+/// as accepted no-ops (`--experimental-fetch`, `--experimental-modules`, …), but
+/// some are HARD-REMOVED on a later major — `--experimental-policy` and
+/// `--experimental-network-imports` are gone, and `--experimental-permission` was
+/// accepted through Node 23.11 then deleted at 24.0 (it stabilized to
+/// `--permission`). An open-ended `Unflag [lo, ∞)` band in the feature matrix would
+/// keep injecting such a flag into every future Node and abort it at startup.
+/// Intersecting the version-band inject set with this probe makes injection
+/// self-correcting: a flag the running Node no longer accepts is simply dropped, no
+/// nub release required.
+pub fn accepted_env_flags(node_path: &Path) -> Option<std::collections::BTreeSet<String>> {
+    if let Some(cached) = read_env_flags_cache(node_path) {
+        return Some(cached);
+    }
+
+    // Clear an inherited NODE_OPTIONS for the probe. `node -e` (unlike `node
+    // --version`) runs NODE_OPTIONS `--require`/`--import` preloads, so an inherited
+    // preload that writes to stdout would pollute the flag list, and a preload with
+    // side effects would run for nothing. The accepted-flag set is a static property
+    // of the binary, independent of NODE_OPTIONS — so removing it makes the probe
+    // deterministic and side-effect-free. (Pollution could only ADD tokens, never
+    // drop a real flag, so this is defense-in-depth, not a correctness fix.)
+    let output = Command::new(node_path)
+        .arg("-e")
+        .arg("process.stdout.write([...process.allowedNodeEnvironmentFlags].join(\"\\n\"))")
+        .env_remove("NODE_OPTIONS")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let flags: std::collections::BTreeSet<String> =
+        stdout.split_whitespace().map(str::to_string).collect();
+    if flags.is_empty() {
+        return None;
+    }
+
+    write_env_flags_cache(node_path, &flags);
+    Some(flags)
+}
+
+/// mtime (seconds since epoch) of a Node binary, for cache-key freshness. `None`
+/// if the path can't be stat'd — a miss then forces a fresh probe.
+fn node_mtime_secs(node_path: &Path) -> Option<u64> {
+    fs::metadata(node_path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Read the cached `allowedNodeEnvironmentFlags` set for a binary, honoring the
+/// (path, mtime) key so a rebuilt/replaced Node at the same path re-probes. Kept in
+/// a sibling file to `node-discovery.json` so it never risks the version cache.
+fn read_env_flags_cache(node_path: &Path) -> Option<std::collections::BTreeSet<String>> {
+    let cache = cache_dir()?.join("node-env-flags.json");
+    let content = fs::read_to_string(&cache).ok()?;
+    let data: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let key = node_path.to_string_lossy();
+    let entry = data.get(key.as_ref())?;
+    let cached_mtime = entry.get("mtime")?.as_u64()?;
+
+    if cached_mtime != node_mtime_secs(node_path)? {
+        return None;
+    }
+
+    let arr = entry.get("flags")?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+fn write_env_flags_cache(node_path: &Path, flags: &std::collections::BTreeSet<String>) {
+    let Some(dir) = cache_dir() else { return };
+    let _ = fs::create_dir_all(&dir);
+    let cache = dir.join("node-env-flags.json");
+
+    let mut data: serde_json::Value = fs::read_to_string(&cache)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let key = node_path.to_string_lossy().to_string();
+    data[key] = serde_json::json!({
+        "flags": flags.iter().collect::<Vec<_>>(),
+        "mtime": node_mtime_secs(node_path).unwrap_or(0),
     });
 
     let _ = fs::write(
@@ -1555,8 +1714,8 @@ mod tests {
     }
 
     #[test]
-    fn engines_node_is_the_fourth_chain_source_below_pin_files() {
-        // engines.node alone is a resolution range (#4) — including the legal
+    fn engines_node_is_the_last_chain_source_below_pin_files() {
+        // engines.node alone is a resolution range (#5) — including the legal
         // operator-space form (">= 20"), which must not silently degrade to
         // no-constraint.
         let dir = resolution_tmpdir("eng-chain");
@@ -1568,11 +1727,84 @@ mod tests {
         assert!(NodeVersion::new(22, 13, 0).satisfies(&pin));
         assert!(!NodeVersion::new(18, 19, 0).satisfies(&pin));
 
-        // A pin file outranks it (#2 beats #4).
+        // A pin file outranks it (#2 beats #5).
         std::fs::write(dir.join(".node-version"), "20.11.0\n").unwrap();
         let chain = resolve_pin_chain(&dir).unwrap();
         let (_, _, source) = chain.pin.expect("a pin");
         assert_eq!(source, ".node-version", "a pin file must beat engines.node");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_versions_pins_node_and_ranks_below_node_specific_files() {
+        // .tool-versions (#4) resolves the `nodejs` line and sits below the
+        // Node-specific pin files (#2/#3): the Node-only files win when a project
+        // carries both, but a .tool-versions-only project (the asdf/mise norm)
+        // resolves cleanly.
+        let dir = resolution_tmpdir("tv-prec");
+        std::fs::write(
+            dir.join(".tool-versions"),
+            "python 3.12.0\nnodejs 20.11.0\n",
+        )
+        .unwrap();
+        let (raw, _pin, source) = walk_up_for_pin(&dir).expect("the nodejs line resolves");
+        assert_eq!(source, ".tool-versions");
+        assert_eq!(raw, "20.11.0", "only the nodejs line is read, not python");
+
+        // .nvmrc (#3) outranks it, and .node-version (#2) outranks that.
+        std::fs::write(dir.join(".nvmrc"), "18.19.0\n").unwrap();
+        let (_, _, source) = walk_up_for_pin(&dir).expect("a pin");
+        assert_eq!(source, ".nvmrc", ".nvmrc must beat .tool-versions");
+        std::fs::write(dir.join(".node-version"), "22.15.0\n").unwrap();
+        let (_, _, source) = walk_up_for_pin(&dir).expect("a pin");
+        assert_eq!(
+            source, ".node-version",
+            ".node-version must beat .tool-versions"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_versions_beats_engines_node_in_the_chain() {
+        // #4 (.tool-versions, an exact pin) outranks #5 (engines.node, a range).
+        let dir = resolution_tmpdir("tv-eng");
+        std::fs::write(dir.join("package.json"), r#"{"engines":{"node":">= 18"}}"#).unwrap();
+        std::fs::write(dir.join(".tool-versions"), "nodejs 20.11.0\n").unwrap();
+        let chain = resolve_pin_chain(&dir).unwrap();
+        let (raw, _, source) = chain.pin.expect("a pin");
+        assert_eq!(
+            source, ".tool-versions",
+            ".tool-versions must beat engines.node"
+        );
+        assert_eq!(raw, "20.11.0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_versions_parsing_covers_the_real_shapes() {
+        // The `node` alias key (mise), a trailing inline comment, and a
+        // multi-version fallback line (first version wins) — the shapes a real
+        // .tool-versions carries.
+        let dir = resolution_tmpdir("tv-parse");
+        std::fs::write(
+            dir.join(".tool-versions"),
+            "# toolchain\nruby 3.3.0\nnode 20.11.0 18.19.0  # fallback\n",
+        )
+        .unwrap();
+        let (raw, _pin, source) = walk_up_for_pin(&dir).expect("the node line resolves");
+        assert_eq!(source, ".tool-versions");
+        assert_eq!(
+            raw, "20.11.0",
+            "the `node` key is honored; first version wins"
+        );
+
+        // A non-modelable specifier (asdf `system`) yields no pin — the walk falls
+        // through exactly as an unparseable .node-version does.
+        std::fs::write(dir.join(".tool-versions"), "nodejs system\n").unwrap();
+        assert!(
+            walk_up_for_pin(&dir).is_none(),
+            "`nodejs system` is not a version nub can model — fall through"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

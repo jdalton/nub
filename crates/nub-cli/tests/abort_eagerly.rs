@@ -146,3 +146,78 @@ fn install_proceeds_on_optional_unresolvable_source() {
         "the optional skip should warn; got:\n{out}"
     );
 }
+
+const BUN_EXOTIC_PKG: &str =
+    r#"{"name":"t","version":"1.0.0","dependencies":{"foo":"exotic:bar"}}"#;
+const BUN_EXOTIC_LOCK: &str = r#"{
+  "lockfileVersion": 1,
+  "workspaces": { "": { "dependencies": { "foo": "exotic:bar" } } },
+  "packages": { "foo": ["foo@exotic:bar", {}] }
+}"#;
+
+#[test]
+fn install_aborts_on_unresolvable_bun_lock_source() {
+    // The bun twin of the yarn case: an unknown-protocol bun.lock entry is
+    // a plan-time fatal, not a silent reclassify-to-registry that 404s
+    // mid-install. (No real bun protocol triggers this today — the fixture
+    // is the future-proof/defense-in-depth path.)
+    for verb in ["install", "ci"] {
+        let dir = tmpdir("bun");
+        write(
+            &dir,
+            &[
+                ("package.json", BUN_EXOTIC_PKG),
+                ("bun.lock", BUN_EXOTIC_LOCK),
+            ],
+        );
+        let (out, code) = run(&dir, &[verb]);
+        assert_ne!(code, 0, "`nub {verb}` must abort on an unresolvable source");
+        assert!(
+            out.contains("ERR_NUB_LOCKFILE_UNSUPPORTED_SOURCE"),
+            "`nub {verb}` output should carry the rebranded code; got:\n{out}"
+        );
+        let flat: String = out.split_whitespace().collect();
+        assert!(
+            flat.contains("foo@exotic:bar") && flat.contains("exotic"),
+            "`nub {verb}` should name the offending entry and protocol; got:\n{out}"
+        );
+        assert!(!out.contains("ERR_AUBE_LOCKFILE_UNSUPPORTED_SOURCE"));
+        assert!(
+            !dir.join("node_modules").exists(),
+            "`nub {verb}` must abort before writing node_modules"
+        );
+    }
+}
+
+#[test]
+fn ci_proceeds_on_optional_unresolvable_bun_lock_source() {
+    // The optional carve-out on the bun reader: warn + skip, recorded as a
+    // consciously-skipped optional so the frozen drift check tolerates it.
+    let dir = tmpdir("bun-opt");
+    write(
+        &dir,
+        &[
+            (
+                "package.json",
+                r#"{"name":"t","version":"1.0.0","optionalDependencies":{"foo":"exotic:bar"}}"#,
+            ),
+            (
+                "bun.lock",
+                r#"{
+  "lockfileVersion": 1,
+  "workspaces": { "": { "optionalDependencies": { "foo": "exotic:bar" } } },
+  "packages": { "foo": ["foo@exotic:bar", {}] }
+}"#,
+            ),
+        ],
+    );
+    let (out, code) = run(&dir, &["ci"]);
+    assert_eq!(
+        code, 0,
+        "an optional unresolvable dep must not abort; got:\n{out}"
+    );
+    assert!(
+        out.contains("WARN_NUB_LOCKFILE_UNSUPPORTED_SOURCE"),
+        "the optional skip should warn; got:\n{out}"
+    );
+}

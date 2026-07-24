@@ -1,0 +1,212 @@
+---
+title: GitHub Action
+description: A drop-in replacement for the official setup-node action. Swap one line in your workflow and Nub installs itself, provisions the project's pinned Node, and fronts it on PATH so every step keeps working unchanged.
+---
+
+A drop-in for [`actions/setup-node`](https://github.com/actions/setup-node). Swap one line and your workflow keeps working:
+
+```diff
+steps:
+  - uses: actions/checkout@v4
+-   - uses: actions/setup-node@v4
++   - uses: nubjs/setup-nub@v0
+  - run: nub install
+  - run: nub run test
+```
+
+Everything that follows resolves to the project's pinned Node — the same contract as setup-node. Bare `node`, `npm`, and `npx` in later steps run the pinned version, because the action fronts that Node's bin directory on the runner's global PATH. The full [`actions/setup-node` documentation](https://github.com/actions/setup-node#readme) describes the surface this action mirrors.
+
+```yaml
+- uses: actions/checkout@v4
+- uses: nubjs/setup-nub@v0
+- run: node --version   # the project's pinned Node, not the runner default
+- run: nub install
+```
+
+## How it works
+
+The action installs the `nub` CLI, then eagerly provisions the project's pinned Node into Nub's cache during the setup step — downloaded and ready before any of your steps run, never lazily mid-build. The pin is resolved from the project's Node-version sources, in this order:
+
+1. `package.json#/devEngines/runtime`
+2. `.node-version`
+3. `.nvmrc`
+4. `.tool-versions` (the asdf/mise file's `nodejs` line)
+5. `package.json#/engines/node`
+
+That resolved Node's bin directory is added to the global PATH, so bare `node`/`npm`/`npx` and every subsequent step see the pinned version — the same PATH guarantee setup-node gives. A project with no pin is fine: the eager step skips cleanly and Nub provisions at runtime instead.
+
+Because the pin lives in the repository, `actions/checkout` must run before this action.
+
+All `actions/setup-node` inputs are accepted, so the swap is always mechanical — inputs Nub can't honor are accepted and ignored rather than erroring.
+
+## Inputs
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `nub-version` | `latest` | Version of Nub to install — any semver range npm understands. |
+| `node-version` | | Provision this version and front it on PATH instead of the project pin. |
+| `node-version-file` | | Read a version from a file and front it on PATH instead of the project pin. |
+| `cache` | auto | Cache Nub's store and provisioned Node toolchains. Auto-enables on a lockfile or `packageManager`/`devEngines`; an explicit value wins. |
+| `package-manager-cache` | `true` | Set false to turn off the automatic caching above. |
+| `cache-dependency-path` | | Lockfile path(s) whose hash keys the cache. |
+| `cache-key-prefix` | | Prefix injected into the cache key to scope or bust caches independently. |
+| `working-directory` | checkout root | Directory to resolve the pin and lockfile from, for monorepo subdirectories. |
+| `registry-url` | | Registry to set up for auth; writes a temporary user-level `.npmrc` via `NPM_CONFIG_USERCONFIG`. |
+| `scope` | | Scope for a scoped registry; falls back to the repository owner for GitHub Packages. |
+| `always-auth` | `false` | Authenticate on every registry request. |
+| `token` | `github.token` | Token for GitHub-API rate-limit relief when resolving Nub's version range. |
+
+The setup-node inputs `check-latest`, `architecture`, `mirror`, and `mirror-token` are accepted and ignored — present so a swap never errors, with no effect. The `version` input is a deprecated alias for `nub-version` and emits a warning.
+
+### `nub-version`
+
+Pin the CLI version to install — any semver range npm understands. Defaults to the latest release:
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    nub-version: ^0.1.0
+```
+
+### `node-version`
+
+Front a specific version on PATH for this run instead of the project pin. The action provisions it during setup and puts it on the global PATH, so bare `node` downstream is this version:
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    node-version: {{NODE_VERSION}}
+```
+
+Nub still runs the project's declared pin when invoked as `nub`, so the action warns if this input differs from that pin. Omit it to let Nub resolve and provision the project pin automatically.
+
+### `node-version-file`
+
+Read a Node version from a file, then provision and front it on PATH. Accepts `.node-version`, `.nvmrc`, and `package.json` (reads `devEngines.runtime`, then `engines.node`):
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    node-version-file: .node-version
+```
+
+### `cache`
+
+Caching is on by default — it auto-enables when the project looks installable, mirroring setup-node. The auto-detection triggers on a lockfile or a `package.json` that declares `packageManager` or `devEngines`. Set the input explicitly to override:
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    cache: true   # force on; `false` forces off
+```
+
+A package-manager name (`npm`/`pnpm`/`yarn`/`bun`) is accepted for setup-node compatibility and treated as on — Nub keeps one store regardless of package manager.
+
+The cache key is derived from the project's lockfile and the Node pin, with the lockfile auto-detected in this order:
+
+1. `pnpm-lock.yaml`
+2. `package-lock.json`
+3. `bun.lock`
+4. `bun.lockb`
+5. `yarn.lock`
+
+### `package-manager-cache`
+
+The disable knob for the automatic caching above. Set false to turn caching off without setting `cache`:
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    package-manager-cache: false
+```
+
+### `cache-dependency-path`
+
+Override the auto-detected lockfile for cache keying — a lockfile path, glob, or newline-delimited list:
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    cache-dependency-path: |
+      app/pnpm-lock.yaml
+      packages/*/pnpm-lock.yaml
+```
+
+A `restore-keys` ladder gives a partial warm hit even when the lockfile changes.
+
+### `cache-key-prefix`
+
+Inject a prefix into the cache key (`nub-<os>-<arch>-<prefix>-<hash>`) to scope or bust caches independently of the lockfile:
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    cache-key-prefix: v2
+```
+
+### `working-directory`
+
+Resolve the Node pin and lockfile from a subdirectory rather than the checkout root — for monorepos where `package.json`/`.node-version` live below the root:
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    working-directory: apps/web
+```
+
+### `registry-url`
+
+Set up authenticated registry access. The action writes a temporary user-level `.npmrc` via `NPM_CONFIG_USERCONFIG` and wires the auth token to `NODE_AUTH_TOKEN`:
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    registry-url: https://registry.npmjs.org
+- run: nub install
+  env:
+    NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+For GitHub Packages, point at the registry and the scope defaults to the repository owner:
+
+```yaml
+- uses: nubjs/setup-nub@v0
+  with:
+    registry-url: https://npm.pkg.github.com
+- run: nub install
+  env:
+    NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+### `scope`
+
+Scope for a scoped registry. Falls back to the repository owner for `npm.pkg.github.com`. The `.npmrc` written by `registry-url` follows the same contract as setup-node, so existing auth setups port over unchanged.
+
+### `always-auth`
+
+Write `always-auth=true` into the `.npmrc` to authenticate on every registry request.
+
+### `token`
+
+Token for GitHub-API rate-limit relief when resolving Nub's version range (and Node downloads on GHES). Defaults to `github.token` on github.com — most workflows don't need to set this explicitly.
+
+## Outputs
+
+| Output | Description |
+| --- | --- |
+| `nub-version` | The installed Nub version. |
+| `node-version` | The Node version provisioned during setup; empty when nothing was provisioned. |
+| `cache-hit` | Whether an exact store-cache match was restored; empty on a miss, mirroring `actions/cache`. |
+| `caching-enabled` | Whether caching is active for this run, independent of whether a cache was hit. |
+
+## Differences from setup-node
+
+The drop-in is mechanical, so the differences are small and rarely surface:
+
+- The `cache` input is a boolean rather than a package-manager name. A package-manager name still works (it is treated as on), since Nub keeps a single store regardless of package manager.
+- The registry `.npmrc` is written fresh to `$RUNNER_TEMP` and pointed at via `NPM_CONFIG_USERCONFIG`, rather than merged into the user `.npmrc`. Both are parsed identically by npm and Nub's package manager.
+
+## Related
+
+- [Node manager](/docs/node) — how Nub provisions and pins Node versions.
+- [Package manager](/docs/install) — the install surface the action's registry auth feeds.

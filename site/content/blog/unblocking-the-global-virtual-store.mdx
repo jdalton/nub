@@ -1,0 +1,232 @@
+---
+title: "Node’s phantom dependency problem and the path to a 5x faster package manager"
+hnTitle: "How we built a 5x faster JavaScript package manager"
+description: One copy of every package per machine, symlinked into every project — and the mechanisms that make that layout work across the ecosystem.
+author: The Nub Team
+date: 2026-07-07T12:00:00Z
+---
+
+Most package managers across all modern language ecosystems — Rust's Cargo, Python's uv — have converged on the pattern of a global store, and JavaScript's are no exception.
+
+- **npm** fills `~/.npm`
+- **pnpm** keeps a content-addressable store under `~/.local/share/pnpm`
+- **Bun** fills `~/.bun`
+
+A package version is downloaded from its registry once per machine.
+
+The differences are all in what happens next — how the files get from that cache into `node_modules`, the directory inside each project that Node actually loads code from. Classic npm copies them. Every package in the dependency graph — yours and everything transitive — is physically copied into the project and hoisted to the top level of `node_modules`:
+
+```text
+my-app/
+└── node_modules/     # real files, one full copy per project
+    ├── ms/
+    ├── react/
+    └── …             # everything else, flattened
+```
+
+That layout is **unsound**: your code — and the code of every package in the tree — can import anything sitting at the top, whether or not it was ever declared as a dependency.
+
+pnpm fixes this for *your* code. It moves every package into a **virtual store** — a directory tucked inside the project at `node_modules/.pnpm`:
+
+```text
+my-app/
+└── node_modules/
+    ├── ms  →  .pnpm/ms@2.1.3
+    └── .pnpm/                    # the virtual store, one per project
+        └── ms@2.1.3/             # real files, hardlinked in
+```
+
+The top level of `node_modules` holds **only what you declared** — your code physically cannot import a package you didn't declare. (Inside the store it's a different story; hold that thought.)
+
+But ultimately the `node_modules/.pnpm` store is still constructed **file-by-file** by hardlinking from the global store (tens of thousands of link calls for a typical app). ("Hardlink" here and throughout means hardlink, clonefile, or whatever is fastest on your OS.) At which point the question asks itself: the files are already on disk, in the machine store — why hardlink them all into every project?
+
+## The holy grail: symlinks
+
+Why not put the virtual store itself in the machine cache?
+
+```text
+~/.cache/store/        # the virtual store, machine-global
+├── ms@2.1.3/          # real files, one copy per machine
+└── react@19.2.0/      # one entry per package version
+```
+
+Then `node_modules` needs no hardlinks at all — just one symlink per package, pointing straight into the store:
+
+```text
+my-app/
+└── node_modules/
+    ├── ms     →  ~/.cache/store/ms@2.1.3
+    └── react  →  ~/.cache/store/react@19.2.0
+```
+
+No package manager works that way today. Not for lack of trying:
+
+- **Bun shipped exactly this** as the default for its isolated linker ([oven-sh/bun#29489](https://github.com/oven-sh/bun/pull/29489)) — and flipped it to opt-in three weeks later, because it "changes module-resolution realpaths in a way that can surprise tooling" ([oven-sh/bun#30473](https://github.com/oven-sh/bun/pull/30473)).
+- **pnpm ships it behind the `enableGlobalVirtualStore` flag** ([pnpm/pnpm#8190](https://github.com/pnpm/pnpm/pull/8190), closing a request as old as [pnpm/pnpm#1001](https://github.com/pnpm/pnpm/issues/1001)) — off by default, and the tracker shows why: transitive-resolution failures in real Angular and Nuxt projects ([pnpm/pnpm#12437](https://github.com/pnpm/pnpm/issues/12437)), packages the store can't find ([pnpm/pnpm#9618](https://github.com/pnpm/pnpm/issues/9618)), broken TypeScript inference ([pnpm/pnpm#9739](https://github.com/pnpm/pnpm/issues/9739)), concurrent-install races ([pnpm/pnpm#10232](https://github.com/pnpm/pnpm/issues/10232)).
+
+Why does a seemingly obvious idea keep not working? Because of Node.js's **phantom dependency** problem.
+
+## The phantom dependency problem
+
+A phantom dependency is an import of a package the importer doesn't declare in its `package.json`. Many popular packages rely on phantom dependencies, including several that are unmaintained and regrettably load-bearing.
+
+| Package | Downloads/week | Phantom-imports |
+|---|---|---|
+| `es-abstract` | 78M | `for-each` |
+| `jest` | 41M | `jest-config` |
+| `react-i18next` | 13M | `babel-plugin-macros` |
+| `@firebase/database` | 12M | `@firebase/app` |
+| `yjs` | 5.9M | `y-protocols` |
+| `object.hasown` | 4.6M | `call-bind` |
+
+For instance, this is `@inkjs/ui`, as published to npm:
+
+```js
+import React from 'react';   // ← not in @inkjs/ui's dependencies
+```
+
+To resolve `import 'react'`, Node starts at the importing *file* and walks up the directory tree, checking every `node_modules` directory it passes for a `react` folder. So whether that import works is purely an accident of layout:
+
+- **Flat npm layout** — works by accident: everything sits in one flat `node_modules`, so the walk finds `react` there.
+- **pnpm** — still works. This is the different story inside the store: a hidden fallback tree (`node_modules/.pnpm/node_modules`, every package linked flat) deliberately keeps your dependencies' phantom imports resolving.
+- **Machine-global store** — throws.
+
+It throws because the store is a **sealed world**: each entry holds one package's real files, plus symlinks to its declared dependencies — and nothing else.
+
+And Node always resolves a symlink to its real path before loading the file. So code loaded from the store resolves its imports *from inside the store* — your project's `node_modules` is never even on the walk:
+
+```text
+~/.cache/store/ms@2.1.3/node_modules/ms/index.js    # the importing file
+~/.cache/store/ms@2.1.3/node_modules/               # the deps ms declares
+~/.cache/store/…                                    # nothing of yours up here
+```
+
+Declared imports resolve perfectly; a phantom import finds *nothing*. This is what sent Bun back to opt-in and fills pnpm's tracker.
+
+Nub found a way to eliminate that breakage — and ships the symlinked machine-global store as its default layout. Here's how.
+
+## De-phantoming node_modules
+
+To solve the phantom problem, Nub inspects every package's actual code. Nub is uniquely positioned to do this: it already contains [Oxc](https://oxc.rs), a production-grade JavaScript parser and transpiler.
+
+As each tarball is downloaded and installed from npm, Nub scans that version's published code — walking the module graph from its entry points and checking every static, unguarded import against the dependencies it declares. Published packages are immutable, so each version only ever needs to be scanned once. The scan runs while the installer is busy downloading, so it's effectively free.
+
+Each verdict lands as a tiny sidecar file in the machine store, keyed by the package's content fingerprint:
+
+```console
+$ cat ~/.local/share/nub/store/v1/phantom/s2/0b278fff….json
+{"has_unguarded_phantom":true,"targets":[{"name":"preact-render-to-string","from_main":false,"from_subpath":true}],"files_analyzed":39}
+```
+
+At link time, a flagged package is **ejected**: instead of a symlink into the machine store, it's hardlinked into the project as real files, so its resolution walk passes through your project again. `@firebase/database` — which requires `@firebase/app` without declaring it — comes out like this:
+
+```text
+my-app/
+└── node_modules/
+    ├── @firebase/database/                            # ejected: hardlinked files, inside the project
+    └── react  →  ~/.cache/nub/pm/store/react@19.2.0
+```
+
+<Callout title="Two details make the eject sound">
+  - **All of its ancestors come along.** Ejecting only the offender would leave its store-resident importers resolving the shared copy — two real paths, two module instances, a silent singleton split. So everything that imports the flagged package, directly or transitively, is hardlinked into the project with it. The set is small in practice: 0.3–2.1% of the tree, measured on real large dependency graphs.
+  - **The phantom target gets linked in.** Ejecting `@firebase/database` moves the walk into your project, but `@firebase/app` still isn't there — *you* never declared it either. So Nub links it directly inside the ejected package's own `node_modules`, where the walk finds it first.
+</Callout>
+
+If there are no phantom deps detected, everything collapses to the holy grail: pure symlinks.
+
+```text
+~/.cache/nub/pm/store/    # the machine-global store
+├── ms@2.1.3/             # real files, one copy per machine
+├── react@19.2.0/         # one entry per package version
+└── …
+```
+
+Inside a project, `node_modules` is nothing but links into it:
+
+```text
+my-app/
+└── node_modules/
+    ├── ms     →  ~/.cache/nub/pm/store/ms@2.1.3
+    └── react  →  ~/.cache/nub/pm/store/react@19.2.0
+```
+
+## Frameworks
+
+Every major framework has been driven through the full loop — install, dev server with a real page load, production build, then serving that build — under Nub's default install:
+
+| Framework | Works | Layout under the default install |
+|---|---|---|
+| Vite + React | ✅ | global store |
+| Vite + Vue | ✅ | global store |
+| Vite + Svelte | ✅ | global store |
+| Vite + Solid | ✅ | global store |
+| Vite + Preact | ✅ | global store |
+| Vite + Lit | ✅ | global store |
+| Astro | ✅ | global store |
+| SvelteKit | ✅ | global store |
+| VitePress | ✅ | global store |
+| Nuxt | ✅ | global store |
+| Parcel | ✅ | global store |
+| Expo | ✅ | global store |
+| Next.js | ✅ | ⚠️ GVS disabled |
+| React Native | ✅ | ⚠️ GVS disabled |
+
+Three of them needed special handling.
+
+### Vite
+
+Vite underpins most of the modern framework ecosystem — Astro, Nuxt, SvelteKit, SolidStart, and TanStack Start all dev-serve and build through it — so if a layout doesn't work under Vite, it doesn't work.
+
+By default, Vite [refuses to load files from outside your project](https://vite.dev/config/server-options.html#server-fs-allow). This recently changed in Vite 8.1, which now natively supports virtual stores ([vitejs/vite#22415](https://github.com/vitejs/vite/pull/22415)). It reads the store's location from `node_modules/.modules.yaml` (a pnpm convention originally) and adds it to the allow-list automatically.
+
+```console
+$ cat node_modules/.modules.yaml
+{"virtualStoreDir":"/Users/you/.cache/nub/pm/store"}
+```
+
+Nub backports this fix to earlier versions of Vite during linking via `patch-package`, effectively adding virtual store support **all the way back to Vite 5**. This is the vast majority of Vite versions (and, by extension, most JavaScript frameworks) in the wild today. 
+
+### Next.js
+
+Next.js is one of the two holdouts. Turbopack (written in Rust) canonicalizes every path and confines the module graph to a single project root. Unlike Vite, there is no opt-out mechanism Nub can take advantage of here. When Nub detects Next.js, it disables symlinks/GVS for the entire project, falling back to the classic pnpm hardlink approach `node_modules/.store`.
+
+### React Native
+
+Same story with bare React Native: its default Metro config only sees files whose real path sits inside the project directory, with no way to point it at the store — so Nub applies the same project-wide fallback. (Metro itself isn't the constraint: Expo ships a store-aware Metro config, and Expo apps work fine against the global store.)
+
+## Opting out
+
+The global store also switches off wherever it can't work or isn't wanted:
+
+- **CI (`CI=1` in the environment), and `nub ci` anywhere** — real directories and relative links, a `node_modules` that survives a Docker `COPY --from` into a fresh image where the machine store wouldn't exist.
+- **Injected workspace dependencies** (`dependenciesMeta.*.injected`) — these exist to give each consumer its own copy, so the store stays in the project.
+- **Manual opt-out** — one `.npmrc` setting moves the virtual store back inside the project: same isolated layout, same phantom protection, no cross-project sharing.
+
+  ```ini
+  enableGlobalVirtualStore=false
+  ```
+
+The default, though, is the global store, with the scanner, the Vite compat, and the framework fallback closing the gaps.
+
+## Final results
+
+All together, Nub can safely symlink the vast majority of packages into your project-local `node_modules`, while surgically falling back to a classic hardlink approach for any problematic dependencies. The final result: symlink-based linkers are finally feasible in JavaScript, and warm installs are up to 5x faster.
+
+The fixture: 1,168 packages, 81,398 files, installed warm — store populated, frozen lockfile, `node_modules` wiped between runs, no network. The two Nub rows are the same install under two linkers: `--node-linker hoisted` builds the same flat, per-file-hardlinked layout as Bun; the default row is the one-symlink-per-package relink this post is about.
+
+<Bench
+  label="warm install · 1168 packages · Linux (ubuntu-latest)"
+  source="https://github.com/nubjs/nub/tree/main/tests/bench/install"
+  accent="pink"
+  max={12945}
+  caption="hyperfine, 25 runs / 6 warmup, near-idle ubuntu-latest runner · bun 1.3.14, pnpm 10.34.4, npm on Node 24."
+  rows={[
+    { cmd: 'nub install', ms: 346, us: true },
+    { cmd: 'nub install --node-linker hoisted', ms: 1461, ratio: 4.2 },
+    { cmd: 'bun install', ms: 1896, ratio: 5.5 },
+    { cmd: 'pnpm install', ms: 3453, ratio: 10 },
+    { cmd: 'npm ci', ms: 12945, ratio: 37.4 },
+  ]}
+/>
+
+See [the virtual store docs](/docs/install/virtual-store) for the layout options in full.

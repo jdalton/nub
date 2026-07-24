@@ -7,7 +7,7 @@
 //! this table (it iterates [`FEATURES`]); the webstorage gating predicates are
 //! derived from it too. There is no second copy of the bands to drift against.
 //!
-//! ## The three mitigation shapes
+//! ## The mitigation shapes
 //!
 //! A feature reaches the user through exactly one of these per Node version:
 //!
@@ -27,8 +27,10 @@
 //!   intent + the floor; it does **not** version-gate the polyfill in Rust (the
 //!   polyfill bows out on its own when the global is already present). A unit
 //!   test asserts each named file exists and contains the named feature-detect.
-//! - **`Absent`** — below the feature's floor nub does nothing and the feature is
-//!   simply unavailable (the honest compat-tier outcome).
+//!
+//! Below a feature's floor no band matches (`mitigation_for` returns `None`):
+//! nub does nothing and the feature is simply unavailable (the honest
+//! compat-tier outcome).
 //!
 //! ## Why this is THE place
 //!
@@ -64,17 +66,17 @@ use super::version::NodeVersion;
 /// iff `lo <= v && (hi.is_none() || v < hi)`.
 #[derive(Clone)]
 pub struct VersionBand {
-    pub lo: NodeVersion,
-    pub hi: Option<NodeVersion>,
+    lo: NodeVersion,
+    hi: Option<NodeVersion>,
 }
 
 impl VersionBand {
-    pub const fn new(lo: NodeVersion, hi: Option<NodeVersion>) -> Self {
+    const fn new(lo: NodeVersion, hi: Option<NodeVersion>) -> Self {
         Self { lo, hi }
     }
 
     /// Whether `v` falls in this `[lo, hi)` band.
-    pub fn contains(&self, v: &NodeVersion) -> bool {
+    fn contains(&self, v: &NodeVersion) -> bool {
         *v >= self.lo && self.hi.as_ref().is_none_or(|hi| v < hi)
     }
 }
@@ -97,24 +99,26 @@ pub enum Mitigation {
         runtime_file: &'static str,
         global: &'static str,
     },
-    /// Below the feature's floor: nub does nothing, the feature is unavailable.
-    Absent,
 }
 
 /// One user-facing runtime feature and its per-version mitigation.
-pub struct Feature {
+pub(crate) struct Feature {
     /// Stable, human-readable feature name (unique across the table).
-    pub name: &'static str,
+    name: &'static str,
     /// The per-version mitigation bands, sorted ascending and non-overlapping.
     /// A version's mitigation is the band it falls into (or "nothing" if none).
-    pub mitigations: &'static [(VersionBand, Mitigation)],
+    mitigations: &'static [(VersionBand, Mitigation)],
     /// Changelog / PR citation for the whole feature (the bands' evidence).
-    pub evidence: &'static str,
+    /// Documentation-as-data: nothing in the production path reads it (hence the
+    /// allow — the lib target can't see the cfg(test) reader); the
+    /// `every_row_carries_changelog_evidence` test enforces it stays populated.
+    #[allow(dead_code)]
+    evidence: &'static str,
 }
 
 impl Feature {
     /// The mitigation that applies to `v` — the band it falls into, if any.
-    pub fn mitigation_for(&self, v: &NodeVersion) -> Option<Mitigation> {
+    pub(crate) fn mitigation_for(&self, v: &NodeVersion) -> Option<Mitigation> {
         self.mitigations
             .iter()
             .find(|(band, _)| band.contains(v))
@@ -135,7 +139,7 @@ const fn band(lo: (u32, u32, u32), hi: Option<(u32, u32, u32)>) -> VersionBand {
 /// feature with its per-version mitigation and changelog evidence. Everything
 /// version-keyed in [`super::flags`] and the webstorage predicates is derived
 /// from this — do not add a parallel table elsewhere.
-pub static FEATURES: &[Feature] = &[
+static FEATURES: &[Feature] = &[
     // ── vm.Module / vm.SourceTextModule ────────────────────────────────────
     // Flag added in Node 9.6.0 (#14253) and NEVER unflagged through Node 26 —
     // `vm.Module` stays experimental and the flag is always required. So inject
@@ -176,7 +180,7 @@ pub static FEATURES: &[Feature] = &[
     // backported to the 20.x LTS line at 20.18.0. The 21.x line was already EOL
     // when it landed, so the flag NEVER existed there — injecting it on any 21.x
     // is a "bad option" startup crash. Never unflagged through 26. Injection set:
-    // [20.18.0, 21.0.0) ∪ [22.3.0, ∞). Below 20.18 it is Absent.
+    // [20.18.0, 21.0.0) ∪ [22.3.0, ∞). Below 20.18 the feature is absent (no band).
     Feature {
         name: "eventsource",
         mitigations: &[
@@ -263,6 +267,106 @@ pub static FEATURES: &[Feature] = &[
         ],
         evidence: "flag added 23.6.0 (23.x) / 22.20.0 (22.x backport); Stability 1.0; never default-on through Node 27",
     },
+    // ── import-text (importing source as text via import attributes) ─────────
+    // `import txt from './x.txt' with { type: 'text' }` — the module's default export
+    // is the file's string contents. Node gained this behind `--experimental-import-text`
+    // on the 26.x line at 26.5.0 (SEMVER-MINOR, #62300); the flag does not exist below
+    // 26.5.0, where injecting it is a "bad option" startup abort, and is still flag-gated
+    // (never default-on) through Node 27 nightly — so this open-ended Unflag band injects
+    // it on [26.5.0, ∞).
+    //
+    // This row is ONLY the native side. nub ALSO provides import-text on EVERY version
+    // that can parse the `with` syntax (Node 18.20+) via a loader polyfill —
+    // `loadTextImport` in runtime/transform-core.mjs, dispatched by the load hooks on
+    // `importAttributes.type === "text"`. Per the additive contract, the fast-tier hook
+    // (preload-common.cjs) feature-detects native support (`--experimental-import-text`
+    // in `process.allowedNodeEnvironmentFlags`, i.e. Node 26.5+) and STEPS ASIDE to
+    // Node's own textStrategy there — this injected flag is what makes that native path
+    // work; below 26.5 the polyfill owns it. The polyfill is a load-hook, not a
+    // typeof-global, so it does not fit the `Polyfill` mitigation shape and lives in the
+    // runtime rather than as a band here.
+    Feature {
+        name: "import-text",
+        mitigations: &[(
+            band((26, 5, 0), None),
+            Mitigation::Unflag("--experimental-import-text"),
+        )],
+        evidence: "flag added Node 26.5.0 (#62300); still flag-gated through Node 27 nightly; nub loader-polyfills below via runtime/transform-core.mjs loadTextImport",
+    },
+    // ── Module syntax detection (ambiguous ESM `.js`) ────────────────────────
+    // `--experimental-detect-module` makes Node parse an ambiguous file — ES-module
+    // syntax, a `.js` extension, and a `package.json` with no `"type"` field — and run it
+    // as ESM when module syntax is found. Bare Node below the default-on cutover refuses
+    // such a file ("To load an ES module, set type: module", exit 1). Introduced on the
+    // 21.x line at 21.1.0 (#50096) and backported to the 20.x LTS line at 20.10.0; the
+    // 21.0.0 release predates the flag, so injecting it there is a "bad option" startup
+    // abort (the same EOL-line hole as eventsource). It became default-on (flag →
+    // default-true, no longer required) at 20.19.0 on the 20.x line and 22.7.0 on the 22.x
+    // line (#53619, "unflag detect-module"). Inject only where the flag both EXISTS and is
+    // still REQUIRED: [20.10.0, 20.19.0) ∪ [21.1.0, 22.7.0). Empirically confirmed —
+    // 20.18.0 needs the flag, 20.19.0 detects by default, 21.0.0 rejects the flag, 21.1.0
+    // needs it, 22.7.0 detects by default.
+    Feature {
+        name: "detect-module",
+        mitigations: &[
+            (
+                band((20, 10, 0), Some((20, 19, 0))),
+                Mitigation::Unflag("--experimental-detect-module"),
+            ),
+            (
+                band((21, 1, 0), Some((22, 7, 0))),
+                Mitigation::Unflag("--experimental-detect-module"),
+            ),
+        ],
+        evidence: "intro 21.1.0 (#50096), backported 20.10.0; default-on 20.19.0 & 22.7.0 (#53619); flag absent on 21.0.0",
+    },
+    // ── node:ffi (foreign function interface) ────────────────────────────────
+    // `--experimental-ffi` gates the `node:ffi` module (loading dynamic libraries and
+    // calling native symbols). Added on the 26.x line at 26.1.0 (#62072); the flag does
+    // not exist on 26.0.0 or below, where injecting it is a "bad option" startup abort.
+    // Snapshot-neutral (a module gate, not a V8 harmony flag — unlike ShadowRealm above),
+    // so it is safe to auto-unflag; enabling the flag only makes the module importable,
+    // and node:ffi is unsafe solely if user code actively misuses it. Stability 1.0 and
+    // still flag-gated (default-off — `import('node:ffi')` throws
+    // ERR_UNKNOWN_BUILTIN_MODULE without the flag) through Node 26.5 / 27 nightly, so this
+    // open-ended band injects it on [26.1.0, ∞). (node:ffi additionally wants --allow-ffi
+    // under the Permission Model; nub does not inject permission flags.)
+    Feature {
+        name: "ffi",
+        mitigations: &[(
+            band((26, 1, 0), None),
+            Mitigation::Unflag("--experimental-ffi"),
+        )],
+        evidence: "node:ffi added Node 26.1.0 (#62072); absent 26.0.0; default-off through Node 27 nightly",
+    },
+    // ── node:vfs (virtual file system) ───────────────────────────────────────
+    // `--experimental-vfs` gates the minimal `node:vfs` subsystem. Added on the 26.x line
+    // at 26.4.0 (#63115); absent on 26.3.0 and below (injecting there is a "bad option"
+    // abort). Snapshot-neutral. Still flag-gated (default-off — `import('node:vfs')` throws
+    // ERR_UNKNOWN_BUILTIN_MODULE without the flag) through Node 26.5 / 27 nightly, so this
+    // open-ended band injects it on [26.4.0, ∞).
+    Feature {
+        name: "vfs",
+        mitigations: &[(
+            band((26, 4, 0), None),
+            Mitigation::Unflag("--experimental-vfs"),
+        )],
+        evidence: "node:vfs added Node 26.4.0 (#63115); absent 26.3.0; default-off through Node 27 nightly",
+    },
+    // ── node:stream/iter (async-iterator stream adapters) ────────────────────
+    // `--experimental-stream-iter` gates the `node:stream/iter` module. Added on the 25.x
+    // line at 25.9.0 (#62066); absent on 25.8.x and below (injecting there is a "bad
+    // option" abort). Snapshot-neutral. Still flag-gated (default-off —
+    // `import('node:stream/iter')` throws ERR_UNKNOWN_BUILTIN_MODULE without the flag)
+    // through Node 26.5 / 27 nightly, so this open-ended band injects it on [25.9.0, ∞).
+    Feature {
+        name: "stream-iter",
+        mitigations: &[(
+            band((25, 9, 0), None),
+            Mitigation::Unflag("--experimental-stream-iter"),
+        )],
+        evidence: "node:stream/iter added Node 25.9.0 (#62066); absent 25.8.1; default-off through Node 27 nightly",
+    },
     // ── WebSocket global ────────────────────────────────────────────────────
     // Flag-gated on [20.10.0, 22.0.0) — the global exists on 20.10+ and all of the
     // 21.x line behind `--experimental-websocket`, then becomes default-on at
@@ -282,7 +386,7 @@ pub static FEATURES: &[Feature] = &[
     // ── Web Storage (localStorage / sessionStorage) ─────────────────────────
     // `--experimental-webstorage` + `--localstorage-file` landed in Node 22.4.0;
     // below it both are "bad option" (compat tier 18.19–22.3 runs without
-    // webstorage → Absent). The experimental flag was unflagged (defaults on) in
+    // webstorage — no band). The experimental flag was unflagged (defaults on) in
     // Node 25.0.0 (PR #57666). So:
     //   • [22.4.0, 25.0.0) → Unflag("--experimental-webstorage") + a storage file.
     //   • [25.0.0, ∞)      → StorageFile only (global is native; the
@@ -559,13 +663,14 @@ pub static FEATURES: &[Feature] = &[
 /// V8 context snapshot (Electron) in `Context::FromSnapshot` → `CreateEnvironment`,
 /// before any preload JS can intervene (#246). The
 /// `no_v8_harmony_flag_in_unflag_set` test enforces this against the whole matrix.
-pub const V8_HARMONY_UNFLAG_DENYLIST: &[&str] = &["--experimental-shadow-realm"];
+#[cfg(test)]
+const V8_HARMONY_UNFLAG_DENYLIST: &[&str] = &["--experimental-shadow-realm"];
 
 /// Look up a feature row by name (used by the webstorage-predicate derivation in
 /// [`super::flags`]). Panics if the name is absent — it is only ever called with
 /// a literal that must exist in [`FEATURES`], so an absent name is a programming
 /// error worth failing loudly.
-pub fn feature(name: &str) -> &'static Feature {
+pub(crate) fn feature(name: &str) -> &'static Feature {
     FEATURES
         .iter()
         .find(|f| f.name == name)
@@ -579,7 +684,7 @@ pub fn feature(name: &str) -> &'static Feature {
 ///
 /// Order follows table order (vm-modules, eventsource, sqlite, websocket,
 /// webstorage…) so the produced flag list is deterministic.
-pub fn unflag_flags_for(node_version: &NodeVersion) -> Vec<&'static str> {
+pub(crate) fn unflag_flags_for(node_version: &NodeVersion) -> Vec<&'static str> {
     FEATURES
         .iter()
         .filter_map(|f| match f.mitigation_for(node_version) {
@@ -597,7 +702,7 @@ pub fn unflag_flags_for(node_version: &NodeVersion) -> Vec<&'static str> {
 /// exactly `[0, floor)`. [`super::flags::strip_unsupported_node_options`] uses this
 /// to snip a below-floor gated flag out of an inherited NODE_OPTIONS. Derived from
 /// the same matrix the inject path reads — no parallel floor table.
-pub fn unflag_floor(flag: &str) -> Option<NodeVersion> {
+pub(crate) fn unflag_floor(flag: &str) -> Option<NodeVersion> {
     FEATURES
         .iter()
         .flat_map(|f| f.mitigations.iter())
@@ -631,6 +736,19 @@ mod tests {
             assert!(
                 seen.insert(f.name),
                 "duplicate feature name in matrix: {:?}",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_row_carries_changelog_evidence() {
+        // The module doc requires each row to cite its changelog/PR evidence;
+        // an empty string would silently drop the audit trail.
+        for f in FEATURES {
+            assert!(
+                !f.evidence.trim().is_empty(),
+                "feature {:?} has no evidence citation",
                 f.name
             );
         }
@@ -780,6 +898,44 @@ mod tests {
         assert!(unflag_flags_for(&v(22, 4, 0)).contains(&"--experimental-webstorage"));
         assert!(unflag_flags_for(&v(24, 99, 0)).contains(&"--experimental-webstorage"));
         assert!(!unflag_flags_for(&v(25, 0, 0)).contains(&"--experimental-webstorage"));
+        // import-text: open-ended [26.5.0, ∞); the flag doesn't exist below 26.5.0.
+        let it = "--experimental-import-text";
+        assert!(!unflag_flags_for(&v(26, 4, 0)).contains(&it));
+        assert!(unflag_flags_for(&v(26, 5, 0)).contains(&it));
+        assert!(unflag_flags_for(&v(27, 0, 0)).contains(&it));
+        assert_eq!(unflag_floor(it), Some(v(26, 5, 0)));
+        // detect-module: [20.10.0, 20.19.0) ∪ [21.1.0, 22.7.0). Below the backport
+        // floor and at each default-on cutover it is excluded; the 21.0.0 release
+        // predates the flag (injecting it is a "bad option" crash — the eventsource hole).
+        let dm = "--experimental-detect-module";
+        assert!(!unflag_flags_for(&v(20, 9, 0)).contains(&dm));
+        assert!(unflag_flags_for(&v(20, 10, 0)).contains(&dm));
+        assert!(unflag_flags_for(&v(20, 18, 0)).contains(&dm));
+        assert!(!unflag_flags_for(&v(20, 19, 0)).contains(&dm)); // default-on
+        assert!(!unflag_flags_for(&v(21, 0, 0)).contains(&dm)); // flag absent (hole)
+        assert!(unflag_flags_for(&v(21, 1, 0)).contains(&dm));
+        assert!(unflag_flags_for(&v(22, 6, 0)).contains(&dm));
+        assert!(!unflag_flags_for(&v(22, 7, 0)).contains(&dm)); // default-on
+        assert_eq!(unflag_floor(dm), Some(v(20, 10, 0)));
+        // ffi: open-ended [26.1.0, ∞); the flag doesn't exist on 26.0.0.
+        let ffi = "--experimental-ffi";
+        assert!(!unflag_flags_for(&v(26, 0, 0)).contains(&ffi));
+        assert!(unflag_flags_for(&v(26, 1, 0)).contains(&ffi));
+        assert!(unflag_flags_for(&v(26, 5, 0)).contains(&ffi));
+        assert!(unflag_flags_for(&v(27, 0, 0)).contains(&ffi));
+        assert_eq!(unflag_floor(ffi), Some(v(26, 1, 0)));
+        // vfs: open-ended [26.4.0, ∞); the flag doesn't exist on 26.3.0.
+        let vfs = "--experimental-vfs";
+        assert!(!unflag_flags_for(&v(26, 3, 0)).contains(&vfs));
+        assert!(unflag_flags_for(&v(26, 4, 0)).contains(&vfs));
+        assert!(unflag_flags_for(&v(26, 5, 0)).contains(&vfs));
+        assert_eq!(unflag_floor(vfs), Some(v(26, 4, 0)));
+        // stream-iter: open-ended [25.9.0, ∞); the flag doesn't exist on 25.8.x.
+        let si = "--experimental-stream-iter";
+        assert!(!unflag_flags_for(&v(25, 8, 1)).contains(&si));
+        assert!(unflag_flags_for(&v(25, 9, 0)).contains(&si));
+        assert!(unflag_flags_for(&v(26, 5, 0)).contains(&si));
+        assert_eq!(unflag_floor(si), Some(v(25, 9, 0)));
     }
 
     #[test]

@@ -24,7 +24,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-NUB="${NUB:-$REPO_ROOT/target/release/nub}"
+DEFAULT_NUB="$REPO_ROOT/target/release/nub"
+NUB="${NUB:-$DEFAULT_NUB}"
 FIXTURE_DIR="$REPO_ROOT/tests/bench/install/fixtures"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 
@@ -67,10 +68,36 @@ HAS_BUN=0
 if command -v bun &>/dev/null; then HAS_BUN=1; fi
 
 # ── Preflight ──────────────────────────────────────────────────────────────
+# Staleness guard: the nub binary's version MUST match the workspace, or the bench
+# silently measures an ancient binary (this happened — a v0.2.8 target/release/nub
+# gave bogus numbers). Auto-build the default binary; hard-error a mismatched NUB=.
+WS_VERSION="$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+nub_semver() { "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+is_default_nub=0
+[[ "$NUB" == "$DEFAULT_NUB" ]] && is_default_nub=1
 if [[ ! -x "$NUB" ]]; then
-  echo "ERROR: $NUB not found or not executable. Run 'cargo build --release' first." >&2
-  exit 1
+  if [[ $is_default_nub -eq 1 ]]; then
+    echo "== nub binary missing at $NUB — building release (cargo build --release -p nub-cli) =="
+    ( cd "$REPO_ROOT" && cargo build --release -p nub-cli ) || { echo "ERROR: release build failed" >&2; exit 1; }
+  else
+    echo "ERROR: nub not found at NUB=$NUB. Build it: cargo build --release -p nub-cli" >&2
+    exit 1
+  fi
 fi
+NUB_SEMVER="$(nub_semver "$NUB")"
+if [[ "$NUB_SEMVER" != "$WS_VERSION" ]]; then
+  if [[ $is_default_nub -eq 1 ]]; then
+    echo "== STALE nub binary: $NUB is v$NUB_SEMVER but workspace is v$WS_VERSION — rebuilding release =="
+    ( cd "$REPO_ROOT" && cargo build --release -p nub-cli ) || { echo "ERROR: release build failed" >&2; exit 1; }
+    NUB_SEMVER="$(nub_semver "$NUB")"
+    [[ "$NUB_SEMVER" == "$WS_VERSION" ]] || { echo "ERROR: after rebuild nub is still v$NUB_SEMVER, expected v$WS_VERSION" >&2; exit 1; }
+  else
+    echo "ERROR: stale/mismatched nub binary: NUB=$NUB is v$NUB_SEMVER but workspace is v$WS_VERSION." >&2
+    echo "       Rebuild release and re-run: cargo build --release -p nub-cli" >&2
+    exit 1
+  fi
+fi
+echo "== nub binary OK: v$NUB_SEMVER (matches workspace v$WS_VERSION) =="
 if ! command -v hyperfine &>/dev/null; then
   echo "ERROR: hyperfine not found. Install with: brew install hyperfine" >&2
   exit 1
@@ -110,16 +137,17 @@ setup_workdir() {
   rm -rf "$workdir"
   cp -r "$FIXTURE_DIR/$fixture" "$workdir"
   rm -rf "$workdir/node_modules" "$workdir"/packages/*/node_modules 2>/dev/null || true
-  # A fixture may ship multiple lockfiles (pnpm-lock.yaml for nub+pnpm, bun.lock for
-  # bun, package-lock.json for npm). Each tool installs from its OWN lockfile; a
-  # foreign lockfile alongside makes nub refuse to infer a PM ("two competing
-  # lockfiles") and lets a tool read a stale lock. Resolution stays identical within
-  # a tool's own lockfile family; we only strip the OTHER tools' lockfiles from this
-  # tool's isolated workdir.
+  # A fixture ships every tool's lockfile (nub.lock for nub, pnpm-lock.yaml for
+  # pnpm, bun.lock for bun, package-lock.json for npm). Each tool installs from its
+  # OWN lockfile; a foreign lockfile alongside makes nub refuse to infer a PM ("two
+  # competing lockfiles") and lets a tool read a stale lock. We strip every OTHER
+  # tool's lockfile from this tool's isolated workdir so the nub leg exercises nub's
+  # NATIVE nub.lock path — not the pnpm-lock.yaml compat-read.
   case "$tool" in
-    pnpm|nub) rm -f "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true ;;
-    bun)      rm -f "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" "$workdir/package-lock.json" 2>/dev/null || true ;;
-    npm)      rm -f "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" 2>/dev/null || true ;;
+    nub)  rm -f "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true ;;
+    pnpm) rm -f "$workdir/nub.lock" "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true ;;
+    bun)  rm -f "$workdir/nub.lock" "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" "$workdir/package-lock.json" 2>/dev/null || true ;;
+    npm)  rm -f "$workdir/nub.lock" "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" 2>/dev/null || true ;;
   esac
 }
 

@@ -41,8 +41,9 @@ pub use pool::default_linker_parallelism;
 pub use sweep::{is_physical_importer, mkdirp, remove_dir_all_with_retry, sweep_stale_tmp_dirs};
 pub(crate) use sweep::{sweep_stale_top_level_entries, try_remove_entry};
 pub use sys::{
-    BinShimOptions, create_bin_shim, create_dir_link, normalize_path, parse_posix_shim_target,
-    remove_bin_shim, validate_bin_name, validate_bin_target,
+    BinShimOptions, create_bin_shim, create_dir_link, is_native_executable,
+    is_native_executable_target, normalize_path, parse_posix_shim_target, remove_bin_shim,
+    validate_bin_name, validate_bin_target,
 };
 
 /// Strategy for arranging packages under `node_modules/`.
@@ -70,11 +71,15 @@ pub enum NodeLinker {
 /// Limit how far packages may be promoted in `NodeLinker::Hoisted`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum HoistingLimits {
-    /// Hoist as far as possible.
+    /// Hoist as far as possible. In a workspace this hoists across every
+    /// member into the single shared workspace-root `node_modules`, so a
+    /// dependency at one version lives once at the root and only conflicts
+    /// nest (real pnpm's `nodeLinker=hoisted` default).
     #[default]
     None,
-    /// Aube plans hoisted installs per physical importer, so this is
-    /// currently equivalent to `None`.
+    /// Hoist only as far as each workspace package: every member's
+    /// `node_modules` is planned independently, bordered at the member
+    /// root, so transitives never promote across the workspace.
     Workspaces,
     /// Do not hoist transitives above the direct dependency that
     /// introduced them.

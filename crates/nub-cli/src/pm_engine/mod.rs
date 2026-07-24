@@ -53,6 +53,7 @@
 
 mod bun_config;
 pub mod config_scope;
+mod expo_compat;
 pub mod identity;
 pub mod info_family;
 pub mod install_family;
@@ -247,10 +248,10 @@ pub const ENGINE_VERBS: &[VerbSpec] = &[
         family: Family::Install,
         aube_args: "commands::create::CreateArgs",
     },
-    // `init` is deliberately NOT registered: the spelling is reserved for
-    // nub's own project init (the maintainer owns the verb), not the engine's
-    // npm-style manifest scaffold. cli.rs answers `nub init` with a
-    // "nub's own init is coming" note instead of a PM redirect.
+    // `init` is deliberately NOT registered: the spelling belongs to nub's
+    // own project scaffold (src/init.rs, a clap subcommand), not the engine's
+    // npm-style manifest write — the fourth deliberate pnpm-compat exception
+    // (AGENTS.md); design record in wiki/commands/init.md.
     // Workspace fanout meta-verb. Registered so it errors with the honest
     // "use -r on the verb" message rather than the generic not-a-command
     // fallback (install_family::run_verb).
@@ -966,14 +967,18 @@ fn apply_config_scope(
     // Scope the override sources to the role's dialect.
     let tagged = config_scope::gather_tagged_overrides(&manifest);
     let (effective, ignored) = config_scope::scope_overrides(role, major, minor, &tagged);
+    // Scope packageExtensions the same way: the top-level home is nub's neutral
+    // surface, honored only under nub identity and dropped under a compat role
+    // whose incumbent ignores it (see `scope_package_extensions`).
+    let (effective_pe, pe_ignored) = config_scope::scope_package_extensions(role, &manifest);
 
-    // Register the scoped source as the engine's sole override source, and
-    // the trusted-deps toggle (only bun honors `trustedDependencies`). Both
-    // are idempotent OnceLocks.
+    // Register the scoped sources as the engine's sole override / packageExtensions
+    // sources, and the trusted-deps toggle (only bun honors `trustedDependencies`).
     let trusted = config_scope::honors_trusted_dependencies(role);
     aube_util::update_engine_context(|c| {
         c.embedder_overrides = Some(effective);
         c.trusted_dependencies_honored = trusted;
+        c.embedder_package_extensions = Some(effective_pe);
     });
 
     if noise == ConfigScopeNoise::Warn {
@@ -985,6 +990,8 @@ fn apply_config_scope(
         {
             return Err(catalog_unsupported_error(role, &spec));
         }
+        let mut ignored = ignored;
+        ignored.extend(pe_ignored);
         emit_scope_warnings(role, &ignored);
 
         // Curated unsupported-config scan: FATAL-abort on the genuinely-hard
@@ -1378,21 +1385,46 @@ fn augmentation_to_lifecycle_overlay(
 /// Install nub's runtime augmentation onto the engine's lifecycle-script spawn
 /// env (via aube's generic [`aube::set_script_settings`] overlay), so dependency
 /// build scripts run under the project's provisioned + augmented Node — the same
-/// env `nub run` / `nub exec` give scripts. No-op (overlay stays default-empty,
-/// behavior preserved) when augmentation can't be computed (compat / re-entrant
-/// / broken install). Called once per command from [`engine_session`].
+/// env `nub run` / `nub exec` give scripts. The overlay stays default-empty
+/// (behavior preserved) when augmentation can't be computed (compat /
+/// re-entrant / broken install); the resolved Node *version* is published to the
+/// engine either way. Called once per command from [`engine_session`].
 fn apply_lifecycle_augmentation(cwd: &Path) {
-    let Ok(nub_binary) = nub_core::node::spawn::current_nub_binary() else {
-        return;
-    };
+    // Anchor Node discovery at the workspace root — the directory aube keys its
+    // install state and virtual store at (`dirs::workspace_or_project_root`). An
+    // install from a member materializes the ONE shared tree for the whole
+    // workspace, so the Node its build scripts compile against — and the engine
+    // that keys the ABI caches — must be the root's pin, not whichever member the
+    // shell sits in. Discovering from the raw cwd instead lets a member's own
+    // `.nvmrc` flip the engine key against a root-anchored state file, thrashing
+    // the warm path. `detect_project` walks up by the same rule aube's root does.
+    let anchor = nub_core::workspace::detect::detect_project(cwd)
+        .map(|p| p.workspace_root.unwrap_or(p.root))
+        .unwrap_or_else(|| cwd.to_path_buf());
     // The project's Node — pin-aware (`.nvmrc`/`.node-version`/`engines`), NOT
     // the ambient PATH node. This resolved version drives flag injection and its
     // path pins npm_node_execpath. Mirrors build_script_command's discovery.
-    let node = nub_core::node::discovery::discover_node(cwd)
-        .unwrap_or_else(|_| nub_core::node::discovery::ResolvedNode::fallback());
+    let discovered = nub_core::node::discovery::discover_node(&anchor);
+    // Published ABOVE the early returns: the engine keys its GVS virtual-store
+    // paths — and validates `engines.node` — off this version, so it has to name
+    // the Node dependency build scripts actually compile against. That stays the
+    // project's pin under `--node` / NODE_COMPAT, which disable augmentation but
+    // not version provisioning. Otherwise aube probes the ambient PATH node and
+    // two majors silently share one store entry. Deliberately left unset when
+    // discovery FAILS: build scripts then fall back to a bare `node`, so the
+    // PATH probe is the honest answer and a fabricated version would not be.
+    if let Ok(node) = &discovered {
+        let version = node.version.to_string();
+        aube_util::update_engine_context(|c| c.runtime_node_version = Some(version));
+    }
+    let Ok(nub_binary) = nub_core::node::spawn::current_nub_binary() else {
+        return;
+    };
+    let node = discovered.unwrap_or_else(|_| nub_core::node::discovery::ResolvedNode::fallback());
     let pnp_ctx = nub_core::pnp::detect(cwd);
     let Some(aug) = nub_core::node::spawn::compute_augmentation_env(
         &nub_binary,
+        node.path.as_std_path(),
         node.version,
         // Lifecycle scripts are never compat: PM verbs run augmented (there is
         // no `--node` lifecycle path).
@@ -1463,6 +1495,22 @@ fn resolve_identity_walk_up(
     strictness: IdentityStrictness,
 ) -> Result<Option<DetectedLockfile>> {
     use aube_lockfile::ResolvedLockfileKind;
+    // The walk never escapes nub's own PM cache root. Installs running inside
+    // it are nub-internal by construction (the node-gyp bootstrap's recursive
+    // install, dlx scratch dirs) and must not inherit identity from whatever
+    // sits above the cache — unbounded, a first-run bootstrap dir (manifest,
+    // no lockfile yet) walked into $HOME and hard-failed the outer install on
+    // unrelated-lockfile ambiguity (#489). The root is kept in whichever
+    // spelling is an ancestor of `cwd` (raw, or canonicalized for the
+    // symlinked-temp-dir case) so the containment test stays consistent as
+    // `dir` pops.
+    let clamp = aube_store::dirs::cache_dir().and_then(|root| {
+        if cwd.starts_with(&root) {
+            return Some(root);
+        }
+        let canon = std::fs::canonicalize(&root).ok()?;
+        cwd.starts_with(&canon).then_some(canon)
+    });
     let mut dir = cwd.to_path_buf();
     for _ in 0..16 {
         match aube_lockfile::resolve_project_lockfile_kind(&dir) {
@@ -1491,6 +1539,11 @@ fn resolve_identity_walk_up(
             Err(err) => return Err(identity_error(err)),
         }
         if !dir.pop() {
+            break;
+        }
+        if let Some(root) = &clamp
+            && !dir.starts_with(root)
+        {
             break;
         }
     }
@@ -1664,6 +1717,19 @@ pub(crate) fn engine_brand_preflight() {
         c.synthetic_user_npmrc_entries = bunfig.user;
         c.synthetic_project_npmrc_entries = bunfig.project;
         c.npm_save_prefix_on_bare_exact = npm_save_prefix_on_bare_exact;
+        // pnpm's `namedRegistries` alias routing is a pnpm-compat surface, so it
+        // engages under the same posture as the pnpm-branded config reads
+        // (pnpm incumbent or fresh nub-as-pnpm-drop-in). Distinct EngineContext
+        // bool because that posture defaults `true` in standalone aube, which
+        // would activate the feature there and break default-preservation.
+        c.named_registries_enabled = read_branded_pnpm_config;
+        // nub treats packageExtensions as a checksummed, drift-enforced config
+        // like pnpm: it stamps `packageExtensionsChecksum` on its own generic
+        // lockfile (nub.lock) and re-resolves / frozen-fails on a mismatch.
+        // Unconditional (not surface-gated) — harmless under lockfile kinds that
+        // carry no checksum (npm/yarn/bun locks), where stored and computed both
+        // resolve to `None`. Standalone aube leaves the default `false`.
+        c.enforce_package_extensions_checksum = true;
     });
     match surface {
         ConfigSurface::NubIdentity(dir) => {
@@ -2129,10 +2195,11 @@ fn nub_setting_defaults(
     // ejects them through #319's ancestor-closure, subsuming the old 14-entry
     // const (incl. the singleton-hazard adapters the closure now makes sound). So
     // this embedder default carries ONLY the #315 vite eject; empty otherwise
-    // (aube's `parse_string_list` drops the empty entry). A user's own
-    // `diskMaterializePackages` still wins — the
-    // embedder default is the lowest precedence tier — so the additive escape
-    // hatch is intact.
+    // (aube's `parse_string_list` drops the empty entry). nub exposes NO
+    // user-facing `diskMaterializePackages` knob (maintainer 2026-07-07): the
+    // detector is the sole eject mechanism, and nub's hook drops every user-source
+    // seed name (`phantom_closure::nub_internal_seed`), keeping only this internal
+    // vite entry. (Standalone aube installs no hook and still honors the knob.)
     //
     // Vite symlink-GVS compat (#315): eject the `vite` package project-local so
     // its dist can be patched with the backported fs.allow sniff (< 8.1) without
@@ -2151,10 +2218,23 @@ fn nub_setting_defaults(
         && vite_compat::enabled()
         && vite_compat::manifest_declares_vite(detected.map(|d| d.dir.as_path()).unwrap_or(cwd))
     {
-        "vite".to_string()
+        // Draw from the hook's allowlist so the embedder default and the seed the
+        // hook keeps ([`phantom_closure::nub_internal_seed`]) can't drift.
+        phantom_closure::NUB_INTERNAL_DISK_MATERIALIZE_SEED.join(",")
     } else {
         String::new()
     };
+    // The whole-install GVS-off list. `next`/`react-native` eject unconditionally
+    // (a resolver that canonicalizes node_modules by realpath — Turbopack, bare-RN
+    // Metro — can't reach the machine-global store at any version). `expo` is
+    // version-gated: it gained store-awareness only in SDK 56 (On-demand
+    // Filesystem), so a project declaring `expo` below the floor is ejected while
+    // 56+ keeps GVS. See [`expo_compat`].
+    let gvs_root = detected.map(|d| d.dir.as_path()).unwrap_or(cwd);
+    let mut gvs_off: Vec<&str> = vec!["next", "react-native"];
+    if expo_compat::expo_below_gvs_floor(gvs_root) {
+        gvs_off.push("expo");
+    }
     let store_dir = format!("node_modules/{PROJECT_VIRTUAL_STORE_LEAF}");
     let mut defaults = vec![
         (
@@ -2187,9 +2267,13 @@ fn nub_setting_defaults(
             // - `react-native` — bare RN's Metro (`@react-native/metro-config`)
             //   crawls by realpath and only sees the project root, so the global
             //   store is out of scope and even DECLARED deps (`@babel/runtime`)
-            //   report unresolved. Expo's `@expo/metro-config` is store-aware
-            //   (works either way; this only flips it project-local, harmless).
-            "next,react-native".to_string(),
+            //   report unresolved.
+            // - `expo` — the SAME break, but ONLY below SDK 56. Expo's Metro fork
+            //   became store-aware in SDK 56 (the On-demand Filesystem); pre-56
+            //   Expo uses the eager realpath crawl and breaks under GVS, so it is
+            //   ejected version-conditionally ([`expo_compat`]) rather than by a
+            //   flat name — 56+ keeps GVS.
+            gvs_off.join(","),
         ),
         ("diskMaterializePackages".to_string(), disk_materialize),
     ];
@@ -2272,15 +2356,48 @@ fn nub_lockfile_present(dir: &Path) -> bool {
         || dir.join(use_align::NUB_LEGACY_LOCKFILE).is_file()
 }
 
-/// Nub's XDG data root (`$XDG_DATA_HOME/nub` or `~/.local/share/nub`), the
-/// data-dir sibling of `nub_core::node::discovery::cache_dir`.
+/// Nub's XDG data root (`$XDG_DATA_HOME/nub`, `%LOCALAPPDATA%\nub` on Windows,
+/// else `~/.local/share/nub`), the data-dir sibling of
+/// `nub_core::node::discovery::cache_dir`.
+///
+/// The Windows `%LOCALAPPDATA%` branch mirrors the engine's own data-path
+/// resolvers (`aube_store::dirs::store_dir`, `aube_runtime` `data_dir`): without
+/// it the CAS `storeDir` default fell through to the Unix `.local/share` leaf on
+/// Windows (`%USERPROFILE%\.local\share\nub\store`), split from the cache tier at
+/// `%LOCALAPPDATA%\nub\pm` — #451. This feeds the `storeDir` embedder default and
+/// the phantom scanner's store path; both stay consistent because both call here.
 pub(crate) fn nub_data_dir() -> Option<PathBuf> {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs_next::home_dir().map(|h| h.join(".local/share")))?;
-    Some(base.join("nub"))
+    nub_data_dir_from(
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from),
+        dirs_next::home_dir(),
+        cfg!(windows),
+    )
+}
+
+/// Pure resolver for [`nub_data_dir`] — precedence: `$XDG_DATA_HOME/nub`; then,
+/// on Windows, `%LOCALAPPDATA%\nub`; then `<home>/.local/share/nub`.
+/// `local_app_data` is consulted only when `windows`, so the unix XDG
+/// `.local/share` convention is preserved everywhere else. Split out
+/// env-injected so the precedence is unit-testable off Windows (mirrors
+/// `nub_core::node::discovery::windows_cache_dir`).
+fn nub_data_dir_from(
+    xdg_data_home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    home: Option<PathBuf>,
+    windows: bool,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_data_home {
+        return Some(xdg.join("nub"));
+    }
+    if windows && let Some(local) = local_app_data {
+        return Some(local.join("nub"));
+    }
+    home.map(|h| h.join(".local/share").join("nub"))
 }
 
 /// Process-env snapshot for `InstallOptions::env_snapshot` — same content as
@@ -2711,6 +2828,38 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    // #451: the Windows data root must be %LOCALAPPDATA%\nub, never the Unix
+    // `.local/share` leaf — otherwise the CAS store splits from the cache tier.
+    #[test]
+    fn nub_data_dir_precedence() {
+        let xdg = PathBuf::from("/xdg-data");
+        let lad = PathBuf::from(r"C:\Users\u\AppData\Local");
+        let home = PathBuf::from("/home/u");
+        let call = |x, l, windows| nub_data_dir_from(x, l, Some(home.clone()), windows);
+
+        // XDG_DATA_HOME wins on every platform.
+        assert_eq!(
+            call(Some(xdg.clone()), Some(lad.clone()), true),
+            Some(xdg.join("nub"))
+        );
+        assert_eq!(call(Some(xdg.clone()), None, false), Some(xdg.join("nub")));
+
+        // Windows, no XDG → %LOCALAPPDATA%\nub, never `.local/share`.
+        assert_eq!(call(None, Some(lad.clone()), true), Some(lad.join("nub")));
+
+        // Unix, no XDG → <home>/.local/share/nub; LOCALAPPDATA ignored.
+        assert_eq!(
+            call(None, Some(lad.clone()), false),
+            Some(home.join(".local/share").join("nub"))
+        );
+
+        // Windows with neither XDG nor LOCALAPPDATA → the home fallback.
+        assert_eq!(
+            call(None, None, true),
+            Some(home.join(".local/share").join("nub"))
+        );
+    }
+
     #[test]
     fn pnpm_npmrc_key_policy_narrows_only_at_v11() {
         // pnpm reversed its `.npmrc` settings-reading at v11: ≤10 reads the
@@ -2831,6 +2980,56 @@ mod tests {
         assert_eq!(
             get(&fresh, "disableGlobalVirtualStoreForPackages"),
             Some("next,react-native"),
+        );
+    }
+
+    #[test]
+    fn expo_below_sdk_56_is_gvs_ejected_but_56_plus_keeps_gvs() {
+        // Expo's Metro fork became store-aware in SDK 56 (On-demand Filesystem),
+        // so `expo` ejects version-conditionally: below the floor joins the
+        // store-locality breakers, at/above it keeps GVS. A range whose major
+        // can't be floored pre-resolution ejects (safe direction).
+        let disable_list = |manifest: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("package.json"), manifest).unwrap();
+            let defaults =
+                nub_setting_defaults(None, false, dir.path(), VirtualStoreLocality::Default);
+            get(&defaults, "disableGlobalVirtualStoreForPackages")
+                .unwrap()
+                .to_string()
+        };
+
+        // Below the floor → ejected (dependencies and devDependencies both count).
+        assert_eq!(
+            disable_list(r#"{"name":"x","dependencies":{"expo":"~52.0.0"}}"#),
+            "next,react-native,expo",
+        );
+        assert_eq!(
+            disable_list(r#"{"name":"x","devDependencies":{"expo":"^51.0.0"}}"#),
+            "next,react-native,expo",
+        );
+        assert_eq!(
+            disable_list(r#"{"name":"x","optionalDependencies":{"expo":"50.0.0"}}"#),
+            "next,react-native,expo",
+        );
+        // Unfloorable range → eject-on-ambiguity.
+        assert_eq!(
+            disable_list(r#"{"name":"x","dependencies":{"expo":"*"}}"#),
+            "next,react-native,expo",
+        );
+        // At/above the floor → GVS stays on (expo absent from the list).
+        assert_eq!(
+            disable_list(r#"{"name":"x","dependencies":{"expo":"~56.0.0"}}"#),
+            "next,react-native",
+        );
+        assert_eq!(
+            disable_list(r#"{"name":"x","dependencies":{"expo":"^57.0.4"}}"#),
+            "next,react-native",
+        );
+        // Not an Expo project → unchanged.
+        assert_eq!(
+            disable_list(r#"{"name":"x","dependencies":{"react":"19.2.0"}}"#),
+            "next,react-native",
         );
     }
 

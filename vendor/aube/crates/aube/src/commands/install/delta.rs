@@ -248,7 +248,13 @@ pub fn compute_subtree_hashes_from_leaf(
             continue;
         };
         for (child_name, child_tail) in &pkg.dependencies {
-            let child_dep_path = dependency_dep_path(child_name, child_tail);
+            let Some(child_dep_path) =
+                aube_lockfile::resolve_dep_edge(child_name, child_tail, |k| {
+                    graph.packages.contains_key(k)
+                })
+            else {
+                continue;
+            };
             if let Some(&to) = scc_index.get(&child_dep_path)
                 && to != from
             {
@@ -330,7 +336,10 @@ fn tarjan_scc(graph: &LockfileGraph) -> Vec<Vec<String>> {
             pkg.dependencies
                 .iter()
                 .filter_map(|(child_name, child_tail)| {
-                    let child_dep_path = dependency_dep_path(child_name, child_tail);
+                    let child_dep_path =
+                        aube_lockfile::resolve_dep_edge(child_name, child_tail, |k| {
+                            graph.packages.contains_key(k)
+                        })?;
                     index_of.get(&child_dep_path).copied()
                 })
                 .collect()
@@ -383,10 +392,6 @@ fn tarjan_scc(graph: &LockfileGraph) -> Vec<Vec<String>> {
         }
     }
     out
-}
-
-fn dependency_dep_path(name: &str, tail: &str) -> String {
-    format!("{name}@{tail}")
 }
 
 fn dfs_post(start: usize, edges: &[BTreeSet<usize>], seen: &mut [bool], order: &mut Vec<usize>) {

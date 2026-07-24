@@ -3,6 +3,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
+// The registry client is https-only; without a TLS backend every request
+// would fail at runtime with an opaque scheme error. Fail at compile time
+// instead so embedders disabling default features re-enable `rustls`
+// (the only supported backend — see the TLS policy in CLAUDE.md).
+#[cfg(not(feature = "rustls"))]
+compile_error!("aube-registry requires the `rustls` feature");
+
 // Visitor helper macros — each tolerant deserializer below picks the
 // subset that matches its custom handlers. Splitting these granularly
 // is what lets `funding_url` keep its own `visit_seq` (array case)
@@ -157,6 +164,26 @@ pub mod supply_chain;
 // rather than defining its own copy. Re-exported for resolver callers
 // that already import this crate.
 pub use aube_manifest::BundledDependencies;
+
+/// The lowercased `host[:port]` key of a registry or tarball URL, or `None`
+/// when the string can't be parsed as a URL with a host. Userinfo
+/// (`user:pass@`) is dropped.
+///
+/// This is the ONE host-comparison key the resolver's tarball-URL persistence
+/// gate and the frozen-install verify-skip gate must share. They decide the
+/// same question at different phases — "does this package's tarball host match
+/// its config-derived registry host?" — and if they extracted the host
+/// differently (case, userinfo, port) a mixed-case named-registry host
+/// (`NPM.Work.net` vs `npm.work.net`) would make the writer persist the URL
+/// while the frozen side re-verified against the default registry and 404'd.
+pub fn registry_host_key(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
 
 /// Controls whether the registry client is allowed to hit the network.
 ///
@@ -737,6 +764,9 @@ pub enum Error {
     #[error("package not found: {0}")]
     #[diagnostic(code(ERR_AUBE_PACKAGE_NOT_FOUND))]
     NotFound(String),
+    #[error("access entity not found: {0}")]
+    #[diagnostic(code(ERR_AUBE_ACCESS_ENTITY_NOT_FOUND))]
+    AccessEntityNotFound(String),
     #[error("version not found: {0}@{1}")]
     #[diagnostic(code(ERR_AUBE_VERSION_NOT_FOUND))]
     VersionNotFound(String, String),

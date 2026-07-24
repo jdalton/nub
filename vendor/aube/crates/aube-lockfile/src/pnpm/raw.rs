@@ -229,7 +229,9 @@ pub(super) struct RawPnpmLockfile {
 /// The hash lands in the graph's `patched_dependency_hashes` map; the
 /// path map stays empty for pnpm lockfiles, because pnpm records no
 /// path in the current form and drift/linking derive the path from the
-/// manifest/workspace declaration instead.
+/// manifest/workspace declaration instead. Preserving the hash is what
+/// lets the writer retain `(patch_hash=…)` package identities on a pure
+/// lockfile conversion, where no patch file is on disk to re-hash.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(super) enum RawPatchedDependency {
@@ -237,16 +239,19 @@ pub(super) enum RawPatchedDependency {
     Object {
         #[serde(default)]
         path: Option<String>,
-        hash: String,
+        #[serde(default)]
+        hash: Option<String>,
     },
 }
 
 impl RawPatchedDependency {
-    /// `(optional path, hash)`. The bare-string form carries only a
-    /// hash; the legacy object form may also carry a path.
-    pub(super) fn into_path_and_hash(self) -> (Option<String>, String) {
+    /// `(optional path, optional hash)`. The bare-string form carries
+    /// only a hash; the legacy object form may also carry a path, and
+    /// tolerates a missing `hash` (a hand-written or third-party entry)
+    /// rather than failing the whole lockfile parse.
+    pub(super) fn into_path_and_hash(self) -> (Option<String>, Option<String>) {
         match self {
-            RawPatchedDependency::Hash(h) => (None, h),
+            RawPatchedDependency::Hash(h) => (None, Some(h)),
             RawPatchedDependency::Object { path, hash } => (path, hash),
         }
     }
@@ -288,7 +293,10 @@ pub(super) struct RawCatalogEntry {
 #[serde(rename_all = "camelCase")]
 pub(super) struct RawPackageInfo {
     pub(super) resolution: Option<Resolution>,
-    #[serde(default)]
+    // Legacy packages (e.g. cordova plugins) carry a nested `cordovaDependencies`
+    // map under `engines`, which pnpm preserves verbatim; keep string-valued
+    // engine entries and drop the nested non-string ones (engine-check-irrelevant).
+    #[serde(default, deserialize_with = "aube_manifest::engines_tolerant")]
     pub(super) engines: BTreeMap<String, String>,
     pub(super) peer_dependencies: Option<BTreeMap<String, String>>,
     pub(super) peer_dependencies_meta: Option<BTreeMap<String, RawPeerDepMeta>>,

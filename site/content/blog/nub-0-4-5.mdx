@@ -1,0 +1,26 @@
+---
+title: "Nub 0.4.5"
+description: Broader pnpm patch-key support, catalog and Homebrew-upgrade fixes, and a faster hoisted link pass.
+author: The Nub Team
+date: 2026-07-08
+---
+
+A patch release: wider `patchedDependencies` key support, two package-manager compatibility fixes, and a link-time speedup.
+
+## Patched dependencies
+
+pnpm's `patchedDependencies` accepts four key forms — exact (`foo@1.2.3`), range (`foo@>=1`), wildcard (`foo@*`), and bare name (`foo`) — where the last two patch every resolved version. Nub previously accepted only exact keys and errored on the rest. It now groups keys by package and resolves each version to the applicable patch using pnpm's priority (exact > single satisfying range > all). An all-exact project's install and lockfile bytes are unchanged. ([#376](https://github.com/nubjs/nub/issues/376))
+
+## Catalogs under nub identity
+
+`nub add --save-catalog` under nub identity now writes the entry to the neutral `workspaces.catalog` field the resolver reads, rather than a pnpm-named workspace file nub identity doesn't read. Previously the write left a dangling `catalog:` reference and failed the follow-up resolve; the target is now pre-flighted, so a catalog entry that can't land never mutates the dependent manifest. ([#369](https://github.com/nubjs/nub/issues/369))
+
+## Homebrew upgrade
+
+`nub upgrade` on the Homebrew channel now runs `brew update` before `brew upgrade`, so a stale tap checkout no longer reports the installed version as newest and misses a published release. ([#375](https://github.com/nubjs/nub/issues/375))
+
+## Performance
+
+The hoisted macOS link pass memoizes its per-package clonedir volume probe across the process, so it runs a handful of times per install instead of once per package. Install output is byte-identical. ([#390](https://github.com/nubjs/nub/pull/390))
+
+The [full release notes](https://github.com/nubjs/nub/releases/tag/v0.4.5) list every change in this release.

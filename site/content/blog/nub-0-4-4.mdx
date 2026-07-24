@@ -1,0 +1,24 @@
+---
+title: "Nub 0.4.4"
+description: NODE_ENV again selects .env files as a fallback, clamped to the canonical development, production, and test values for Next.js and Bun parity.
+author: The Nub Team
+date: 2026-07-08
+---
+
+A patch release that restores Next.js/Bun migration parity for `.env`-file mode selection.
+
+## NODE_ENV is a clamped fallback
+
+`APP_ENV` remains the primary, framework-neutral selector for which `.env.[mode]` files load. When `APP_ENV` is unset, `NODE_ENV` acts as a fallback — but only for the three canonical values `development`, `production`, and `test`, matching Next.js and Bun. Any other value is ignored for file selection; use `APP_ENV` for arbitrary modes.
+
+```sh
+APP_ENV=staging nub server.ts      # reads .env.staging*
+NODE_ENV=production nub server.ts  # APP_ENV unset → reads .env.production*
+NODE_ENV=staging nub server.ts     # not canonical → reads only .env, .env.local
+```
+
+This restores migration parity for projects that select env files via `NODE_ENV=production`/`development`/`test`, without reintroducing the footgun where an unrecognized `NODE_ENV` silently flips a framework into development mode. Nub still never sets `NODE_ENV`, and a `.env` file that assigns it still has that key ignored on load. ([#387](https://github.com/nubjs/nub/pull/387))
+
+The docs and OG cards also got updates.
+
+The [full release notes](https://github.com/nubjs/nub/releases/tag/v0.4.4) list every change in this release.

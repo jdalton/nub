@@ -75,6 +75,14 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub catalogs: BTreeMap<String, BTreeMap<String, String>>,
 
+    /// Registry aliases: `<alias>` → registry URL. A dep spec of the form
+    /// `<alias>:<range>` resolves the package from the aliased registry. Typed
+    /// (not left to `extra`) so the typo-guard test recognizes the key and the
+    /// discovery layer can read it directly. Only consulted when the embedder
+    /// enables named-registry routing (pnpm-compat mode).
+    #[serde(default)]
+    pub named_registries: BTreeMap<String, String>,
+
     // -- Node-Modules Settings --
     /// Linking strategy: "isolated" (default), "hoisted", or "pnp".
     #[serde(default)]
@@ -238,6 +246,18 @@ pub struct WorkspaceConfig {
     /// conflict (same precedence as `overrides`).
     #[serde(default, rename = "patchedDependencies")]
     pub patched_dependencies: BTreeMap<String, String>,
+
+    /// Downgrade a `patchedDependencies` key that matched no installed
+    /// package from a hard error to a warning. Lives here as well as in
+    /// the manifest because pnpm 10 accepts it in both (verified against
+    /// 10.15.1, including the deprecated `allowNonAppliedPatches`
+    /// spelling), and it belongs wherever `patchedDependencies` does.
+    #[serde(
+        default,
+        rename = "allowUnusedPatches",
+        alias = "allowNonAppliedPatches"
+    )]
+    pub allow_unused_patches: Option<bool>,
 
     /// os/cpu/libc widening set. pnpm v10 moved this alongside
     /// `overrides` — users generating a cross-platform lockfile on

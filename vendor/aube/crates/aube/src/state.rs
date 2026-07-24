@@ -78,6 +78,11 @@ pub struct InstallState {
     /// there for the freshness-check fast-path semantics.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub package_json_meta: BTreeMap<String, FileMeta>,
+    /// Content fingerprints for copied local directory dependencies, keyed by
+    /// their project-relative source path. `None` means the state predates
+    /// local-source freshness tracking and must miss the warm path once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_directory_hashes: Option<BTreeMap<String, LocalDirectoryFingerprint>>,
     pub aube_version: String,
     #[serde(default, rename = "prod")]
     pub section_filtered: bool,
@@ -153,6 +158,8 @@ struct FreshnessState {
     /// existing hash path, so older state files stay valid.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     package_json_meta: BTreeMap<String, FileMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_directory_hashes: Option<BTreeMap<String, LocalDirectoryFingerprint>>,
     #[serde(default, rename = "prod")]
     section_filtered: bool,
     #[serde(default)]
@@ -190,6 +197,12 @@ pub struct FileMeta {
     pub mtime_nanos: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalDirectoryFingerprint {
+    pub content_hash: String,
+    pub metadata_hash: String,
+}
+
 impl FileMeta {
     pub fn capture(path: &Path) -> Option<Self> {
         let meta = std::fs::metadata(path).ok()?;
@@ -218,6 +231,7 @@ impl From<&InstallState> for FreshnessState {
             member_lockfile_meta: state.member_lockfile_meta.clone(),
             package_json_hashes: state.package_json_hashes.clone(),
             package_json_meta: state.package_json_meta.clone(),
+            local_directory_hashes: state.local_directory_hashes.clone(),
             section_filtered: state.section_filtered,
             settings_hash: state.settings_hash.clone(),
             dep_build_policy_hash: state.dep_build_policy_hash.clone(),
@@ -313,7 +327,7 @@ fn check_needs_install_compute(
     // No state directory = never installed (or `rm -rf <modulesDir>` wiped it).
     let _diag_read =
         aube_util::diag::Span::new(aube_util::diag::Category::Frozen, "read_state_file");
-    let state = match read_or_migrate_fresh_state(&state_path) {
+    let mut state = match read_or_migrate_fresh_state(&state_path) {
         Some(s) => s,
         None => return Some("install state not found".into()),
     };
@@ -379,6 +393,22 @@ fn check_needs_install_compute(
     }
     drop(_diag_pjs);
 
+    // `package_jsons_stale` only revisits members recorded at the last
+    // install, so a member added *since* has no recorded manifest hash and
+    // is invisible to it. Under `sharedWorkspaceLockfile=false` the
+    // `member_lockfiles_stale` check above already busts on a new member,
+    // but the default shared layout records no per-member lockfile state,
+    // so nothing there re-enumerates the workspace — a newly-added member
+    // silently reports "up to date" (nubjs/nub#441). Fill that gap by
+    // re-enumerating current members whenever no per-member lockfile state
+    // was recorded (shared layout, and a per-project layout that had no
+    // members last install); the non-empty case is already covered above.
+    if state.member_lockfile_hashes.is_empty()
+        && let Some(reason) = new_workspace_member(project_dir, &state)
+    {
+        return Some(reason);
+    }
+
     if state.section_filtered {
         return Some(
             "previous install omitted dependency sections; auto-installing full graph".into(),
@@ -400,7 +430,7 @@ fn check_needs_install_compute(
             aube_util::diag::Span::new(aube_util::diag::Category::Frozen, "settings_hash");
         let current_settings_hash = hash_settings(project_dir, cli_flags);
         if current_settings_hash != state.settings_hash {
-            return Some(".npmrc or workspace config has changed".into());
+            return Some("install settings or the active Node version have changed".into());
         }
     }
 
@@ -414,6 +444,48 @@ fn check_needs_install_compute(
     // a spurious auto-install.
     if lockfile_missing {
         return Some("no lockfile found".into());
+    }
+
+    let Some(local_directory_hashes) = state.local_directory_hashes.as_mut() else {
+        return Some("local dependency fingerprints not recorded".to_string());
+    };
+    let mut refreshed_metadata = false;
+    for (rel, stored) in local_directory_hashes {
+        let path = project_dir.join(rel);
+        let current_metadata = match aube_store::directory_metadata_fingerprint(&path) {
+            Ok(current) if current == stored.metadata_hash => continue,
+            Ok(current) => current,
+            Err(err) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %err,
+                    "local dependency metadata fingerprint failed"
+                );
+                return Some(format!("local dependency {rel} is unreadable"));
+            }
+        };
+        match aube_store::directory_content_fingerprint(&path) {
+            Ok(current_hash) if current_hash == stored.content_hash => {
+                stored.metadata_hash = current_metadata;
+                refreshed_metadata = true;
+            }
+            Ok(_) => return Some(format!("local dependency {rel} has changed")),
+            Err(err) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %err,
+                    "local dependency content fingerprint failed"
+                );
+                return Some(format!("local dependency {rel} is unreadable"));
+            }
+        }
+    }
+    if refreshed_metadata && let Err(err) = write_fresh_state(&state_path, &state) {
+        tracing::debug!(
+            path = %fresh_state_file(&state_path).display(),
+            error = %err,
+            "refresh local dependency metadata state failed"
+        );
     }
     None
 }
@@ -553,6 +625,37 @@ fn member_lockfiles_stale(project_dir: &Path, state: &FreshnessState) -> Option<
     None
 }
 
+/// Detect a workspace member added since the last install. Complements
+/// [`package_jsons_stale`], which only revisits members it *recorded* (so it
+/// catches an edited or deleted member but never a newly-added one). Each
+/// current member is keyed exactly the way [`collect_package_json_hashes_from_manifests`]
+/// records it — the root-as-member (`packages: ['.']`) under `.`, every other
+/// member under `<rel>/package.json` — and a member whose key is absent from
+/// `package_json_hashes` is new. Returns `Some(reason)` on the first new
+/// member, `None` when every current member was already recorded.
+/// Non-workspace projects enumerate to nothing and no-op.
+fn new_workspace_member(project_dir: &Path, state: &FreshnessState) -> Option<String> {
+    let members = aube_workspace::find_workspace_packages(project_dir).unwrap_or_default();
+    for member_dir in &members {
+        let rel = relative_path_or_original(member_dir, project_dir);
+        // A workspace that lists its own root (`packages: ['.']`) yields an
+        // empty rel for the root member, recorded under "." — mirror that
+        // special-case so the root never reads as a spurious "new member"
+        // and churns the warm path on every install.
+        let is_root = rel.is_empty() || rel == ".";
+        let manifest_key = if is_root {
+            ".".to_string()
+        } else {
+            relative_path_or_original(&member_dir.join("package.json"), project_dir)
+        };
+        if !state.package_json_hashes.contains_key(&manifest_key) {
+            let dir_key = if is_root { ".".to_string() } else { rel };
+            return Some(format!("{dir_key} is a new workspace member"));
+        }
+    }
+    None
+}
+
 /// Write state file after a successful install. `section_filtered` should be
 /// `true` when the install omitted dependency sections, so that
 /// `check_needs_install` knows to trigger a full re-install before commands
@@ -645,6 +748,7 @@ pub fn write_state(project_dir: &Path, input: WriteStateInput<'_>) -> Result<(),
     // Fingerprint each member's lockfile so the warm path has something
     // to verify; empty for the default shared layout.
     let (member_lockfile_hashes, member_lockfile_meta) = collect_member_lockfile_state(project_dir);
+    let local_directory_hashes = collect_local_directory_hashes(project_dir, layout.graph)?;
 
     let state = InstallState {
         lockfile_hash,
@@ -653,6 +757,7 @@ pub fn write_state(project_dir: &Path, input: WriteStateInput<'_>) -> Result<(),
         member_lockfile_meta,
         package_json_hashes,
         package_json_meta,
+        local_directory_hashes: Some(local_directory_hashes),
         aube_version: env!("CARGO_PKG_VERSION").to_string(),
         section_filtered,
         settings_hash,
@@ -671,6 +776,35 @@ pub fn write_state(project_dir: &Path, input: WriteStateInput<'_>) -> Result<(),
     write_fresh_state(&state_path, &fresh_state)?;
 
     Ok(())
+}
+
+fn collect_local_directory_hashes(
+    project_dir: &Path,
+    graph: &aube_lockfile::LockfileGraph,
+) -> Result<BTreeMap<String, LocalDirectoryFingerprint>, std::io::Error> {
+    let mut hashes = BTreeMap::new();
+    for pkg in graph.packages.values() {
+        let rel = match pkg.local_source.as_ref() {
+            Some(aube_lockfile::LocalSource::Directory(rel))
+            | Some(aube_lockfile::LocalSource::Portal(rel)) => rel,
+            _ => continue,
+        };
+        let key = rel.to_string_lossy().replace('\\', "/");
+        if hashes.contains_key(&key) {
+            continue;
+        }
+        let (content_hash, metadata_hash) =
+            aube_store::directory_fingerprints(&project_dir.join(rel))
+                .map_err(std::io::Error::other)?;
+        hashes.insert(
+            key,
+            LocalDirectoryFingerprint {
+                content_hash,
+                metadata_hash,
+            },
+        );
+    }
+    Ok(hashes)
 }
 
 fn snapshot_active_lockfile(
@@ -1031,7 +1165,22 @@ impl InstallLayoutState {
             };
             let entries = deps
                 .iter()
-                .map(|dep| relative_path_or_original(&modules_base.join(&dep.name), project_dir))
+                .map(|dep| {
+                    // In hoisted mode a member's direct dep may have hoisted
+                    // out of `<importer>/node_modules/<name>` to the shared
+                    // workspace root (or nested under a different member), so
+                    // verify it at its ACTUAL placement — otherwise the
+                    // warm-path check reports it permanently "missing" and
+                    // re-installs on every run. `placements` is `Some` only
+                    // for hoisted; a `link:` sibling created by the post-pass
+                    // (absent from `placements`) and every isolated-mode dep
+                    // fall back to the `<importer>/node_modules/<name>` path.
+                    let path = placements
+                        .and_then(|p| p.package_dir(&dep.dep_path))
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| modules_base.join(&dep.name));
+                    relative_path_or_original(&path, project_dir)
+                })
                 .collect();
             direct_entries.insert(importer.clone(), entries);
         }
@@ -1264,6 +1413,17 @@ fn hash_settings(project_dir: &Path, cli_flags: &[(String, String)]) -> String {
     hasher.update(b"hoisting_limits=");
     hasher.update(format!("{hoisting_limits:?}").as_bytes());
     hasher.update(b"\0");
+    // Hoisted-layout algorithm version. A multi-importer workspace under
+    // `nodeLinker=hoisted` now plans ONE shared tree (hoist to the
+    // workspace root) instead of a full per-importer closure. The graph
+    // hash is otherwise identical across the change, so without this a
+    // tree materialized by the old per-importer algorithm would be treated
+    // as current and never relinked. Bump on any future hoisted-layout
+    // change. Gated on the hoisted linker so isolated installs are
+    // unaffected.
+    if matches!(node_linker, aube_settings::resolved::NodeLinker::Hoisted) {
+        hasher.update(b"hoisted_layout_algo=2\0");
+    }
     let dedupe_direct_deps = aube_settings::resolved::dedupe_direct_deps(&ctx);
     hasher.update(format!("dedupe_direct_deps={dedupe_direct_deps}\0").as_bytes());
     let symlink = aube_settings::resolved::symlink(&ctx);
@@ -1288,6 +1448,31 @@ fn hash_settings(project_dir: &Path, cli_flags: &[(String, String)]) -> String {
         hasher.update(b"\x1f");
     }
     hasher.update(b"\0");
+    // The Node engine builds run against. Without it a Node major switch leaves
+    // this hash unchanged, the install reports itself current, and a native
+    // addon compiled for the previous ABI is never revisited — the delta filter
+    // and the side-effects cache downstream never get the chance.
+    //
+    // Gated on the embedder owning Node provisioning, because only then is the
+    // value STABLE ACROSS THIS HASH'S TWO CALL SITES. The freshness check runs
+    // before `runtime::ensure` populates `runtime::current()`, the state write
+    // runs after; under runtime switching those observe different versions, so
+    // folding a resolver-derived value would hash differently at check time and
+    // write time and never converge — a permanent warm-path miss. An embedder
+    // that provisions Node publishes its resolved version into the engine
+    // context before any install code runs, so both sites read one value.
+    // Standalone aube keeps its byte-for-byte hash; its own delta gate
+    // (`dep_build_policy_hash`) is engine-aware and computed after `ensure`,
+    // where the resolver has settled.
+    if !aube_util::embedder().runtime_switching {
+        let engine = crate::engines::build_node_version()
+            .map_or_else(aube_lockfile::graph_hash::platform_name, |v| {
+                aube_lockfile::graph_hash::engine_name_default(&v).0
+            });
+        hasher.update(b"engine=");
+        hasher.update(engine.as_bytes());
+        hasher.update(b"\0");
+    }
     // Embedder-supplied extra fingerprint: an install-shape input the host
     // controls outside aube's resolved settings (nub's phantom-eject flag,
     // which changes which packages materialize but rides no setting). `None`
@@ -1449,8 +1634,9 @@ mod tests {
     use super::{
         InstallLayoutMode, InstallLayoutState, InstallState, InstalledPackageState,
         collect_package_json_hashes_from_manifests, empty_blake3_hash, fresh_state_file, hash_file,
-        hash_settings, install_state_file, member_lockfiles_stale, read_or_migrate_fresh_state,
-        relative_path_or_original, remove_state, verify_install_layout,
+        hash_settings, install_state_file, member_lockfiles_stale, new_workspace_member,
+        read_or_migrate_fresh_state, relative_path_or_original, remove_state,
+        verify_install_layout,
     };
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -1476,6 +1662,7 @@ mod tests {
             member_lockfile_meta: BTreeMap::new(),
             package_json_hashes: BTreeMap::new(),
             package_json_meta: BTreeMap::new(),
+            local_directory_hashes: Some(BTreeMap::new()),
             aube_version: String::new(),
             section_filtered: false,
             settings_hash: String::new(),
@@ -1619,6 +1806,79 @@ mod tests {
     }
 
     #[test]
+    fn from_graph_tracks_hoisted_member_dep_at_its_shared_root_location() {
+        // Regression guard (issue #484 follow-up): under nodeLinker=hoisted a
+        // member's direct dep hoists to the shared workspace-root
+        // node_modules, so its warm-path entry must point THERE, not at the
+        // (now empty) <member>/node_modules/<dep>. Tracking the assumed
+        // member path would make verify_install_layout report it missing on
+        // every warm install and re-link forever.
+        let project_dir = temp_project_dir("layout-hoisted-shared");
+        let root_nm = project_dir.join("node_modules");
+        std::fs::create_dir_all(root_nm.join("react")).unwrap();
+        std::fs::write(
+            root_nm.join("react/package.json"),
+            "{\"name\":\"react\",\"version\":\"19.2.7\"}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project_dir.join("packages/app/node_modules")).unwrap();
+
+        let dep = |name: &str, dep_path: &str| aube_lockfile::DirectDep {
+            name: name.to_string(),
+            dep_path: dep_path.to_string(),
+            dep_type: aube_lockfile::DepType::Production,
+            specifier: None,
+        };
+        let mut importers = BTreeMap::new();
+        importers.insert(".".to_string(), vec![]);
+        importers.insert(
+            "packages/app".to_string(),
+            vec![dep("react", "react@19.2.7")],
+        );
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            "react@19.2.7".to_string(),
+            aube_lockfile::LockedPackage {
+                name: "react".to_string(),
+                version: "19.2.7".to_string(),
+                dep_path: "react@19.2.7".to_string(),
+                ..Default::default()
+            },
+        );
+        let graph = aube_lockfile::LockfileGraph {
+            importers,
+            packages,
+            ..Default::default()
+        };
+
+        let placements = aube_linker::HoistedPlacements::from_graph(
+            &project_dir,
+            &graph,
+            "node_modules",
+            aube_linker::HoistingLimits::None,
+        )
+        .unwrap();
+
+        let layout = InstallLayoutState::from_graph(
+            &project_dir,
+            &graph,
+            aube_linker::NodeLinker::Hoisted,
+            "node_modules",
+            &root_nm.join(".aube"),
+            120,
+            Some(&placements),
+        );
+
+        // The member's react is tracked at the SHARED ROOT, where it hoisted.
+        assert_eq!(
+            layout.direct_entries.get("packages/app"),
+            Some(&vec!["node_modules/react".to_string()])
+        );
+        // And the warm-path check passes: the root react dir exists.
+        assert!(verify_install_layout(&project_dir, Some(&layout)).is_none());
+    }
+
+    #[test]
     fn collect_package_json_hashes_from_manifests_uses_file_paths_for_workspaces() {
         let project_dir = temp_project_dir("manifest-hash-keys");
         let root_pkg = project_dir.join("package.json");
@@ -1657,6 +1917,7 @@ mod tests {
             member_lockfile_meta: BTreeMap::new(),
             package_json_hashes: BTreeMap::from([(".".to_string(), "blake3:pkg".to_string())]),
             package_json_meta: BTreeMap::new(),
+            local_directory_hashes: Some(BTreeMap::new()),
             aube_version: env!("CARGO_PKG_VERSION").to_string(),
             section_filtered: false,
             settings_hash: "blake3:settings".to_string(),
@@ -1713,6 +1974,7 @@ mod tests {
             member_lockfile_meta: BTreeMap::new(),
             package_json_hashes: BTreeMap::new(),
             package_json_meta: BTreeMap::new(),
+            local_directory_hashes: Some(BTreeMap::new()),
             aube_version: env!("CARGO_PKG_VERSION").to_string(),
             section_filtered: false,
             settings_hash: String::new(),
@@ -1945,6 +2207,7 @@ mod tests {
             member_lockfile_meta: BTreeMap::new(),
             package_json_hashes: pjh,
             package_json_meta: BTreeMap::new(),
+            local_directory_hashes: Some(BTreeMap::new()),
             aube_version: env!("CARGO_PKG_VERSION").to_string(),
             section_filtered: false,
             settings_hash: String::new(),
@@ -2010,6 +2273,7 @@ mod tests {
             member_lockfile_meta: BTreeMap::new(),
             package_json_hashes: BTreeMap::new(),
             package_json_meta: BTreeMap::new(),
+            local_directory_hashes: Some(BTreeMap::new()),
             section_filtered: false,
             settings_hash: String::new(),
             dep_build_policy_hash: String::new(),
@@ -2045,6 +2309,114 @@ mod tests {
             member_lockfiles_stale(&dir, &state),
             Some("packages/b was removed from the workspace".to_string())
         );
+    }
+
+    #[test]
+    fn new_workspace_member_busts_warm_path_on_shared_layout() {
+        // The default `sharedWorkspaceLockfile=true` layout records no
+        // per-member lockfile state, so `member_lockfiles_stale` never runs
+        // and a member added after the last install is otherwise invisible
+        // to the warm path (nubjs/nub#441). `new_workspace_member` fills the
+        // gap by re-enumerating current members against the recorded manifest
+        // hashes — keyed by the member's `package.json` path, matching
+        // `collect_package_json_hashes_from_manifests`.
+        let dir = temp_project_dir("new-workspace-member");
+        std::fs::write(dir.join("pnpm-workspace.yaml"), "packages:\n  - 'apps/*'\n").unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"root","private":true}"#,
+        )
+        .unwrap();
+        let write_member = |name: &str| {
+            let d = dir.join("apps").join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("package.json"), format!("{{\"name\":\"{name}\"}}")).unwrap();
+        };
+        write_member("server");
+
+        // State from the last install: only the root and `apps/server` are
+        // recorded, keyed by their package.json paths. No member lockfile
+        // state (shared layout).
+        let mut package_json_hashes = BTreeMap::new();
+        package_json_hashes.insert(".".to_string(), hash_file(&dir.join("package.json")));
+        package_json_hashes.insert(
+            "apps/server/package.json".to_string(),
+            hash_file(&dir.join("apps/server/package.json")),
+        );
+        let state = super::FreshnessState {
+            lockfile_hash: String::new(),
+            lockfile_snapshot_name: None,
+            member_lockfile_hashes: BTreeMap::new(),
+            member_lockfile_meta: BTreeMap::new(),
+            package_json_hashes,
+            package_json_meta: BTreeMap::new(),
+            local_directory_hashes: Some(BTreeMap::new()),
+            section_filtered: false,
+            settings_hash: String::new(),
+            dep_build_policy_hash: String::new(),
+            package_json_shape_digests: BTreeMap::new(),
+            layout: None,
+            unreviewed_builds: Vec::new(),
+        };
+
+        // Every current member was recorded → fresh.
+        assert_eq!(new_workspace_member(&dir, &state), None);
+
+        // Adding `apps/web` after the last install busts the warm path.
+        write_member("web");
+        assert_eq!(
+            new_workspace_member(&dir, &state),
+            Some("apps/web is a new workspace member".to_string())
+        );
+    }
+
+    #[test]
+    fn new_workspace_member_root_as_member_does_not_churn() {
+        // A workspace that lists its own root (`packages: ['.']`, the pnpm
+        // pattern where the root is itself a package members depend on) must
+        // not read the root as a spurious "new member": the root is recorded
+        // under "." but enumerates with an empty rel, so a naive
+        // `<rel>/package.json` key would never match and bust the warm path on
+        // every install.
+        let dir = temp_project_dir("new-member-root-as-member");
+        std::fs::write(
+            dir.join("pnpm-workspace.yaml"),
+            "packages:\n  - '.'\n  - 'apps/*'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"root","private":true}"#,
+        )
+        .unwrap();
+        let app = dir.join("apps/server");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"name":"server"}"#).unwrap();
+
+        let mut package_json_hashes = BTreeMap::new();
+        package_json_hashes.insert(".".to_string(), hash_file(&dir.join("package.json")));
+        package_json_hashes.insert(
+            "apps/server/package.json".to_string(),
+            hash_file(&app.join("package.json")),
+        );
+        let state = super::FreshnessState {
+            lockfile_hash: String::new(),
+            lockfile_snapshot_name: None,
+            member_lockfile_hashes: BTreeMap::new(),
+            member_lockfile_meta: BTreeMap::new(),
+            package_json_hashes,
+            package_json_meta: BTreeMap::new(),
+            local_directory_hashes: Some(BTreeMap::new()),
+            section_filtered: false,
+            settings_hash: String::new(),
+            dep_build_policy_hash: String::new(),
+            package_json_shape_digests: BTreeMap::new(),
+            layout: None,
+            unreviewed_builds: Vec::new(),
+        };
+
+        // Root + apps/server both recorded → fresh (no churn on the root).
+        assert_eq!(new_workspace_member(&dir, &state), None);
     }
 
     #[test]

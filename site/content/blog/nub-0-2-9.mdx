@@ -12,11 +12,9 @@ This release changes the default `node_modules` layout to isolated for npm, Yarn
 
 ## The default layout
 
-Every incumbent now defaults to isolated — npm, Yarn, and Bun join pnpm and Nub-identity projects. Isolated links each package into a global virtual store and symlinks the declared dependency graph into `node_modules`, so only declared dependencies are reachable. A project that relies on phantom (undeclared) dependencies opts into the flat layout with `node-linker=hoisted`. When an undeclared package fails to resolve at runtime, the error names it and points at this opt-out. ([#238](https://github.com/nubjs/nub/pull/238))
+Every incumbent now defaults to isolated — npm, Yarn, and Bun join pnpm and Nub-identity projects. Isolated links each package into a global virtual store and symlinks the declared dependency graph into `node_modules`, so only declared dependencies are reachable. ([#238](https://github.com/nubjs/nub/pull/238))
 
 `next`, `nuxt`, and `parcel` default to strict isolated with the global virtual store auto-disabled, matching how those toolchains expect `node_modules` to be laid out.
-
-**pnpm compatibility note.** Nub now sets `hoist=false` for pnpm incumbents too, so a pnpm project that depended on packages reachable only through pnpm's hidden hoist tree may hit a phantom-dependency miss it did not see under pnpm. The `.npmrc` opt-out and the runtime hint mitigate it; the change favors correct, declared-only resolution by default.
 
 ## Install performance
 

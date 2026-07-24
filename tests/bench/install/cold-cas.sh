@@ -175,13 +175,13 @@ echo ""
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 # Copy a fixture to a fresh workdir, stripping foreign lockfiles so nub installs
-# from its own pnpm-lock family without a competing-lockfile refusal.
+# from its own NATIVE nub.lock without a competing-lockfile refusal.
 setup_workdir() {
   local fixture="$1" workdir="$2"
   rm -rf "$workdir"
   cp -r "$FIXTURE_DIR/$fixture" "$workdir"
   rm -rf "$workdir/node_modules" 2>/dev/null || true
-  rm -f "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true
+  rm -f "$workdir/pnpm-lock.yaml" "$workdir/pnpm-workspace.yaml" "$workdir/bun.lock" "$workdir/bun.lockb" "$workdir/package-lock.json" 2>/dev/null || true
 }
 
 # Pre-populate the hermetic Verdaccio storage with THIS fixture's own tarballs.

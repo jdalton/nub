@@ -37,8 +37,8 @@ impl LockfileGraph {
     /// `"lodash": "catalog:"` override reads as stale against a
     /// lockfile that recorded the resolved `"lodash": "4.17.21"`.
     ///
-    /// Lockfile formats that don't record specifiers (npm, yarn, bun) always
-    /// return `Fresh` since we have no way to detect drift without re-resolving.
+    /// Importers that don't record specifiers return `Fresh` since we have no
+    /// way to detect manifest drift without re-resolving.
     ///
     /// [`check_drift_workspace`]: Self::check_drift_workspace
     pub fn check_drift(
@@ -445,6 +445,35 @@ impl LockfileGraph {
         DriftStatus::Fresh
     }
 
+    /// Compare the lockfile's recorded `packageExtensionsChecksum` against the
+    /// project's freshly-computed effective checksum. A mismatch means the
+    /// packageExtensions config changed since the lockfile was written — the
+    /// resolved graph is stale, since an extension adds/relaxes deps and can
+    /// alter resolution. Mirrors pnpm's `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`
+    /// `packageExtensionsChecksum` rule.
+    ///
+    /// `effective_checksum` is the caller-computed hash of the effective
+    /// packageExtensions (`None` when there are none). A stale
+    /// checksum carried over from a renamed pnpm-lock.yaml is validated here,
+    /// not trusted — a divergence re-resolves (or frozen-fails) and the write
+    /// path restamps the current value.
+    ///
+    /// Meaningful only for embedders that STAMP the checksum on every lockfile
+    /// kind they write (so the check reaches a fixpoint); the caller gates the
+    /// invocation on that embedder posture
+    /// (`EngineContext::enforce_package_extensions_checksum`), so standalone
+    /// aube — which stamps only pnpm-lock.yaml and never enforces — never
+    /// reaches it.
+    pub fn check_package_extensions_drift(&self, effective_checksum: Option<&str>) -> DriftStatus {
+        if self.package_extensions_checksum.as_deref() == effective_checksum {
+            DriftStatus::Fresh
+        } else {
+            DriftStatus::Stale {
+                reason: "packageExtensions changed since the lockfile was written".to_string(),
+            }
+        }
+    }
+
     /// Compare a single importer's `DirectDep` list against the corresponding
     /// `package.json`. Used by both [`check_drift`] and [`check_drift_workspace`].
     ///
@@ -483,8 +512,19 @@ impl LockfileGraph {
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
 
-        // Skip the check entirely if no DirectDep has a specifier (non-pnpm format).
-        if importer_deps.iter().all(|d| d.specifier.is_none()) {
+        // Skip the check entirely if the importer's recorded deps carry no
+        // specifier (a non-pnpm lockfile format that doesn't record them).
+        // Guard on the importer actually being present in the lockfile: a
+        // brand-new workspace member absent from it has an empty
+        // `importer_deps`, for which `all(specifier.is_none())` is vacuously
+        // true — skipping here would wrongly report the new member Fresh and
+        // its declared deps would never resolve (nubjs/nub#441). Falling
+        // through instead makes each manifest dep read as added against the
+        // empty locked specs (Stale), while a depless new member still reads
+        // Fresh (nothing to add — matches a `workspace:*` link with no deps).
+        if self.importers.contains_key(importer_path)
+            && importer_deps.iter().all(|d| d.specifier.is_none())
+        {
             return DriftStatus::Fresh;
         }
         let lockfile_specs: BTreeMap<&str, &str> = importer_deps
@@ -1054,6 +1094,40 @@ mod drift_tests {
     }
 
     #[test]
+    fn package_extensions_drift_fires_on_checksum_mismatch() {
+        let mut graph = make_graph(&[("lodash", "^4.17.0", "lodash@4.17.21")]);
+        graph.package_extensions_checksum = Some("sha256-abc".to_string());
+
+        // Match → Fresh; both-absent → Fresh; any divergence → Stale.
+        assert_eq!(
+            graph.check_package_extensions_drift(Some("sha256-abc")),
+            DriftStatus::Fresh
+        );
+        assert!(matches!(
+            graph.check_package_extensions_drift(Some("sha256-xyz")),
+            DriftStatus::Stale { .. }
+        ));
+        // Extensions removed from the project (effective None) drifts a
+        // lockfile that still records a checksum.
+        assert!(matches!(
+            graph.check_package_extensions_drift(None),
+            DriftStatus::Stale { .. }
+        ));
+
+        // No checksum stored (a lockfile written before extensions existed):
+        // absent-vs-absent is Fresh, absent-vs-present drifts.
+        graph.package_extensions_checksum = None;
+        assert_eq!(
+            graph.check_package_extensions_drift(None),
+            DriftStatus::Fresh
+        );
+        assert!(matches!(
+            graph.check_package_extensions_drift(Some("sha256-abc")),
+            DriftStatus::Stale { .. }
+        ));
+    }
+
+    #[test]
     fn stale_when_specifier_changes() {
         let manifest = make_manifest(&[("lodash", "^4.18.0")]);
         let graph = make_graph(&[("lodash", "^4.17.0", "lodash@4.17.21")]);
@@ -1387,8 +1461,8 @@ mod drift_tests {
 
     #[test]
     fn fresh_when_no_specifiers_recorded() {
-        // Non-pnpm formats (npm/yarn/bun) don't store specifiers, so we can't
-        // detect drift — we treat them as fresh and let the resolver decide.
+        // Some lockfile importers don't store specifiers, so we can't detect
+        // drift — we treat them as fresh and let the resolver decide.
         let manifest = make_manifest(&[("lodash", "^4.17.0")]);
         let graph = LockfileGraph {
             importers: {
@@ -2364,6 +2438,67 @@ mod drift_tests {
         assert_eq!(
             graph.check_drift_workspace(
                 &workspace_manifests,
+                &BTreeMap::new(),
+                &[],
+                &BTreeMap::new(),
+                true,
+            ),
+            DriftStatus::Fresh
+        );
+    }
+
+    #[test]
+    fn workspace_drift_stale_when_member_added_with_deps_but_absent_from_lockfile() {
+        // A newly-added workspace member with deps (present in the manifests,
+        // absent from the lockfile importers) must invalidate the lockfile so
+        // its deps get resolved — the `Prefer`-mode counterpart to the
+        // warm-path new-member check (nubjs/nub#441). The per-importer loop's
+        // `all(specifier.is_none())` early-return is vacuously true for the
+        // empty lockfile entry, so without the presence guard the member reads
+        // Fresh and its deps silently never resolve. A depless new member,
+        // however, legitimately has no importer entry and stays Fresh (see
+        // `workspace_drift_allows_root_links_for_workspace_packages`).
+        let root_dep = DirectDep {
+            name: "lodash".into(),
+            dep_path: "lodash@4.17.21".into(),
+            dep_type: DepType::Production,
+            specifier: Some("^4.17.0".into()),
+        };
+        let mut importers = BTreeMap::new();
+        importers.insert(".".to_string(), vec![root_dep]);
+        let graph = LockfileGraph {
+            importers,
+            packages: BTreeMap::new(),
+            ..Default::default()
+        };
+        let root = (".".to_string(), make_manifest(&[("lodash", "^4.17.0")]));
+
+        // New member WITH deps → stale (its react dep can't be satisfied by a
+        // non-existent importer entry).
+        assert_eq!(
+            graph.check_drift_workspace(
+                &[
+                    root.clone(),
+                    (
+                        "packages/web".to_string(),
+                        make_manifest(&[("react", "^19.0.0")]),
+                    ),
+                ],
+                &BTreeMap::new(),
+                &[],
+                &BTreeMap::new(),
+                true,
+            ),
+            DriftStatus::Stale {
+                reason: "packages/web: manifest adds react@^19.0.0".to_string()
+            }
+        );
+
+        // New member with NO deps → fresh (nothing to install; matches the
+        // depless `workspace:*` link invariant).
+        assert_eq!(
+            graph.check_drift_workspace(
+                &[root, ("packages/web".to_string(), make_manifest(&[]))],
                 &BTreeMap::new(),
                 &[],
                 &BTreeMap::new(),

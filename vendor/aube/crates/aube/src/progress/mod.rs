@@ -36,6 +36,9 @@ mod render;
 
 pub(crate) use render::format_bytes;
 
+use crate::commands::install::{
+    InstallEvent, InstallOutputMode, InstallPhase, InstallProgressSnapshot, InstallReporter,
+};
 use ci::{CiState, format_duration};
 use clx::progress::{
     ProgressJob, ProgressJobBuilder, ProgressJobDoneBehavior, ProgressOutput, ProgressStatus,
@@ -138,6 +141,11 @@ const TTY_PKG_MAX_CHARS: usize = 32;
 fn clamp_reused_to(reused: &AtomicUsize, downloaded: &AtomicUsize, total: usize) {
     let dl = downloaded.load(Ordering::Relaxed);
     let cap = total.saturating_sub(dl);
+    // `fetch_update` is renamed to `try_update` in Rust 1.99, but that method
+    // is only stable since 1.95 and our MSRV is 1.93 — switch once the MSRV
+    // clears 1.95. The deprecation is nightly-only for now; allow it so a
+    // nightly `clippy -D warnings` stays green.
+    #[allow(deprecated)]
     let _ = reused.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
         (cur > cap).then_some(cap)
     });
@@ -301,14 +309,60 @@ enum Mode {
         alive: Arc<AtomicUsize>,
     },
     Ci(Arc<CiState>),
+    Events(Arc<EventState>),
+}
+
+struct EventState {
+    reporter: Arc<dyn InstallReporter>,
+    phase: AtomicUsize,
+    resolved: AtomicUsize,
+    total: AtomicUsize,
+    reused: AtomicUsize,
+    downloaded: AtomicUsize,
+    downloaded_bytes: AtomicU64,
+    estimated_bytes: AtomicU64,
+    /// The *same* `Arc` the linker bumps per file — handed over by
+    /// `InstallProgress::link_progress_counter` — so a snapshot reads the
+    /// live count instead of a private zero. Events mode runs no ticker of
+    /// its own (unlike the TTY and CI renderers), so the value reaches the
+    /// host on whatever snapshot the install emits next.
+    files_linked: Arc<AtomicUsize>,
+}
+
+impl EventState {
+    fn phase(&self) -> Option<InstallPhase> {
+        match self.phase.load(Ordering::Relaxed) {
+            1 => Some(InstallPhase::Resolving),
+            2 => Some(InstallPhase::Fetching),
+            3 => Some(InstallPhase::Linking),
+            4 => Some(InstallPhase::Complete),
+            _ => None,
+        }
+    }
+
+    fn report_progress(&self) {
+        self.reporter
+            .report(InstallEvent::Progress(InstallProgressSnapshot {
+                phase: self.phase(),
+                resolved: self.resolved.load(Ordering::Relaxed),
+                total: self.total.load(Ordering::Relaxed),
+                reused: self.reused.load(Ordering::Relaxed),
+                downloaded: self.downloaded.load(Ordering::Relaxed),
+                downloaded_bytes: self.downloaded_bytes.load(Ordering::Relaxed),
+                estimated_bytes: self.estimated_bytes.load(Ordering::Relaxed),
+                files_linked: self.files_linked.load(Ordering::Relaxed),
+            }));
+    }
 }
 
 impl Clone for InstallProgress {
-    /// Both modes track their own "alive clones" refcount instead of relying on
-    /// `Arc::strong_count`: CI mode's heartbeat thread owns an `Arc<CiState>`,
-    /// and clx's global `JOBS` registry owns a strong clone of the TTY `root`,
-    /// for the entire run — either would pin `strong_count ≥ 2` and defeat the
-    /// `== 1` shutdown check in `Drop`.
+    /// Both rendering modes track their own "alive clones" refcount instead of
+    /// relying on `Arc::strong_count`: CI mode's heartbeat thread owns an
+    /// `Arc<CiState>`, and clx's global `JOBS` registry owns a strong clone of
+    /// the TTY `root`, for the entire run — either would pin `strong_count ≥ 2`
+    /// and defeat the `== 1` shutdown check in `Drop`. Events mode owns no
+    /// renderer to tear down (its `Drop` arm is a no-op; the embedder's reporter
+    /// owns any display), so there is nothing for a refcount to gate.
     fn clone(&self) -> Self {
         match &self.mode {
             Mode::Ci(s) => {
@@ -317,6 +371,7 @@ impl Clone for InstallProgress {
             Mode::Tty { alive, .. } => {
                 alive.fetch_add(1, Ordering::Relaxed);
             }
+            Mode::Events(_) => {}
         }
         Self {
             mode: self.mode.clone(),
@@ -331,6 +386,35 @@ impl InstallProgress {
     /// disabled (clx text mode — i.e. `--silent`, `-v`, or a line-oriented
     /// reporter that owns its own output).
     pub fn try_new() -> Option<Self> {
+        let control = crate::commands::install::control::current();
+        match control.output_mode() {
+            InstallOutputMode::Events => {
+                let reporter = control.reporter()?;
+                // One counter, two holders — same handoff as `new_ci`: the
+                // linker gets this `Arc` through `link_progress_counter()` and
+                // `EventState` reads it when building a snapshot. Constructing
+                // a second atomic here would leave the reported count pinned
+                // at zero.
+                let files_linked = Arc::new(AtomicUsize::new(0));
+                return Some(Self {
+                    mode: Mode::Events(Arc::new(EventState {
+                        reporter,
+                        phase: AtomicUsize::new(0),
+                        resolved: AtomicUsize::new(0),
+                        total: AtomicUsize::new(0),
+                        reused: AtomicUsize::new(0),
+                        downloaded: AtomicUsize::new(0),
+                        downloaded_bytes: AtomicU64::new(0),
+                        estimated_bytes: AtomicU64::new(0),
+                        files_linked: files_linked.clone(),
+                    })),
+                    unpacked_sizes: Arc::new(Mutex::new(HashMap::new())),
+                    files_linked,
+                });
+            }
+            InstallOutputMode::Silent => return None,
+            InstallOutputMode::Human => {}
+        }
         if clx::progress::output() == ProgressOutput::Text {
             return None;
         }
@@ -507,6 +591,10 @@ impl InstallProgress {
             Mode::Ci(s) => {
                 s.target_total.fetch_max(n, Ordering::Relaxed);
             }
+            Mode::Events(s) => {
+                s.total.fetch_max(n, Ordering::Relaxed);
+                s.report_progress();
+            }
         }
     }
 
@@ -541,6 +629,12 @@ impl InstallProgress {
                 s.resolved.store(total, Ordering::Relaxed);
                 clamp_reused_to(&s.reused, &s.downloaded, total);
             }
+            Mode::Events(s) => {
+                s.resolved.store(total, Ordering::Relaxed);
+                s.total.store(total, Ordering::Relaxed);
+                clamp_reused_to(&s.reused, &s.downloaded, total);
+                s.report_progress();
+            }
         }
     }
 
@@ -553,6 +647,11 @@ impl InstallProgress {
             }
             Mode::Ci(s) => {
                 s.resolved.fetch_add(n, Ordering::Relaxed);
+            }
+            Mode::Events(s) => {
+                let resolved = s.resolved.fetch_add(n, Ordering::Relaxed) + n;
+                s.total.fetch_max(resolved, Ordering::Relaxed);
+                s.report_progress();
             }
         }
     }
@@ -600,6 +699,13 @@ impl InstallProgress {
                 }
                 s.estimated_bytes.fetch_add(bytes, Ordering::Relaxed);
             }
+            Mode::Events(s) => {
+                if prior > 0 {
+                    s.estimated_bytes.fetch_sub(prior, Ordering::Relaxed);
+                }
+                s.estimated_bytes.fetch_add(bytes, Ordering::Relaxed);
+                s.report_progress();
+            }
         }
     }
 
@@ -631,6 +737,10 @@ impl InstallProgress {
             }
             Mode::Ci(s) => {
                 s.estimated_bytes.store(sum, Ordering::Relaxed);
+            }
+            Mode::Events(s) => {
+                s.estimated_bytes.store(sum, Ordering::Relaxed);
+                s.report_progress();
             }
         }
     }
@@ -676,6 +786,22 @@ impl InstallProgress {
                 self.refresh_tty_bar();
             }
             Mode::Ci(s) => s.set_phase(phase),
+            Mode::Events(s) => {
+                let (n, phase) = match phase {
+                    "resolving" => (1, InstallPhase::Resolving),
+                    "fetching" => (2, InstallPhase::Fetching),
+                    "linking" => (3, InstallPhase::Linking),
+                    "" => {
+                        s.phase.store(0, Ordering::Relaxed);
+                        s.report_progress();
+                        return;
+                    }
+                    _ => return,
+                };
+                s.phase.store(n, Ordering::Relaxed);
+                s.reporter.report(InstallEvent::Phase(phase));
+                s.report_progress();
+            }
         }
     }
 
@@ -690,6 +816,10 @@ impl InstallProgress {
             }
             Mode::Ci(s) => {
                 s.reused.fetch_add(n, Ordering::Relaxed);
+            }
+            Mode::Events(s) => {
+                s.reused.fetch_add(n, Ordering::Relaxed);
+                s.report_progress();
             }
         }
     }
@@ -713,6 +843,10 @@ impl InstallProgress {
             }
             Mode::Ci(s) => {
                 s.downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            Mode::Events(s) => {
+                s.downloaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+                s.report_progress();
             }
         }
     }
@@ -907,6 +1041,10 @@ impl InstallProgress {
                 inner: FetchRowInner::Ci(Arc::downgrade(s)),
                 completed: false,
             },
+            Mode::Events(s) => FetchRow {
+                inner: FetchRowInner::Events(Arc::downgrade(s)),
+                completed: false,
+            },
         }
     }
 
@@ -964,6 +1102,13 @@ impl InstallProgress {
                 clx::progress::stop_clear();
             }
             Mode::Ci(s) => s.stop(print_ci_summary),
+            Mode::Events(s) => {
+                if s.phase.swap(4, Ordering::Relaxed) != 4 {
+                    s.reporter
+                        .report(InstallEvent::Phase(InstallPhase::Complete));
+                    s.report_progress();
+                }
+            }
         }
     }
 
@@ -996,6 +1141,9 @@ impl InstallProgress {
         total_packages: usize,
         elapsed: Duration,
     ) {
+        if matches!(self.mode, Mode::Events(_)) {
+            return;
+        }
         if linked == 0 && top_level_linked == 0 {
             let body = if total_packages == 0 {
                 "Already up to date".to_string()
@@ -1026,6 +1174,7 @@ impl InstallProgress {
         let needs_summary = match &self.mode {
             Mode::Tty { .. } => true,
             Mode::Ci(s) => !s.shown.load(Ordering::Relaxed),
+            Mode::Events(_) => false,
         };
         if !needs_summary {
             return;
@@ -1356,6 +1505,7 @@ impl Drop for InstallProgress {
                     s.stop(false);
                 }
             }
+            Mode::Events(_) => {}
         }
     }
 }
@@ -1395,6 +1545,7 @@ enum FetchRowInner {
     /// rows shouldn't prevent `CiState` from being dropped after the
     /// last `InstallProgress` clone is gone.
     Ci(Weak<CiState>),
+    Events(Weak<EventState>),
 }
 
 impl FetchRow {
@@ -1465,6 +1616,12 @@ impl FetchRow {
             FetchRowInner::Ci(weak) => {
                 if let Some(s) = weak.upgrade() {
                     s.downloaded.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            FetchRowInner::Events(weak) => {
+                if let Some(s) = weak.upgrade() {
+                    s.downloaded.fetch_add(1, Ordering::Relaxed);
+                    s.report_progress();
                 }
             }
         }
@@ -1600,6 +1757,96 @@ impl Drop for PausingWriterGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingReporter(Mutex<Vec<InstallEvent>>);
+
+    impl InstallReporter for RecordingReporter {
+        fn report(&self, event: InstallEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn event_mode_reports_phase_progress_and_completion() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let control = crate::commands::install::InstallControl::events(reporter.clone());
+
+        crate::commands::install::control::scope(control, async {
+            let progress = InstallProgress::try_new().unwrap();
+            progress.set_phase("resolving");
+            progress.set_total_floor(3);
+            progress.inc_total(1);
+            progress.inc_total(1);
+            progress.set_total(2);
+            progress.inc_reused(1);
+            progress.set_phase("fetching");
+            progress.set_phase("future-phase");
+            progress.inc_downloaded_bytes(512);
+            drop(progress.start_fetch("dep", "1.0.0"));
+            progress.finish(false);
+        })
+        .await;
+
+        let events = reporter.0.lock().unwrap();
+        assert!(events.contains(&InstallEvent::Phase(InstallPhase::Resolving)));
+        assert!(events.contains(&InstallEvent::Phase(InstallPhase::Fetching)));
+        assert!(events.contains(&InstallEvent::Phase(InstallPhase::Complete)));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InstallEvent::Progress(snapshot)
+                if snapshot.phase == Some(InstallPhase::Resolving)
+                    && snapshot.resolved == 2
+                    && snapshot.total == 3
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InstallEvent::Progress(snapshot)
+                if snapshot.phase == Some(InstallPhase::Fetching)
+                    && snapshot.downloaded_bytes == 512
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            InstallEvent::Progress(snapshot)
+                if snapshot.phase == Some(InstallPhase::Complete)
+                    && snapshot.resolved == 2
+                    && snapshot.reused == 1
+                    && snapshot.downloaded == 1
+                    && snapshot.downloaded_bytes == 512
+        )));
+    }
+
+    /// Events mode must observe the linker's own counter, not a private copy:
+    /// the linker only ever touches the `Arc` it received from
+    /// `link_progress_counter()`, so a duplicate atomic would report `0` for
+    /// every install no matter how many files were materialized.
+    #[tokio::test]
+    async fn event_mode_reports_the_linkers_own_file_counter() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let control = crate::commands::install::InstallControl::events(reporter.clone());
+
+        crate::commands::install::control::scope(control, async {
+            let progress = InstallProgress::try_new().unwrap();
+            progress.set_phase("linking");
+            // Stands in for the linker's materialize pass, which holds this
+            // exact counter and bumps it once per file.
+            progress
+                .link_progress_counter()
+                .fetch_add(7, Ordering::Relaxed);
+            progress.finish(false);
+        })
+        .await;
+
+        let events = reporter.0.lock().unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                InstallEvent::Progress(snapshot) if snapshot.files_linked == 7
+            )),
+            "no snapshot carried the linker's file count: {events:?}"
+        );
+    }
 
     /// Display width of a styled string: strip SGR escapes, then count chars
     /// (every glyph the bar uses — ASCII, `—`, `█`, `░`, `·`, `/` — is one

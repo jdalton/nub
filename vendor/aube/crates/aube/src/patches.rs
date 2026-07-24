@@ -12,17 +12,17 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// One resolved patch entry. The key is `name@version` (the same
-/// string used as the `pnpm.patchedDependencies` map key), `path` is
-/// the absolute path on disk, and `content` is the raw patch text the
-/// linker applies.
+/// One resolved patch entry. `key` is the VERBATIM declared
+/// `patchedDependencies` key — exact (`ms@2.1.3`), range (`ms@>=2`),
+/// wildcard (`ms@*`), or bare name (`ms`) — and is the string the
+/// lockfile's `patchedDependencies:` block records unresolved, matching
+/// pnpm. `path` is the absolute path on disk, `content` is the raw
+/// patch text the linker applies. Mapping a concrete resolved
+/// `name@version` to the entry that applies is
+/// [`aube_lockfile::patch_groups`]'s job.
 #[derive(Debug, Clone)]
 pub struct ResolvedPatch {
     pub key: String,
-    #[allow(dead_code)]
-    pub name: String,
-    #[allow(dead_code)]
-    pub version: String,
     #[allow(dead_code)]
     pub path: PathBuf,
     /// The project-relative patch path exactly as declared
@@ -76,58 +76,60 @@ fn is_safe_patch_rel(rel: &str) -> bool {
     })
 }
 
-/// Split a `name@version` patch key into its parts. Mirrors
-/// `commands::split_name_spec` but always requires a version (a bare
-/// name is rejected — patches are always per-version).
-pub fn split_patch_key(key: &str) -> Result<(String, String)> {
-    let (name, ver) = if let Some(rest) = key.strip_prefix('@') {
-        let slash = rest
-            .find('/')
-            .ok_or_else(|| miette!("invalid patch key {key:?}: scoped name missing slash"))?;
-        let after = &rest[slash + 1..];
-        let at = after
-            .find('@')
-            .ok_or_else(|| miette!("invalid patch key {key:?}: missing version"))?;
-        let split = 1 + slash + 1 + at;
-        (&key[..split], &key[split + 1..])
-    } else {
-        let at = key
-            .find('@')
-            .ok_or_else(|| miette!("invalid patch key {key:?}: missing version"))?;
-        (&key[..at], &key[at + 1..])
-    };
-    if name.is_empty() || ver.is_empty() {
-        return Err(miette!("invalid patch key {key:?}"));
-    }
-    Ok((name.to_string(), ver.to_string()))
+/// Validate a `patchedDependencies` key's shape, rejecting only a
+/// non-`*` selector that isn't a valid semver range (pnpm's
+/// `PATCH_NON_SEMVER_RANGE`). Every other shape — exact, range, `*`,
+/// bare name — is accepted; mapping the key to concrete resolved
+/// versions is [`aube_lockfile::patch_groups`]'s job. Kept a thin
+/// wrapper so the invalid-range error carries the branded code.
+fn validate_patch_key(key: &str) -> Result<()> {
+    aube_lockfile::patch_groups::classify_patch_key(key).map_err(|e| {
+        miette!(
+            code = aube_codes::errors::ERR_AUBE_PATCH_NON_SEMVER_RANGE,
+            "{}",
+            e.message()
+        )
+    })?;
+    Ok(())
 }
 
-/// Read every patch declared in the active lockfile, `package.json`,
-/// and `pnpm-workspace.yaml`, then return them keyed by `name@version`.
-/// Workspace-yaml entries (pnpm v10+ canonical location) win over
-/// `package.json`, which wins over lockfile entries, on key conflict.
-/// Missing patch files become a hard error — that matches pnpm, which
-/// refuses to install with a declared-but-missing patch.
-/// Load patches and pre-build the two shapes the linker + GVS-prewarm
-/// materializer want: a `(name@version, content)` map and a
-/// `(name@version, content_hash)` map. Both materializer call sites
-/// (lockfile + no-lockfile) and the link phase compute these from the
-/// same `load_patches` output, hoisted here so the BTreeMap walks
-/// happen once per install.
+/// Build the two shapes the linker + GVS-prewarm materializer want,
+/// keyed by the CONCRETE resolved `name@version` those stages apply
+/// patches by: a `(name@version, content)` content map and a
+/// `(name@version, content_hash)` fold map. The declared keys may be
+/// exact (`ms@2.1.3`), a range (`ms@>=2`), a wildcard (`ms@*`), or a
+/// bare name (`ms`); each graph package resolves to at most one patch
+/// by pnpm's `getPatchInfo` priority (exact > range > all). An
+/// all-exact project resolves each key to its own `name@version`, so
+/// the maps are byte-identical to the pre-resolution behavior.
 ///
-/// Result is cached per cwd for the lifetime of the process. The 2-3
-/// call sites within a single install hit the cache on calls 2+ instead
-/// of re-walking `patches/` from disk. pnpm.patchedDependencies is
-/// resolved at install entry; patch files are static across the run.
+/// Two ranges matching one version → [`aube_codes::errors::ERR_AUBE_PATCH_KEY_CONFLICT`];
+/// an invalid non-`*` range → [`aube_codes::errors::ERR_AUBE_PATCH_NON_SEMVER_RANGE`].
 pub fn load_patches_for_linker(
     cwd: &Path,
-    lockfile_patched_dependencies: &BTreeMap<String, String>,
+    graph: &aube_lockfile::LockfileGraph,
 ) -> Result<(aube_linker::Patches, BTreeMap<String, String>)> {
-    use std::sync::{Mutex, OnceLock};
+    let resolved = load_resolved_patches_cached(cwd, &graph.patched_dependencies)?;
+    resolve_patches_against_graph(&resolved, graph)
+}
+
+/// Cache the DISK read of the declared patch set (source key →
+/// [`ResolvedPatch`]) per cwd for the process lifetime. The 2-3 link /
+/// materialize / prewarm call sites within one install hit the cache on
+/// calls 2+ instead of re-walking `patches/` from disk. Resolving the
+/// cached set against the graph is cheap and stays out of the cache, so
+/// the cache is correctly graph-independent (the same cwd is only ever
+/// queried with one graph per install process anyway).
+fn load_resolved_patches_cached(
+    cwd: &Path,
+    lockfile_patched_dependencies: &BTreeMap<String, String>,
+) -> Result<std::sync::Arc<BTreeMap<String, ResolvedPatch>>> {
+    use std::sync::{Arc, Mutex, OnceLock};
     type CacheKey = (PathBuf, BTreeMap<String, String>);
-    type CachedShape = (aube_linker::Patches, BTreeMap<String, String>);
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<CacheKey, CachedShape>>> =
-        OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<CacheKey, Arc<BTreeMap<String, ResolvedPatch>>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     // Canonicalize so `cwd` and `cwd.canonicalize()` collapse to one
     // key. Windows `\\?\C:\foo` vs `C:\foo`, Unix `cwd` vs `cwd/.`
@@ -143,19 +145,54 @@ pub fn load_patches_for_linker(
     {
         return Ok(hit.clone());
     }
-    let resolved = load_patches_with_lockfile_entries(cwd, lockfile_patched_dependencies)?;
-    let patches: aube_linker::Patches = resolved
-        .values()
-        .map(|p| (p.key.clone(), p.content.clone()))
-        .collect();
-    let hashes: BTreeMap<String, String> = resolved
-        .values()
-        .map(|p| (p.key.clone(), p.content_hash()))
-        .collect();
+    let resolved = Arc::new(load_patches_with_lockfile_entries(
+        cwd,
+        lockfile_patched_dependencies,
+    )?);
     if let Ok(mut guard) = cache.lock() {
-        guard.insert(key, (patches.clone(), hashes.clone()));
+        guard.insert(key, resolved.clone());
+    }
+    Ok(resolved)
+}
+
+/// Map every resolved graph package to the declared patch that applies
+/// (pnpm's `getPatchInfo` priority), keying the linker's content map
+/// and the graph-hash fold map by the concrete `name@version` those
+/// stages look up. No `local_source` filter — the linker applies to any
+/// `spec_key` match, matching the pre-resolution unfiltered behavior.
+fn resolve_patches_against_graph(
+    resolved: &BTreeMap<String, ResolvedPatch>,
+    graph: &aube_lockfile::LockfileGraph,
+) -> Result<(aube_linker::Patches, BTreeMap<String, String>)> {
+    let by_version =
+        aube_lockfile::patch_groups::resolve_patched_by_version(resolved, &graph.packages)
+            .map_err(map_patch_resolve_err)?;
+    let mut patches = aube_linker::Patches::new();
+    let mut hashes = BTreeMap::new();
+    for (spec, patch) in by_version {
+        hashes.insert(spec.clone(), patch.content_hash());
+        patches.insert(spec, patch.content);
     }
     Ok((patches, hashes))
+}
+
+/// Brand a patch-group resolution failure with the matching
+/// `ERR_AUBE_PATCH_*` code (rewritten to `ERR_NUB_*` by the embedder).
+fn map_patch_resolve_err(e: aube_lockfile::patch_groups::PatchResolveError) -> miette::Report {
+    use aube_lockfile::patch_groups::PatchResolveError;
+    match e {
+        PatchResolveError::InvalidRange(r) => miette!(
+            code = aube_codes::errors::ERR_AUBE_PATCH_NON_SEMVER_RANGE,
+            "{}",
+            r.message()
+        ),
+        PatchResolveError::Conflict(c) => miette!(
+            code = aube_codes::errors::ERR_AUBE_PATCH_KEY_CONFLICT,
+            help = c.hint(),
+            "{}",
+            c.message()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -186,7 +223,7 @@ fn load_patches_with_lockfile_entries(
 
     let mut out = BTreeMap::new();
     for (key, rel) in entries {
-        let (name, version) = split_patch_key(&key)?;
+        validate_patch_key(&key)?;
         // Refuse absolute paths and `..` traversal in the manifest-
         // declared patch path so a hostile `package.json` cannot
         // coerce `aube install` into reading an arbitrary file off
@@ -215,8 +252,6 @@ fn load_patches_with_lockfile_entries(
             key.clone(),
             ResolvedPatch {
                 key,
-                name,
-                version,
                 path,
                 rel,
                 content,
@@ -339,9 +374,95 @@ pub fn effective_patch_config(
 /// install.
 pub fn record_patches_on_graph(cwd: &Path, graph: &mut aube_lockfile::LockfileGraph) -> Result<()> {
     let (paths, hashes) = effective_patch_config(cwd)?;
+    // Surface a range CONFLICT (two ranges matching one resolved
+    // version) here at resolve time — the earliest, most uniform gate,
+    // matching pnpm's "raise during config grouping". Without it the
+    // conflict would only surface later at link / write, and a
+    // `--lockfile-only` no-op write could suppress it entirely. An
+    // invalid range already errored inside `effective_patch_config`.
+    aube_lockfile::patch_groups::resolve_patched_by_version(&paths, &graph.packages)
+        .map_err(map_patch_resolve_err)?;
+    verify_patches_used(cwd, &paths, graph)?;
     graph.patched_dependencies = paths;
     graph.patched_dependency_hashes = hashes;
     Ok(())
+}
+
+/// pnpm's `verifyPatches`: a declared `patchedDependencies` key that
+/// matches no installed package fails the install, unless
+/// `allowUnusedPatches` downgrades it to a warning.
+///
+/// Runs here, at the resolve gate, because that is where pnpm runs it —
+/// inside the resolution step, which a warm "lockfile is up to date"
+/// install skips entirely (verified against pnpm 10.15.1). Reporting
+/// every unused key at once, rather than the first, also matches pnpm,
+/// and firing before the graph is handed on keeps the failure ahead of
+/// any linking or lockfile write.
+fn verify_patches_used(
+    cwd: &Path,
+    paths: &BTreeMap<String, String>,
+    graph: &aube_lockfile::LockfileGraph,
+) -> Result<()> {
+    let unused = aube_lockfile::patch_groups::unused_patch_keys(
+        paths.keys().map(String::as_str),
+        &graph.packages,
+    )
+    // An invalid range is `effective_patch_config`'s error to raise, and
+    // it already did; nothing here can add to it.
+    .unwrap_or_default();
+    if unused.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<&str> = unused.iter().map(|u| u.source_key).collect();
+    // Byte-identical to pnpm's ERR_PNPM_UNUSED_PATCH wording so a user
+    // moving between the two reads the same sentence.
+    let message = format!("The following patches were not used: {}", keys.join(", "));
+    // An alias-named key is the one unused shape with a mechanical fix,
+    // so it carries the exact replacement rather than the generic hint.
+    let hint = unused
+        .iter()
+        .find_map(|u| {
+            let spelling = u.registry_name_spelling.as_deref()?;
+            Some(format!(
+                "Patches resolve against a package's registry name, not the npm alias it is \
+                 installed as — declare {:?} as {spelling:?}.",
+                u.source_key
+            ))
+        })
+        .unwrap_or_else(|| {
+            "Either remove them from \"patchedDependencies\" or update them to match packages \
+             in your dependencies."
+                .to_string()
+        });
+    if allow_unused_patches(cwd) {
+        tracing::warn!(
+            code = aube_codes::warnings::WARN_AUBE_UNUSED_PATCH,
+            "{message} {hint}"
+        );
+        return Ok(());
+    }
+    Err(miette!(
+        code = aube_codes::errors::ERR_AUBE_UNUSED_PATCH,
+        help = hint,
+        "{message}"
+    ))
+}
+
+/// Resolve `allowUnusedPatches` from the two homes pnpm 10 honors it in
+/// — the manifest and the workspace yaml — with the workspace yaml
+/// winning, matching how `patchedDependencies` itself merges. Each
+/// reader applies its own brand gating, so a nub-identity project sees
+/// only neutral, un-branded config.
+fn allow_unused_patches(cwd: &Path) -> bool {
+    if let Ok(ws) = aube_manifest::workspace::WorkspaceConfig::load(cwd)
+        && let Some(allow) = ws.allow_unused_patches
+    {
+        return allow;
+    }
+    aube_manifest::PackageJson::from_path(&cwd.join("package.json"))
+        .ok()
+        .and_then(|m| m.allow_unused_patches())
+        .unwrap_or(false)
 }
 
 /// Drop an entry from `patchedDependencies` in whichever file declares
@@ -533,30 +654,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_simple() {
-        let (n, v) = split_patch_key("is-positive@3.1.0").unwrap();
-        assert_eq!(n, "is-positive");
-        assert_eq!(v, "3.1.0");
-    }
-
-    #[test]
-    fn split_scoped() {
-        let (n, v) = split_patch_key("@babel/core@7.0.0").unwrap();
-        assert_eq!(n, "@babel/core");
-        assert_eq!(v, "7.0.0");
-    }
-
-    #[test]
-    fn split_missing_version_errors() {
-        assert!(split_patch_key("is-positive").is_err());
-        assert!(split_patch_key("@babel/core").is_err());
+    fn validate_accepts_all_pnpm_key_shapes() {
+        // The parse-time gate now rejects ONLY a non-`*` invalid range;
+        // exact, range, `*`, and bare-name keys all pass.
+        for key in [
+            "is-positive@3.1.0",
+            "@babel/core@7.0.0",
+            "sonda",
+            "sonda@*",
+            "sonda@>=1",
+        ] {
+            assert!(validate_patch_key(key).is_ok(), "should accept {key:?}");
+        }
+        assert!(validate_patch_key("sonda@not-a-range").is_err());
     }
 
     fn patch_with_content(content: &str) -> ResolvedPatch {
         ResolvedPatch {
             key: "ms@2.1.3".into(),
-            name: "ms".into(),
-            version: "2.1.3".into(),
             path: PathBuf::from("patches/ms@2.1.3.patch"),
             rel: "patches/ms@2.1.3.patch".into(),
             content: content.into(),
@@ -583,6 +698,50 @@ mod tests {
             patch_with_content("hello\r\n").content_hash(),
             patch_with_content("hello\n").content_hash(),
         );
+    }
+
+    /// pnpm's `verifyPatches` contract: a declared key that matches no
+    /// installed package fails the install, and `allowUnusedPatches`
+    /// downgrades exactly that failure to a warning.
+    #[test]
+    fn unused_patch_key_fails_the_install_unless_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("patches")).unwrap();
+        std::fs::write(dir.path().join("patches/ghost.patch"), "").unwrap();
+        // `extra` lands inside the `pnpm` object, after the closing
+        // brace of `patchedDependencies`.
+        let manifest = |extra: &str| {
+            let json = String::from(
+                r#"{"pnpm":{"patchedDependencies":{"ghost@1.0.0":"patches/ghost.patch"}"#,
+            ) + extra
+                + "}}";
+            std::fs::write(dir.path().join("package.json"), json).unwrap();
+        };
+        let mut graph = aube_lockfile::LockfileGraph {
+            packages: [(
+                "is-number@6.0.0".to_string(),
+                aube_lockfile::LockedPackage {
+                    name: "is-number".into(),
+                    version: "6.0.0".into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+
+        manifest("");
+        let err = record_patches_on_graph(dir.path(), &mut graph)
+            .expect_err("an unused patch key must fail the install");
+        assert_eq!(
+            err.code().map(|c| c.to_string()).as_deref(),
+            Some(aube_codes::errors::ERR_AUBE_UNUSED_PATCH),
+            "wrong error for an unused patch key: {err:?}"
+        );
+
+        manifest(r#","allowUnusedPatches":true"#);
+        record_patches_on_graph(dir.path(), &mut graph)
+            .expect("allowUnusedPatches must downgrade the failure to a warning");
     }
 
     #[test]
@@ -798,7 +957,10 @@ mod tests {
         )
         .unwrap();
 
-        let (patches, hashes) = load_patches_for_linker(
+        // A lockfile-carried patch entry is merged into the declared set
+        // (keyed by the verbatim source key). Resolving it against a graph
+        // is covered by `aube_lockfile::patch_groups` unit tests.
+        let resolved = load_patches_with_lockfile_entries(
             dir.path(),
             &BTreeMap::from([(
                 "is-number@7.0.0".to_string(),
@@ -807,11 +969,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            patches.get("is-number@7.0.0").map(String::as_str),
-            Some("diff --git a/index.js b/index.js\n")
-        );
-        assert!(hashes.contains_key("is-number@7.0.0"));
+        let entry = resolved.get("is-number@7.0.0").expect("entry present");
+        assert_eq!(entry.content, "diff --git a/index.js b/index.js\n");
+        assert_eq!(entry.rel, ".yarn/patches/is-number.patch");
     }
 
     #[test]

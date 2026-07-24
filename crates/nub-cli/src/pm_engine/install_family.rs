@@ -511,16 +511,16 @@ fn run_approve_builds(typed: &str, args: &[String]) -> Result<i32> {
     let (globals, verb): (_, aube::commands::approve_builds::ApproveBuildsArgs) =
         parse_or_return!(typed, args);
     let session = super::engine_session(globals.dir.as_deref())?;
-    // The success summary ends with a raw `` Run `aube install` (or `aube
-    // rebuild`) … `` println on stdout. Capture + rewrite; the interactive
-    // picker is unaffected (it prompts on stderr and reads stdin).
-    let (result, captured) = super::with_fd_captured(1, || {
-        session
-            .runtime
-            .block_on(aube::commands::approve_builds::run(verb))
-    });
-    print!("{}", present::rewrite(&captured));
-    finish(result)
+    // No fd capture: the engine's remaining prints brand through
+    // `prog()`/`cmd()` (already profile-aware), and the verb now runs the
+    // approved packages' build scripts in-process — buffering fd 1 for the
+    // whole call would hold back live script output until the end, reading
+    // as a hang during long native builds. Same shape as `run_rebuild`.
+    finish_quieted(
+        &globals.output,
+        &session,
+        aube::commands::approve_builds::run(verb),
+    )
 }
 
 fn run_ignored_builds(typed: &str, args: &[String]) -> Result<i32> {
@@ -828,6 +828,19 @@ fn import_to_pnpm_lock(force: bool) -> miette::Result<String> {
         Err(e) => {
             restore(&backup);
             return Err(miette::Report::new(e)).wrap_err("failed to parse source lockfile");
+        }
+    };
+
+    // install skips its own peer pass for a pnpm incumbent, assuming a pnpm-lock
+    // is already peer-resolved — so a suffix-less source (npm / bun) has to be
+    // contextualized here or nothing downstream ever restores the edges (#453).
+    let graph = match aube_resolver::peer_pass_for_import(graph, kind) {
+        Ok(graph) => graph,
+        // Restore a moved-aside pnpm-lock like every other error path here;
+        // a bare `?` would orphan the user's original as `.import-backup`.
+        Err(e) => {
+            restore(&backup);
+            return Err(miette!("peer-context pass failed: {e}"));
         }
     };
 
@@ -1336,50 +1349,79 @@ pub fn run_ci(flags: CiFlags) -> Result<i32> {
 
 /// Yarn-kind drift pre-flight, at the nub layer.
 ///
-/// Why this exists: aube's yarn parsers (classic and berry) synthesize the
-/// root importer by cross-referencing the manifest's deps against the
-/// lockfile's `name@range` keys, silently *dropping* any manifest dep the
-/// lockfile doesn't satisfy — and they record `specifier: None` on every
-/// `DirectDep`, which makes the engine's frozen drift check return Fresh
-/// vacuously for yarn formats. Net effect at the pinned API: a drifted
-/// yarn.lock under FrozenMode::Frozen "installs" without the new dep and
-/// exits 0. This pre-flight redoes the comparison the engine can't: any
-/// manifest direct dep missing from the parsed root importer means the
-/// lockfile can't satisfy the manifest — i.e. a real install would have to
-/// re-resolve and rewrite yarn.lock, which the gate forbids.
+/// Why this exists: the yarn readers reconstruct importers by
+/// cross-referencing current manifests against the lockfile, silently dropping
+/// any dependency the lockfile cannot satisfy. Berry also records no direct
+/// dependency specifiers, so generic frozen drift reports those reconstructed
+/// importers fresh. This pre-flight compares each reconstructed importer back
+/// to its current manifest before the engine can under-install it.
 ///
-/// Scope: root importer only — yarn workspace member manifests are not
-/// checked (aube's yarn readers only synthesize the "." importer today).
-/// Parse/read failures return None (no drift claim); the engine surfaces
-/// those errors itself with better diagnostics.
+/// Parse/read failures return None (no drift claim); the engine surfaces those
+/// errors itself with better diagnostics.
 fn yarn_drift_reason(dir: &Path) -> Option<String> {
-    let manifest = aube_manifest::PackageJson::from_path(&dir.join("package.json")).ok()?;
-    let graph = aube_lockfile::parse_lockfile(dir, &manifest).ok()?;
-    let mut satisfied: std::collections::HashSet<&str> =
-        graph.root_deps().iter().map(|d| d.name.as_str()).collect();
-    // An optional dependency the reader consciously skipped (e.g. an
-    // unresolvable `git`/`jsr` source under the strict-unsupported-source
-    // policy) is not drift — it's deliberately absent and needs no yarn.lock
-    // rewrite, exactly like a platform-filtered optional. Without this, an
-    // optional unsupported dep would trip the read-only yarn write-gate even
-    // though the policy is to warn + proceed.
-    // Root importer only, matching `root_deps()` above: this function checks
-    // only the root manifest, so folding a workspace member's skipped optional
-    // into `satisfied` could mask real root drift on a same-named dep. Both
-    // yarn readers key the root's skipped optionals under "." (classic keys
-    // members under their dir), so this lookup is exact.
-    if let Some(root_skipped) = graph.skipped_optional_dependencies.get(".") {
-        satisfied.extend(root_skipped.keys().map(String::as_str));
+    let root_manifest = aube_manifest::PackageJson::from_path(&dir.join("package.json")).ok()?;
+    let graph = aube_lockfile::yarn::parse(&dir.join("yarn.lock"), &root_manifest).ok()?;
+
+    for (importer, locked_deps) in &graph.importers {
+        let manifest = if importer == "." {
+            root_manifest.clone()
+        } else {
+            let importer_path = Path::new(importer);
+            // Workspace patterns may intentionally select a sibling via `..`;
+            // keep that supported relative form while rejecting other shapes.
+            if importer_path.as_os_str().is_empty()
+                || importer_path.components().any(|component| {
+                    !matches!(
+                        component,
+                        std::path::Component::Normal(_) | std::path::Component::ParentDir
+                    )
+                })
+            {
+                return None;
+            }
+            let importer_dir = aube_util::path::normalize_lexical(&dir.join(importer_path));
+            aube_manifest::PackageJson::from_path(&importer_dir.join("package.json")).ok()?
+        };
+        let is_satisfied = |name: &str, dep_type: aube_lockfile::DepType| {
+            locked_deps
+                .iter()
+                .any(|dep| dep.name == name && dep.dep_type == dep_type)
+        };
+        let format_reason = |name: &str, spec: &str| {
+            let missing = format!("{name}@{spec} is not satisfied by yarn.lock");
+            if importer == "." {
+                missing
+            } else {
+                format!("{importer}: {missing}")
+            }
+        };
+
+        if let Some((name, spec)) = manifest
+            .dependencies
+            .iter()
+            .find(|(name, _)| !is_satisfied(name, aube_lockfile::DepType::Production))
+        {
+            return Some(format_reason(name, spec));
+        }
+
+        if let Some((name, spec)) = manifest.dev_dependencies.iter().find(|(name, _)| {
+            !manifest.dependencies.contains_key(name.as_str())
+                && !is_satisfied(name, aube_lockfile::DepType::Dev)
+        }) {
+            return Some(format_reason(name, spec));
+        }
+
+        let skipped = graph.skipped_optional_dependencies.get(importer);
+        if let Some((name, spec)) = manifest.optional_dependencies.iter().find(|(name, _)| {
+            !manifest.dependencies.contains_key(name.as_str())
+                && !manifest.dev_dependencies.contains_key(name.as_str())
+                && !is_satisfied(name, aube_lockfile::DepType::Optional)
+                && !skipped.is_some_and(|deps| deps.contains_key(name.as_str()))
+        }) {
+            return Some(format_reason(name, spec));
+        }
     }
-    let manifest_deps = manifest
-        .dependencies
-        .iter()
-        .chain(manifest.dev_dependencies.iter())
-        .chain(manifest.optional_dependencies.iter());
-    manifest_deps
-        .filter(|(name, _)| !satisfied.contains(name.as_str()))
-        .map(|(name, spec)| format!("{name}@{spec} is not satisfied by yarn.lock"))
-        .next()
+    None
 }
 
 // ───────────────────────── pnpm lockfile-version gate ──────────────────────────
@@ -1474,21 +1516,6 @@ fn run_engine(
     yarn_gated: bool,
     output: &super::output::OutputFlags,
 ) -> Result<i32> {
-    // Pre-install phantom backfill (flag-gated STRICT no-op by default): scan any
-    // already-cached resolved package that has no verdict sidecar yet, BEFORE the
-    // engine links. The extract hook only fires on a genuine tarball fetch, so a
-    // package served from a WARM store (or whose sidecar was GC'd) would otherwise
-    // reach the closure with no sidecar and never seed an eject; this closes that
-    // gap on THIS install. Rooted at the lockfile's dir (else the cwd). See
-    // `crate::dynamic_phantom::backfill_from_lockfile`.
-    crate::dynamic_phantom::backfill_from_lockfile(
-        session
-            .detected
-            .as_ref()
-            .map(|d| d.dir.as_path())
-            .unwrap_or(session.cwd.as_path()),
-    );
-
     // Hold the output guard only across the engine run (so `--silent` suppresses
     // the progress/summary written during install) and drop it before the match
     // below, so a final error report still reaches the real stderr.
@@ -1566,6 +1593,124 @@ mod tests {
             ParsedVerb::Run(globals, verb) => (globals, verb),
             ParsedVerb::Done(code) => panic!("expected a parse, clap settled with exit {code}"),
         }
+    }
+
+    #[test]
+    fn yarn_drift_preflight_accepts_satisfied_classic_workspace_importers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","private":true,"packageManager":"yarn@1.22.22","workspaces":["packages/*"],"dependencies":{"@fixture/utils":"1.0.0"}}"#,
+        )
+        .unwrap();
+        for (member, manifest) in [
+            (
+                "app",
+                r#"{"name":"@fixture/app","version":"1.0.0","dependencies":{"@fixture/utils":"1.0.0"}}"#,
+            ),
+            ("utils", r#"{"name":"@fixture/utils","version":"1.0.0"}"#),
+        ] {
+            let member_dir = root.join("packages").join(member);
+            std::fs::create_dir_all(&member_dir).unwrap();
+            std::fs::write(member_dir.join("package.json"), manifest).unwrap();
+        }
+        std::fs::write(root.join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+        std::fs::write(
+            root.join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\nimporters:\n  .: {}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            yarn_drift_reason(root),
+            None,
+            "the preflight must parse the exact yarn.lock even with a stray foreign lockfile"
+        );
+    }
+
+    #[test]
+    fn yarn_drift_preflight_checks_the_effective_dependency_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","private":true,"packageManager":"yarn@4.17.0","dependencies":{"foo":"2.0.0"},"devDependencies":{"foo":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("yarn.lock"),
+            r#"__metadata:
+  version: 10
+  cacheKey: 10c0
+
+"foo@npm:1.0.0":
+  version: 1.0.0
+  resolution: "foo@npm:1.0.0"
+  languageName: node
+  linkType: hard
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  dependencies:
+    foo: "npm:1.0.0"
+  languageName: unknown
+  linkType: soft
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            yarn_drift_reason(root).as_deref(),
+            Some("foo@2.0.0 is not satisfied by yarn.lock"),
+            "a satisfied lower-priority dev edge must not mask production drift"
+        );
+    }
+
+    #[test]
+    fn yarn_drift_preflight_checks_parent_relative_workspace_importers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let sibling = tmp.path().join("sibling");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","private":true,"packageManager":"yarn@4.17.0","workspaces":["../sibling"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sibling.join("package.json"),
+            r#"{"name":"@fixture/sibling","version":"1.0.0","dependencies":{"is-odd":"3.0.1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("yarn.lock"),
+            r#"__metadata:
+  version: 10
+  cacheKey: 10c0
+
+"@fixture/sibling@workspace:../sibling":
+  version: 0.0.0-use.local
+  resolution: "@fixture/sibling@workspace:../sibling"
+  languageName: unknown
+  linkType: soft
+
+"root@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "root@workspace:."
+  languageName: unknown
+  linkType: soft
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            yarn_drift_reason(&root).as_deref(),
+            Some("../sibling: is-odd@3.0.1 is not satisfied by yarn.lock"),
+            "supported parent-relative workspace importers must not bypass drift validation"
+        );
     }
 
     /// The aube args types parse through nub's verb_command with their

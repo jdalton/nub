@@ -3,7 +3,7 @@ use tracing::{debug, trace, warn};
 use crate::patches::apply_multi_file_patch;
 use crate::sweep::{EntryState, classify_entry_state, mkdirp, try_remove_entry};
 use crate::{Error, LinkStats, LinkStrategy, Linker, sys};
-use aube_lockfile::{LockedPackage, shared_local_dep_path};
+use aube_lockfile::{LockedPackage, LockfileGraph, resolve_dep_edge, shared_local_dep_path};
 use aube_store::{PackageIndex, StoredFile};
 use std::collections::BTreeMap;
 use std::io;
@@ -179,6 +179,10 @@ impl Linker {
     pub fn ensure_in_virtual_store(
         &self,
         dep_path: &str,
+        // Resolves each transitive dep's edge value to its canonical package
+        // key across reader conventions during the sibling-symlink pass (only
+        // `graph.packages` is read). See `materialize_into`.
+        graph: &LockfileGraph,
         pkg: &LockedPackage,
         index: &PackageIndex,
         stats: &mut LinkStats,
@@ -197,6 +201,7 @@ impl Linker {
         self.ensure_in_virtual_store_with_subdir(
             dep_path,
             &subdir,
+            graph,
             pkg,
             index,
             stats,
@@ -213,10 +218,12 @@ impl Linker {
     /// long/scoped/peer-context names). `subdir` MUST equal
     /// `self.virtual_store_subdir(dep_path)`; the public wrapper above
     /// guarantees that for callers that don't already have it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ensure_in_virtual_store_with_subdir(
         &self,
         dep_path: &str,
         subdir: &str,
+        graph: &LockfileGraph,
         pkg: &LockedPackage,
         index: &PackageIndex,
         stats: &mut LinkStats,
@@ -252,6 +259,7 @@ impl Linker {
             &tmp_base,
             &self.virtual_store,
             dep_path,
+            graph,
             pkg,
             index,
             stats,
@@ -339,10 +347,12 @@ impl Linker {
     /// only existed in the per-project `.aube/` would leave that
     /// sibling symlink dangling — and Node would resolve whatever
     /// unrelated `<name>` it found walking up the tree.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ensure_shared_local_in_global_store(
         &self,
         aube_dir: &Path,
         dep_path: &str,
+        graph: &LockfileGraph,
         pkg: &LockedPackage,
         index: &PackageIndex,
         stats: &mut LinkStats,
@@ -355,7 +365,7 @@ impl Linker {
             stats.packages_cached += 1;
             return Ok(());
         }
-        self.ensure_in_virtual_store(dep_path, pkg, index, stats, nested_link_targets)?;
+        self.ensure_in_virtual_store(dep_path, graph, pkg, index, stats, nested_link_targets)?;
         if matches!(state, EntryState::Stale) {
             // A prior install — or an older aube that always
             // materialized git/remote sources per-project — may have
@@ -384,10 +394,12 @@ impl Linker {
     /// install-time materializer to pipeline the link work into the
     /// fetch phase under non-GVS mode, so the dedicated link phase only
     /// has to create top-level `node_modules/<name>` symlinks.
+    #[allow(clippy::too_many_arguments)]
     pub fn ensure_in_aube_dir(
         &self,
         aube_dir: &Path,
         dep_path: &str,
+        graph: &LockfileGraph,
         pkg: &LockedPackage,
         index: &PackageIndex,
         stats: &mut LinkStats,
@@ -406,6 +418,7 @@ impl Linker {
             &tmp_base,
             aube_dir,
             dep_path,
+            graph,
             pkg,
             index,
             stats,
@@ -472,6 +485,10 @@ impl Linker {
         base_dir: &Path,
         final_base_dir: &Path,
         dep_path: &str,
+        // The whole graph, so a transitive dep's VALUE can be resolved to its
+        // canonical package key across every reader convention (see the sibling
+        // symlink loop below). Only `graph.packages` is consulted.
+        graph: &LockfileGraph,
         pkg: &LockedPackage,
         index: &PackageIndex,
         stats: &mut LinkStats,
@@ -652,13 +669,23 @@ impl Linker {
         // a per-project `.aube/<dep_path>` that the caller just
         // ensured is empty), so nothing can be in the way.
         for (dep_name, dep_version) in &pkg.dependencies {
-            // Git / remote-tarball deps are recorded by their resolved
-            // URL spec but keyed in the graph under the short
-            // `name@git+<hash>` / `name@url+<hash>` form. Translate so the
-            // sibling symlink targets the same `dep_path` the package was
-            // materialized under; everything else keeps `name@version`.
-            let dep_dep_path = shared_local_dep_path(dep_name, dep_version)
-                .unwrap_or_else(|| format!("{dep_name}@{dep_version}"));
+            // Resolve the edge VALUE to the canonical package key the dep was
+            // materialized under. Readers disagree on what the value holds — the
+            // yarn readers store the full dep_path (`is-plain-obj@4.1.0`),
+            // npm/pnpm the tail, git/remote-tarball the resolved URL — so the
+            // former inline `name@tail` guess doubled the name for the yarn
+            // convention (`is-plain-obj@is-plain-obj@4.1.0`), pointing the
+            // sibling symlink at a nonexistent `.aube` entry (a dangling link
+            // that breaks resolution). `resolve_dep_edge` tries all three
+            // conventions against the real graph keys; the fallback preserves
+            // today's behavior for an edge that isn't a graph node (a `link:`
+            // target keyed only in `nested_link_targets`, or a pruned optional).
+            let dep_dep_path =
+                resolve_dep_edge(dep_name, dep_version, |k| graph.packages.contains_key(k))
+                    .unwrap_or_else(|| {
+                        shared_local_dep_path(dep_name, dep_version)
+                            .unwrap_or_else(|| format!("{dep_name}@{dep_version}"))
+                    });
             // Skip any dep whose name matches the package being
             // materialized, regardless of version. The symlink would
             // land at `pkg_nm_parent.join(dep_name)` which is exactly
@@ -723,17 +750,20 @@ impl Linker {
             // `pkg_nm_parent` is `<base_dir>/<subdir>/node_modules/`, so
             // two parents deep brings us to `<base_dir>/` where all
             // sibling subdirs live side-by-side.
-            let virtual_root = pkg_nm_parent
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or(&pkg_nm_parent);
-            let sibling_abs = virtual_root
-                .join(&sibling_subdir)
-                .join("node_modules")
-                .join(dep_name);
-            let link_parent = symlink_path.parent().unwrap_or(&pkg_nm_parent);
-            let target = pathdiff::diff_paths(&sibling_abs, link_parent)
-                .unwrap_or_else(|| sibling_abs.clone());
+            #[cfg(not(windows))]
+            let target = {
+                let virtual_root = pkg_nm_parent
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap_or(&pkg_nm_parent);
+                let sibling_abs = virtual_root
+                    .join(&sibling_subdir)
+                    .join("node_modules")
+                    .join(dep_name);
+                let link_parent = symlink_path.parent().unwrap_or(&pkg_nm_parent);
+                pathdiff::diff_paths(&sibling_abs, link_parent)
+                    .unwrap_or_else(|| sibling_abs.clone())
+            };
 
             // Staged materialization writes into `.tmp-<pid>-<id>/`,
             // then atomic-renames into `final_base_dir/<subdir>/`.
@@ -1061,13 +1091,61 @@ impl Linker {
     /// install; `can_clonedir` needs it to stat the source volume. We
     /// create it, then probe `trees/` against `pkg_nm_parent`. Returns
     /// the probe result. macOS-only caller.
+    ///
+    /// Both halves are run-invariant, so both are memoized. `create_dir_all`
+    /// of the store `trees/` root only needs to succeed once per process;
+    /// `can_clonedir`'s answer for a `(trees_dir, dst_parent)` pair is fixed
+    /// by the two volumes' `st_dev` + the destination filesystem type, none
+    /// of which change during a run. Uncached, the hoisted link pass calls
+    /// this once per package (hundreds of times), each repeating a
+    /// `create_dir_all` walk + two `metadata` + one `statfs` — pure
+    /// redundant syscalls after the first probe of a given parent. The
+    /// per-parent memo collapses them: a mostly-flat hoisted tree shares one
+    /// `node_modules` parent across most packages, so the probe runs a
+    /// handful of times instead of hundreds. Mirrors `detect_strategy_cross`'s
+    /// process-lifetime cache; the return value is byte-identical either way.
     #[cfg(target_os = "macos")]
     fn ensure_trees_dir_then_probe(&self, pkg_nm_parent: &Path) -> bool {
         let trees_dir = self.store.trees_dir();
-        if std::fs::create_dir_all(&trees_dir).is_err() {
-            return false;
+
+        // `trees/` creation: attempt once per process, memoize success.
+        static TREES_READY: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+        > = std::sync::OnceLock::new();
+        {
+            let ready = TREES_READY.get_or_init(Default::default);
+            let already = ready
+                .lock()
+                .expect("trees-ready cache poisoned")
+                .contains(&trees_dir);
+            if !already {
+                if std::fs::create_dir_all(&trees_dir).is_err() {
+                    return false;
+                }
+                ready
+                    .lock()
+                    .expect("trees-ready cache poisoned")
+                    .insert(trees_dir.clone());
+            }
         }
-        crate::clonedir::can_clonedir(trees_dir.as_path(), pkg_nm_parent)
+
+        // Probe answer keyed on (trees_dir, dst_parent) for the process
+        // lifetime. First-write-wins so a concurrent linker can't clobber.
+        type ProbeKey = (PathBuf, PathBuf);
+        static PROBE_CACHE: std::sync::OnceLock<
+            std::sync::RwLock<std::collections::HashMap<ProbeKey, bool>>,
+        > = std::sync::OnceLock::new();
+        let key = (trees_dir.clone(), pkg_nm_parent.to_path_buf());
+        let cache = PROBE_CACHE.get_or_init(Default::default);
+        if let Some(hit) = cache.read().expect("probe cache poisoned").get(&key) {
+            return *hit;
+        }
+        let result = crate::clonedir::can_clonedir(trees_dir.as_path(), pkg_nm_parent);
+        *cache
+            .write()
+            .expect("probe cache poisoned")
+            .entry(key)
+            .or_insert(result)
     }
 
     /// Build the extracted-tree clone source for a package at

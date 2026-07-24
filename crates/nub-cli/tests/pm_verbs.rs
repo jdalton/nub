@@ -124,6 +124,70 @@ const IS_POSITIVE_PACKAGE_LOCK: &str = r#"{
 }
 "#;
 
+/// A minimal npm lockfile where `demo-plugin` declares a peer on `demo-host`,
+/// with both as direct deps. An organic pnpm-lock keys the plugin as
+/// `demo-plugin@1.0.0(demo-host@1.0.0)`; the #453 bug wrote a bare
+/// `demo-plugin@1.0.0`. `import` reads peer data straight from the lockfile —
+/// no registry — so synthetic package names exercise the pass fully offline.
+/// bun.lock counterpart of [`PEER_DEP_PACKAGE_LOCK`]: ajv@6.12.6 +
+/// ajv-keywords@3.5.2 (a real published peer pair, captured from `bun install`).
+/// Exercises the same import peer pass through the BUN parser, whose
+/// peer-dependency plumbing is separate from the npm one.
+const AJV_PEER_BUN_LOCK: &str = r#"{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "fixture",
+      "dependencies": {
+        "ajv": "6.12.6",
+        "ajv-keywords": "3.5.2",
+      },
+    },
+  },
+  "packages": {
+    "ajv": ["ajv@6.12.6", "", { "dependencies": { "fast-deep-equal": "^3.1.1", "fast-json-stable-stringify": "^2.0.0", "json-schema-traverse": "^0.4.1", "uri-js": "^4.2.2" } }, "sha512-j3fVLgvTo527anyYyJOGTYJbG+vnnQYvE0m5mmkc1TK+nxAppkCLMIL0aZ4dblVCNoGShhm+kzE4ZUykBoMg4g=="],
+
+    "ajv-keywords": ["ajv-keywords@3.5.2", "", { "peerDependencies": { "ajv": "^6.9.1" } }, "sha512-5p6WTN0DdTGVQk6VjcEju19IgaHudalcfabD7yhDGeA6bcQnmL+CpveLJq/3hvfwd1aof6L386Ougkx6RfyMIQ=="],
+
+    "fast-deep-equal": ["fast-deep-equal@3.1.3", "", {}, "sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q=="],
+
+    "fast-json-stable-stringify": ["fast-json-stable-stringify@2.1.0", "", {}, "sha512-lhd/wF+Lk98HZoTCtlVraHtfh5XYijIjalXck7saUtuanSDyLMxnHhSXEDJqHxD7msR8D0uCmqlkwjCV8xvwHw=="],
+
+    "json-schema-traverse": ["json-schema-traverse@0.4.1", "", {}, "sha512-xbbCH5dCYU5T8LcEhhuh7HJ88HXuW3qsI3Y0zOZFKfZEHcpWiHU/Jxzk629Brsab/mMiHQti9wMP+845RPe3Vg=="],
+
+    "punycode": ["punycode@2.3.1", "", {}, "sha512-vYt7UD1U9Wg6138shLtLOvdAu+8DsC/ilFtEVHcH+wydcSpNE20AfSOduf6MkRFahL5FY7X1oU7nKVZFtfq8Fg=="],
+
+    "uri-js": ["uri-js@4.4.1", "", { "dependencies": { "punycode": "^2.1.0" } }, "sha512-7rKUyy33Q1yc98pQ1DAmLtwX109F7TIfWlW1Ydo8Wl1ii1SeHieeh0HHfPeL2fMXK6z0s8ecKs9frCuLJvndBg=="],
+  }
+}"#;
+
+const PEER_DEP_PACKAGE_LOCK: &str = r#"{
+  "name": "fixture",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "fixture",
+      "version": "1.0.0",
+      "dependencies": { "demo-plugin": "1.0.0", "demo-host": "1.0.0" }
+    },
+    "node_modules/demo-host": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/demo-host/-/demo-host-1.0.0.tgz",
+      "integrity": "sha512-8ND1j3y9/HP94TOvGzr69/FgbkX2ruOldhLEsTWwcJVfo4oRjwemJmJxt7RJkKYH8tz7vYBP9JcKQY8CLuJ90Q=="
+    },
+    "node_modules/demo-plugin": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/demo-plugin/-/demo-plugin-1.0.0.tgz",
+      "integrity": "sha512-8ND1j3y9/HP94TOvGzr69/FgbkX2ruOldhLEsTWwcJVfo4oRjwemJmJxt7RJkKYH8tz7vYBP9JcKQY8CLuJ90Q==",
+      "peerDependencies": { "demo-host": "^1.0.0" }
+    }
+  }
+}
+"#;
+
 /// `nub add` then `nub rm` (alias) round-trip on a truly-fresh project: add
 /// persists the dep + writes nub's neutral `nub.lock` + links node_modules;
 /// remove strips the dep from the manifest again. Both outputs brand-clean.
@@ -419,6 +483,39 @@ fn dlx_installs_and_runs_a_bin_from_a_scratch_project() {
     );
 }
 
+/// dlx/create children carry the role-aware `npm_config_user_agent` (pnpm
+/// parity) — create-* scaffolders sniff it to emit the invoking PM's commands
+/// and fall back to npm-mode when it's absent.
+#[test]
+#[ignore = "network: installs uuid into a dlx scratch project"]
+fn dlx_child_sees_nub_user_agent() {
+    if !registry_reachable() {
+        eprintln!("skipping: registry.npmjs.org unreachable");
+        return;
+    }
+    let dir = pm_tmpdir("dlxua");
+    let out = run_nub(
+        &dir,
+        &[
+            "dlx",
+            "--shell-mode",
+            "-p",
+            "uuid",
+            "node -p process.env.npm_config_user_agent",
+        ],
+    );
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    assert!(
+        out.stdout.contains("nub/"),
+        "dlx child must see a nub-first user agent, got: {}",
+        out.stdout
+    );
+}
+
 /// The yarn write gate on the mutating daily drivers: a yarn project refuses
 /// add/remove/update/dedupe outright (no network — the gate is a pre-flight),
 /// yarn.lock stays byte-identical, and `dedupe --check` is still allowed
@@ -481,6 +578,73 @@ fn yarn_gate_refuses_mutating_verbs_and_names_the_remedy() {
     );
 }
 
+/// Workspace `link:` deps must not surface in dedupe's diff (#494): the
+/// lockfile parser synthesizes `<name>@link+<hash>` package entries that a
+/// fresh resolve never produces, so dedupe reported every workspace link as
+/// "removed" on each run — while the lockfile stayed byte-identical (the
+/// writer never serializes links) and `--check` failed forever. Offline by
+/// construction: the fixture's only deps are workspace members.
+#[test]
+fn dedupe_ignores_workspace_links_and_check_passes() {
+    let dir = pm_tmpdir("dedupe-ws");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"fixture","private":true,"devDependencies":{"@repro/a":"workspace:*"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\n",
+    )
+    .unwrap();
+    for (rel, manifest) in [
+        (
+            "packages/a",
+            r#"{"name":"@repro/a","version":"1.0.0","dependencies":{"@repro/b":"workspace:*"}}"#,
+        ),
+        ("packages/b", r#"{"name":"@repro/b","version":"1.0.0"}"#),
+    ] {
+        let pkg = dir.join(rel);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("package.json"), manifest).unwrap();
+    }
+
+    let (xdg_data, xdg_cache) = (pm_tmpdir("dedupe-ws-data"), pm_tmpdir("dedupe-ws-cache"));
+    let install = run_nub_with(&dir, &["install"], &xdg_data, &xdg_cache);
+    assert_eq!(
+        install.code, 0,
+        "stdout: {}\nstderr: {}",
+        install.stdout, install.stderr
+    );
+    let lock_before = std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap();
+
+    let dedupe = run_nub_with(&dir, &["dedupe"], &xdg_data, &xdg_cache);
+    assert_eq!(
+        dedupe.code, 0,
+        "stdout: {}\nstderr: {}",
+        dedupe.stdout, dedupe.stderr
+    );
+    assert!(
+        dedupe.combined().contains("already deduped"),
+        "workspace links must not be reported as dedupe changes: {}",
+        dedupe.combined()
+    );
+    dedupe.assert_brand_clean();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap(),
+        lock_before,
+        "dedupe must not change the lockfile"
+    );
+
+    let check = run_nub_with(&dir, &["dedupe", "--check"], &xdg_data, &xdg_cache);
+    assert_eq!(
+        check.code,
+        0,
+        "dedupe --check must pass on a deduped workspace: {}",
+        check.combined()
+    );
+}
+
 /// `nub import` converts a foreign lockfile to pnpm-lock.yaml (nub's
 /// canonical format — never aube-lock.yaml), refuses a second run without
 /// `--force`, and works fully offline.
@@ -531,6 +695,78 @@ fn import_converts_package_lock_to_pnpm_lock() {
     );
     let forced = run_nub(&dir, &["import", "--force"]);
     assert_eq!(forced.code, 0, "stderr: {}", forced.stderr);
+}
+
+/// Regression for #453: importing a suffix-less source (npm/bun) must run the
+/// peer-context pass so the written pnpm-lock carries peer suffixes. The install
+/// path skips that pass for pnpm incumbents, assuming a pnpm-lock already has
+/// them; a bare `demo-plugin@1.0.0` would leave the store-resident plugin with
+/// no peer sibling under the isolated layout and fail at runtime with
+/// `Cannot find package 'demo-host'`.
+#[test]
+fn import_writes_peer_suffixes_for_suffixless_source() {
+    let dir = pm_tmpdir("import-peer");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"fixture","version":"1.0.0","dependencies":{"demo-plugin":"1.0.0","demo-host":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("package-lock.json"), PEER_DEP_PACKAGE_LOCK).unwrap();
+
+    let out = run_nub(&dir, &["import"]);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    let lock = std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains("demo-plugin@1.0.0(demo-host@1.0.0)"),
+        "imported pnpm-lock must peer-suffix the plugin key (#453): {lock}"
+    );
+}
+
+/// Same guarantee through the BUN lockfile parser: a real published peer pair
+/// (ajv-keywords peers on ajv) must come out suffixed with the resolved peer
+/// mirrored into the snapshot's dependencies — the edge that gives the
+/// store-resident copy its sibling link under the isolated layout (#453).
+#[test]
+fn import_writes_peer_suffixes_for_bun_lock_source() {
+    let dir = pm_tmpdir("import-peer-bun");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"fixture","version":"1.0.0","dependencies":{"ajv":"6.12.6","ajv-keywords":"3.5.2"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("bun.lock"), AJV_PEER_BUN_LOCK).unwrap();
+
+    let out = run_nub(&dir, &["import"]);
+    assert_eq!(
+        out.code, 0,
+        "stdout: {}\nstderr: {}",
+        out.stdout, out.stderr
+    );
+    let lock = std::fs::read_to_string(dir.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains("ajv-keywords@3.5.2(ajv@6.12.6)"),
+        "bun-sourced import must carry the peer-context suffix: {lock}"
+    );
+    // Bound the check to ajv-keywords' OWN snapshot block: split on its
+    // suffixed key (unique to the snapshots section — the packages key stays
+    // bare), then cut at the blank line that separates snapshot entries. The
+    // whole-file remainder would let a peer edge that landed on the wrong
+    // snapshot still pass.
+    let snapshot = lock
+        .split("ajv-keywords@3.5.2(ajv@6.12.6):")
+        .nth(1)
+        .unwrap_or("")
+        .split("\n\n")
+        .next()
+        .unwrap_or("");
+    assert!(
+        snapshot.contains("ajv: 6.12.6"),
+        "resolved peer must be mirrored into ajv-keywords' snapshot deps: {snapshot}"
+    );
 }
 
 /// `nub link` (register) → `nub link <name>` (consume) → `nub unlink <name>`
@@ -607,18 +843,20 @@ fn verb_help_is_rebranded_and_exits_zero() {
     }
 }
 
-/// `init` is reserved for nub's own project init: not an engine verb, not a
-/// PM redirect — the answer names the coming nub feature and nothing else.
+/// `init` is nub's own project scaffolder (src/init.rs), never an engine verb
+/// or a PM redirect. In a dir that already has a manifest it refuses with
+/// nub's own conflict message — no engine routing, no "pnpm init" spelling.
+/// The scaffold contract itself lives in tests/init_cmd.rs.
 #[test]
-fn init_is_reserved_and_answers_with_the_coming_note() {
+fn init_is_nub_own_and_never_redirects_to_a_pm() {
     let dir = pm_tmpdir("init");
     std::fs::write(dir.join("package.json"), r#"{"name":"init-fixture"}"#).unwrap();
-    let out = run_nub(&dir, &["init"]);
-    assert_ne!(out.code, 0, "init must error until nub's own init ships");
+    let out = run_nub(&dir, &["init", "-y", "--no-install"]);
+    assert_ne!(out.code, 0, "init must refuse over an existing manifest");
     out.assert_brand_clean();
     assert!(
-        out.stderr.contains("nub's own project init is coming"),
-        "the message must name the coming nub feature: {}",
+        out.stderr.contains("refusing to overwrite"),
+        "the refusal is nub's own conflict message: {}",
         out.stderr
     );
     assert!(

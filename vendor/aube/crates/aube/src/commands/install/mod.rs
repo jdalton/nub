@@ -7,6 +7,7 @@ use std::io::Write;
 mod advisory;
 mod args;
 mod bin_linking;
+pub(crate) mod control;
 mod critical_path;
 mod default_trust;
 mod delta;
@@ -20,6 +21,7 @@ mod layout;
 mod lifecycle;
 mod link;
 mod lockfile_dir;
+mod lockfile_write_overlap;
 mod materialize;
 // `pub` (not `pub(crate)`) so an embedder whose `current_exe()` is the binary
 // the lazy node-gyp shim re-execs can reach `ensure_cached` /
@@ -38,6 +40,10 @@ mod workspace;
 use advisory::resolve_osv_routing_settings;
 pub use args::{InstallArgs, InstallOptions};
 pub(crate) use bin_linking::{PkgJsonCache, link_dep_bins, materialized_pkg_dir};
+pub use control::{
+    InstallControl, InstallEvent, InstallOutputLevel, InstallOutputMode, InstallPhase,
+    InstallProgressSnapshot, InstallReporter,
+};
 pub(crate) use default_trust::DefaultTrustFloor;
 pub use dep_selection::DepSelection;
 pub(super) use fetch::fetch_packages;
@@ -54,14 +60,17 @@ use lifecycle::{
     resolve_link_strategy, run_import_on_blocking, run_root_lifecycle, validate_required_scripts,
 };
 use lockfile_dir::{
-    parse_lockfile_dir_remapped, parse_lockfile_dir_remapped_with_kind, write_lockfile_dir_remapped,
+    parse_lockfile_dir_remapped_with_kind_and_options, write_lockfile_dir_remapped,
 };
 use materialize::{
     GvsPrewarmInputs, combine_install_pipeline_errors, materialize_channel, spawn_gvs_prewarm,
 };
 pub(crate) use settings::PeerDependencyRules;
+pub(crate) use settings::resolve_minimum_release_age;
 pub(crate) use settings::{ResolverConfigInputs, configure_resolver, finalize_lockfile_graph};
-pub(crate) use side_effects_cache::{SideEffectsCacheConfig, side_effects_cache_root};
+pub(crate) use side_effects_cache::{
+    SideEffectsCacheConfig, SideEffectsCacheLocation, side_effects_cache_root,
+};
 
 use settings::{
     check_unmet_peers, default_lockfile_network_concurrency, default_streaming_network_concurrency,
@@ -152,6 +161,103 @@ pub(crate) fn warm_load_index(
 const TRUST_POLICY_VALIDATION_CACHE_DIR: &str = "trust-policy-v1";
 const TRUST_POLICY_VALIDATION_CACHE_TTL: std::time::Duration =
     std::time::Duration::from_secs(5 * 60);
+
+#[cfg(test)]
+mod reentrancy_tests {
+    use super::*;
+
+    fn explicit_options(project_dir: &std::path::Path) -> InstallOptions {
+        let mut options = InstallOptions::with_mode(FrozenMode::Prefer);
+        options.project_dir = Some(project_dir.to_path_buf());
+        options.ignore_scripts = true;
+        options.skip_root_lifecycle = true;
+        options.network_mode = aube_registry::NetworkMode::Offline;
+        options
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_directory_installs_can_run_concurrently() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(second.path().join("package.json"), "{}\n").unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            run(explicit_options(first.path())),
+            run(explicit_options(second.path())),
+        );
+
+        first_result.unwrap();
+        second_result.unwrap();
+        assert!(first.path().join("aube-lock.yaml").is_file());
+        assert!(second.path().join("aube-lock.yaml").is_file());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_installs_can_run_concurrently() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(second.path().join("package.json"), "{}\n").unwrap();
+        let first_lock = super::super::take_project_lock(first.path()).unwrap();
+        let second_lock = super::super::take_project_lock(second.path()).unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            run_with_project_lock(explicit_options(first.path()), &first_lock),
+            run_with_project_lock(explicit_options(second.path()), &second_lock),
+        );
+
+        first_result.unwrap();
+        second_result.unwrap();
+        assert!(first.path().join("aube-lock.yaml").is_file());
+        assert!(second.path().join("aube-lock.yaml").is_file());
+    }
+}
+
+pub(crate) fn package_build_is_allowed(
+    policy: &aube_scripts::BuildPolicy,
+    pkg: &aube_lockfile::LockedPackage,
+) -> bool {
+    let source_key = pkg.source_approval_key();
+    let git_repository_key = pkg.git_repository_approval_key();
+    matches!(
+        policy.decide_package_with_git_repository(
+            pkg.registry_name(),
+            &pkg.version,
+            source_key.as_deref(),
+            git_repository_key.as_deref(),
+        ),
+        aube_scripts::AllowDecision::Allow
+    )
+}
+
+/// Whether a package's virtual-store path must carry the engine fingerprint.
+///
+/// Deliberately a SUPERSET of the policy decision: the lifecycle phase also
+/// builds packages the `defaultTrust` floor clears, and a package that builds
+/// writes its artifacts into that directory. Keying only on an explicit allow
+/// would give a floor-built native addon an engine-agnostic path — shared
+/// across every project on the machine — so two Node majors would overwrite
+/// each other's `build/Release/*.node` there.
+///
+/// The floor's dynamic gates (advisory vetting, the cooling window) are
+/// deliberately NOT consulted: they only ever narrow what builds, and they are
+/// unknown at prewarm time, which computes these same hashes before the floor
+/// exists. Folding the engine for a package that then does not build costs a
+/// little store dedup; omitting it for one that does is the ABI bug.
+pub(crate) fn build_may_key_engine(
+    policy: &aube_scripts::BuildPolicy,
+    pkg: &aube_lockfile::LockedPackage,
+    default_trust_enabled: bool,
+) -> bool {
+    package_build_is_allowed(policy, pkg)
+        || (default_trust_enabled
+            // Registry-resolved only, matching `DefaultTrustFloor::trusts` so an
+            // alias or a file:/git package cannot borrow a listed name's bucket.
+            && pkg.local_source.is_none()
+            && !pkg.registry_git_hosted
+            && aube_scripts::is_default_trusted(pkg.registry_name()))
+}
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct TrustPolicyValidationStamp {
@@ -586,9 +692,42 @@ fn prewarm_host_filter_inputs(
 }
 
 pub async fn run(opts: InstallOptions) -> miette::Result<()> {
-    let mode = opts.mode;
     let cwd = resolve_project_cwd(&opts)?;
     let _lock = super::take_project_lock(&cwd)?;
+    run_scoped(opts, cwd).await
+}
+
+/// Run install while reusing a project lock owned by an outer command.
+///
+/// The guard determines the project directory, making lock reentrancy
+/// invocation-scoped: only the command that owns this project's lock can
+/// bypass acquisition. Concurrent installs for unrelated projects always
+/// acquire their own filesystem lock.
+pub(crate) async fn run_with_project_lock(
+    mut opts: InstallOptions,
+    lock: &super::project_lock::ProjectLock,
+) -> miette::Result<()> {
+    let cwd = lock.project_dir().to_path_buf();
+    opts.project_dir = Some(cwd.clone());
+    run_scoped(opts, cwd).await
+}
+
+async fn run_scoped(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Result<()> {
+    let control = opts.control.clone();
+    // Box the large install state machine before stacking task-local scopes.
+    // Keeping it inline overflowed a Tokio worker stack in the parallel-install
+    // regression test once runtime and script-settings scopes were added.
+    let install = Box::pin(run_inner(opts, cwd));
+    control::scope(
+        control,
+        crate::runtime::scope(aube_scripts::scope(crate::dep_chain::scope(install))),
+    )
+    .await
+}
+
+async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Result<()> {
+    opts.control.check_cancelled()?;
+    let mode = opts.mode;
     let start = std::time::Instant::now();
     let mut phase_timings = InstallPhaseTimings::from_env();
     aube_util::diag::spawn_concurrency_sampler();
@@ -599,8 +738,10 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         apply_force_state_reset(&cwd, &opts)?;
     }
     if !opts.dry_run
-        && try_install_fast_path(&cwd, &opts, mode, modules_cache_sweep_is_default(&cwd))
+        && let Some(total) =
+            try_install_fast_path(&cwd, &opts, mode, modules_cache_sweep_is_default(&cwd))?
     {
+        control::complete(total);
         return Ok(());
     }
 
@@ -633,6 +774,10 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // workspace's catalog. See `discover_catalogs` for the precedence
     // order.
     let workspace_catalogs = super::discover_catalogs(&cwd)?;
+    // pnpm `namedRegistries` alias→URL map (empty under any non-pnpm posture);
+    // routes `<alias>:<spec>` deps to the aliased registry. Same discovery
+    // shape as catalogs.
+    let named_registries = super::discover_named_registries(&cwd);
     let settings_ctx = files.ctx(&raw_workspace, &opts.env_snapshot, &opts.cli_flags);
     let dependency_policy = resolve_dependency_policy(&manifest, &settings_ctx);
     // Resolve the project's Node runtime before anything can spawn
@@ -645,16 +790,29 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     if opts.network_mode == aube_registry::NetworkMode::Offline {
         runtime_settings.network = aube_runtime::NetworkMode::Offline;
     }
+    let strict_store_integrity_setting = settings::resolve_strict_store_integrity(&settings_ctx);
+    let lockfile_parse_options = aube_lockfile::ParseOptions {
+        strict_store_integrity: strict_store_integrity_setting,
+    };
+    // An embedding host (mise) can supply the node runtime for lifecycle
+    // scripts. Seed it into the scoped runtime slot before `ensure` runs —
+    // `ensure` returns early when the slot is set, so aube skips its own
+    // runtime resolution and scripts spawn on the host's node.
+    if let Some(bin_dir) = &opts.embedder_node_bin_dir {
+        crate::runtime::seed_embedder_node(bin_dir.clone()).await;
+    }
     if !opts.dry_run {
         crate::runtime::ensure(
             &cwd,
             Some(&manifest),
             runtime_settings,
-            crate::runtime::lockfile_node_pin(&cwd, &manifest).as_ref(),
+            crate::runtime::lockfile_node_pin(&cwd, &manifest, lockfile_parse_options).as_ref(),
         )
         .await?;
     }
-    super::configure_script_settings(&cwd, &settings_ctx, Some("install"));
+    if !opts.ignore_scripts {
+        super::configure_script_settings(&cwd, &settings_ctx, Some("install"));
+    }
 
     let layout::InstallLayoutConfig {
         lockfile_dir,
@@ -698,7 +856,6 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     let network_concurrency_setting = resolve_network_concurrency(&settings_ctx);
     let link_concurrency_setting = resolve_link_concurrency(&settings_ctx);
     let verify_store_integrity_setting = resolve_verify_store_integrity(&settings_ctx);
-    let strict_store_integrity_setting = settings::resolve_strict_store_integrity(&settings_ctx);
     let strict_store_pkg_content_check_setting =
         resolve_strict_store_pkg_content_check(&settings_ctx);
     let side_effects_cache_setting = resolve_side_effects_cache(&settings_ctx);
@@ -809,6 +966,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // *no* output other than the bar itself — everything else is tracing at
     // debug level, visible with `aube -v install`. Must be constructed after
     // any lifecycle script that writes to stderr.
+    control::check_cancelled()?;
     let prog = InstallProgress::try_new();
     let prog_ref = prog.as_ref();
 
@@ -872,6 +1030,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         &lockfile_dir,
         &lockfile_importer_key,
         &manifest,
+        lockfile_parse_options,
     )?;
     let lockfile_conflict_marker_warning_emitted = lockfile_pre_parse.is_none()
         && lockfile_enabled
@@ -879,6 +1038,20 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         && aube_lockfile::active_lockfile_has_conflict_markers(&lockfile_dir);
     let existing_for_resolver: Option<&aube_lockfile::LockfileGraph> =
         lockfile_pre_parse.as_ref().map(|(g, _)| g);
+
+    // The project's effective packageExtensions checksum, for the lockfile
+    // drift check. Computed only under an enforcing embedder (nub); standalone
+    // aube leaves it `None` and the drift check (gated on the same posture) is
+    // a no-op. Uses the same `effective_package_extensions` the stamp path
+    // does, so a fresh install and the drift check agree.
+    let effective_package_extensions_checksum =
+        if aube_util::engine_context().enforce_package_extensions_checksum {
+            aube_lockfile::pnpm::package_extensions_checksum(
+                &settings::effective_package_extensions(&manifest, &settings_ctx),
+            )
+        } else {
+            None
+        };
 
     // `--lockfile-only` short-circuit. Resolves (or reuses a fresh
     // lockfile), writes the new lockfile, and exits before any tarball
@@ -900,11 +1073,14 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 lockfile_dir: &lockfile_dir,
                 lockfile_importer_key: &lockfile_importer_key,
                 manifest: &manifest,
+                parse_options: lockfile_parse_options,
                 manifests: &manifests,
                 ws_config: &ws_config_shared,
                 workspace_catalogs: &workspace_catalogs,
                 is_workspace_project,
                 lockfile_pre_parse: lockfile_pre_parse.as_ref(),
+                effective_package_extensions_checksum: effective_package_extensions_checksum
+                    .clone(),
             })? {
                 Ok(_) => {}
                 Err(aube_lockfile::Error::NotFound(_)) => {
@@ -926,10 +1102,12 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             lockfile_dir: &lockfile_dir,
             lockfile_importer_key: &lockfile_importer_key,
             manifest: &manifest,
+            parse_options: lockfile_parse_options,
             manifests: &manifests,
             per_project_write_selection: per_project_write_selection.as_ref(),
             ws_config: &ws_config_shared,
             workspace_catalogs: &workspace_catalogs,
+            named_registries: &named_registries,
             settings_ctx: &settings_ctx,
             dependency_policy: &dependency_policy,
             lockfile_pre_parse: lockfile_pre_parse.as_ref(),
@@ -1095,11 +1273,13 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         lockfile_dir: &lockfile_dir,
         lockfile_importer_key: &lockfile_importer_key,
         manifest: &manifest,
+        parse_options: lockfile_parse_options,
         manifests: &manifests,
         ws_config: &ws_config_shared,
         workspace_catalogs: &workspace_catalogs,
         is_workspace_project,
         lockfile_pre_parse: lockfile_pre_parse.as_ref(),
+        effective_package_extensions_checksum,
     })?;
 
     // Deprecation messages from freshly-resolved packages. Only the
@@ -1136,6 +1316,14 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // allowlist without a per-install OSV run — see
     // `wiki/commands/pm/supply-chain-posture.md` Decision 2.
     let lockfile_vetted;
+    // The cold-install lockfile write runs on a `spawn_blocking` task so it
+    // overlaps `filter_graph` + the link phase (see
+    // `lockfile_write_overlap`). The handle escapes the resolve match arm
+    // and is joined before `run_finalize_phase` re-reads the graph, so a
+    // write error still surfaces. `None` on every path that wrote inline
+    // (lockfile-matched fast path, killswitch disabled, `lockfile=false`,
+    // or after the rare catch-up integrity rewrite joined it early).
+    let mut lockfile_write_handle: Option<lockfile_write_overlap::LockfileWriteHandle> = None;
     let (graph, package_indices, cached_count, fetch_count) = match lockfile_result {
         Ok((mut graph, kind)) => {
             // Under `sharedWorkspaceLockfile=false` the project's own
@@ -1203,6 +1391,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
 
             // Lockfile path: the total is known upfront, so seed the overall
             // bar with the full package count and enter the fetch phase.
+            control::check_cancelled()?;
             if let Some(p) = prog_ref {
                 p.set_total(graph.packages.len());
                 p.set_phase("fetching");
@@ -1283,13 +1472,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             let network_mode = opts.network_mode;
             let cwd_for_client = cwd.clone();
 
-            let lock_node_version = crate::engines::effective_node_version(
-                aube_settings::resolved::node_version(&settings_ctx).as_deref(),
-            );
+            let lock_node_version = crate::engines::build_node_version();
             let lock_build_policy = std::sync::Arc::new(build_policy.clone());
             let lock_strategy = resolve_link_strategy(&cwd, &settings_ctx, planned_gvs)?;
             let (lock_patches, lock_patch_hashes) =
-                crate::patches::load_patches_for_linker(&cwd, &graph.patched_dependencies)?;
+                crate::patches::load_patches_for_linker(&cwd, &graph)?;
             let (lock_supported_architectures, lock_ignored_optional) =
                 prewarm_host_filter_inputs(&manifest, &ws_config_shared, &settings_ctx);
             let (lock_materialize_tx, lock_materialize_rx) = materialize_channel();
@@ -1304,6 +1491,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 patch_hashes: lock_patch_hashes,
                 node_version: lock_node_version,
                 build_policy: lock_build_policy,
+                default_trust_enabled,
                 use_global_virtual_store_override: prewarm_gvs_override,
                 virtual_store_dir: aube_dir.clone(),
                 supported_architectures: lock_supported_architectures,
@@ -1380,6 +1568,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 Some(joined) => joined.into_diagnostic()??,
                 None => unreachable!("trust-policy JoinSet had exactly one spawned task"),
             }
+            control::check_cancelled()?;
             // Gate: consume the OSV verdict that ran concurrently with
             // the download phase above. This `await` is strictly before
             // the link + finalize phases, so a `MAL-*` finding aborts
@@ -1407,6 +1596,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         {
             // No lockfile — resolve + fetch tarballs concurrently
             tracing::debug!("No lockfile found, resolving dependencies for {project_name}...");
+            control::check_cancelled()?;
             if let Some(p) = prog_ref {
                 // Seed the resolving-phase denominator floor from any
                 // existing lockfile on disk. In FrozenMode::Fix /
@@ -1420,10 +1610,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 // empty placeholder.
                 let lockfile_estimate =
                     existing_for_resolver.map(|g| g.packages.len()).or_else(|| {
-                        parse_lockfile_dir_remapped_with_kind(
+                        parse_lockfile_dir_remapped_with_kind_and_options(
                             &lockfile_dir,
                             &lockfile_importer_key,
                             &manifest,
+                            lockfile_parse_options,
                         )
                         .ok()
                         .map(|(g, _)| g.packages.len())
@@ -1438,9 +1629,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // await) can compute the same graph hashes the link phase
             // will. Keeping a single source of truth avoids any
             // subdir-name drift between prewarm and link step 1.
-            let node_version_for_prewarm = crate::engines::effective_node_version(
-                aube_settings::resolved::node_version(&settings_ctx).as_deref(),
-            );
+            let node_version_for_prewarm = crate::engines::build_node_version();
             let build_policy_for_prewarm = std::sync::Arc::new(build_policy.clone());
             let client =
                 std::sync::Arc::new(make_client(&cwd).with_network_mode(opts.network_mode));
@@ -1493,6 +1682,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             };
             super::run_pnpmfile_pre_resolution(&pnpmfile_paths, &cwd, existing_for_resolver)
                 .await?;
+            control::check_cancelled()?;
             let (read_package_host, read_package_forwarders) =
                 match crate::pnpmfile::ReadPackageHostChain::spawn(&pnpmfile_paths, &cwd)
                     .await
@@ -1511,6 +1701,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                     settings_ctx: &settings_ctx,
                     workspace_config: &ws_config_shared,
                     workspace_catalogs: &workspace_catalogs,
+                    named_registries: &named_registries,
                     minimum_release_age_override: opts.minimum_release_age_override,
                     // Same disambiguation as the `--lockfile-only` path:
                     // `None` only when no lockfile will be written, so
@@ -1586,7 +1777,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // spawned task. The install command reads it back after
             // `filter_graph` prunes the post-resolve graph.
             let fetch_deprecations_tx = deprecations.clone();
-            let fetch_handle = tokio::spawn(async move {
+            let fetch = Box::pin(async move {
                 /*
                  * Adaptive tarball concurrency. Loaded from the
                  * cross run persistent store when available so the
@@ -1825,7 +2016,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                         .map(|p| p.start_fetch(&pkg.name, &pkg.version));
                     let bytes_progress = fetch_progress.clone();
 
-                    handles.spawn(async move {
+                    handles.spawn(crate::dep_chain::scope_current(async move {
                         let _row = row;
                         let _diag_tar = aube_util::diag::Span::new(aube_util::diag::Category::Fetch, "tarball")
                             .with_meta_fn(|| format!(r#"{{"name":{},"version":{}}}"#,
@@ -1982,7 +2173,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                         }
 
                         Ok::<_, miette::Report>((dep_path, index, computed_integrity))
-                    });
+                    }));
                 }
 
                 // Collect all fetch results via JoinSet. Drop on
@@ -2010,6 +2201,9 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 }
                 Ok::<_, miette::Report>((indices, cached_count, fetch_count, computed_integrities))
             });
+            let fetch = crate::runtime::scope_current(fetch);
+            let fetch = aube_scripts::scope_current(fetch);
+            let fetch_handle = tokio::spawn(fetch);
 
             // Run resolution (this streams packages to the fetch coordinator).
             // `existing_for_resolver` is `Some` when Fix / Prefer parsed a
@@ -2073,10 +2267,23 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // YAML parse pass over the same 5-50 KB file.
             if let Some((prior, _)) = lockfile_pre_parse.as_ref() {
                 graph.overlay_metadata_from(prior);
-            } else if let Ok(prior) =
-                parse_lockfile_dir_remapped(&lockfile_dir, &lockfile_importer_key, &manifest)
-            {
+            } else if let Ok((prior, _)) = parse_lockfile_dir_remapped_with_kind_and_options(
+                &lockfile_dir,
+                &lockfile_importer_key,
+                &manifest,
+                lockfile_parse_options,
+            ) {
                 graph.overlay_metadata_from(&prior);
+            }
+            // A pnpm lockfile's patchedDependencies block describes the
+            // resolution that produced that lockfile; it is not authoritative
+            // after manifest/workspace drift forced a fresh resolve. Replace
+            // the metadata overlaid above with the current declarations so a
+            // deleted patch from the stale lockfile is neither read during
+            // materialization nor written back. This also prevents pnpm 11's
+            // hash-only scalar entries from being mistaken for file paths.
+            if matches!(source_kind_before, Some(aube_lockfile::LockfileKind::Pnpm)) {
+                graph.patched_dependencies = crate::patches::read_patched_dependencies(&cwd)?;
             }
             tracing::debug!("Resolved {} packages", graph.packages.len());
             // Seed the chain index for diagnostic enrichment. Any
@@ -2158,6 +2365,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 super::security_scanner::run_scanner(&scanner, &cwd, &scanner_packages).await?;
             }
 
+            control::check_cancelled()?;
             if let Some(p) = prog_ref {
                 p.set_phase("fetching");
             }
@@ -2182,7 +2390,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             let materialize_graph_arc = std::sync::Arc::new(graph.clone());
             let materialize_strategy = resolve_link_strategy(&cwd, &settings_ctx, planned_gvs)?;
             let (materialize_patches, materialize_patch_hashes) =
-                crate::patches::load_patches_for_linker(&cwd, &graph.patched_dependencies)?;
+                crate::patches::load_patches_for_linker(&cwd, &graph)?;
             let (prewarm_supported_architectures, prewarm_ignored_optional) =
                 prewarm_host_filter_inputs(&manifest, &ws_config_shared, &settings_ctx);
             let materialize_inputs = GvsPrewarmInputs {
@@ -2196,6 +2404,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 patch_hashes: materialize_patch_hashes,
                 node_version: node_version_for_prewarm.clone(),
                 build_policy: build_policy_for_prewarm.clone(),
+                default_trust_enabled,
                 use_global_virtual_store_override: prewarm_gvs_override,
                 virtual_store_dir: aube_dir.clone(),
                 supported_architectures: prewarm_supported_architectures,
@@ -2240,6 +2449,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 Some(joined) => joined.into_diagnostic()??,
                 None => unreachable!("OSV JoinSet had exactly one spawned task"),
             };
+            control::check_cancelled()?;
             let (canonical_indices, mut cached, mut fetched, computed_integrities) = fetch_result;
             tracing::debug!(
                 "phase:fetch {:.1?} ({fetched} packages, {cached} cached){}",
@@ -2292,6 +2502,18 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
             // default `aube-lock.yaml`. Skipped entirely when
             // `lockfile=false`.
             let write_kind = source_kind_before.unwrap_or(aube_lockfile::LockfileKind::Aube);
+            // pnpm persists a top-level `time:` block only under
+            // `resolution-mode=time-based`; every other mode writes a
+            // `time:`-free lockfile even when the resolver kept publish
+            // times in memory (minimumReleaseAge / trustPolicy / the
+            // defaultTrust floor). Decided once here so EVERY lockfile
+            // write below — the main overlapped/inline write and the
+            // catch-up integrity rewrite alike — routes its graph through
+            // `lockfile_graph_for_write(_, persist_times)` and cannot
+            // diverge on the `time:` axis (the integrity rewrite once
+            // wrote its own un-stripped clone, re-introducing `time:`).
+            let persist_times = settings::resolve_resolution_mode(&settings_ctx)
+                == aube_resolver::ResolutionMode::TimeBased;
             if lockfile_enabled {
                 // When `lockfileIncludeTarballUrl=true`, record the
                 // registry tarball URL on every registry-sourced
@@ -2356,42 +2578,53 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 // snapshot metadata (`optional: true`, `transitivePeerDependencies`)
                 // before the write and before the host-only `filter_graph` below.
                 crate::commands::prepare_resolved_graph_for_lockfile_write(&mut graph);
-                // pnpm persists a top-level `time:` block only under
-                // `resolution-mode=time-based`; in every other mode the
-                // lockfile stays `time:`-free even when the resolver kept
-                // publish times in memory for `minimumReleaseAge` /
-                // `trustPolicy` / the `defaultTrust` floor. Strip them on
-                // the writer's view (a clone) WITHOUT mutating the shared
-                // `graph` — the floor clones `graph` further down and
-                // still needs `graph.times`.
-                let persist_times = settings::resolve_resolution_mode(&settings_ctx)
-                    == aube_resolver::ResolutionMode::TimeBased;
+                // Strip `time:` on the writer's view (a clone) WITHOUT
+                // mutating the shared `graph` — the `defaultTrust` floor
+                // clones `graph` further down and still needs
+                // `graph.times`. Both write paths below consume this same
+                // view, so the overlapped write and the killswitch write
+                // stay byte-identical to each other.
                 let write_graph = lockfile_dir::lockfile_graph_for_write(&graph, persist_times);
-                if shared_workspace_lockfile || !has_workspace {
-                    let written_path = write_lockfile_dir_remapped(
-                        &lockfile_dir,
-                        &lockfile_importer_key,
+                // The serialize + reformat + atomic write is the slowest
+                // serial span before the linker (10-55 ms on large trees).
+                // When the overlap is on, hand it a clone of the prepared
+                // graph and run it on a blocking thread so it overlaps
+                // `filter_graph` + the link phase; the handle is joined
+                // before `run_finalize_phase`.
+                // `AUBE_DISABLE_LOCKFILE_WRITE_OVERLAP=1` reverts to the
+                // inline serial write — byte-identical output, same error
+                // point, and no extra graph clone (the pre-overlap cost).
+                if lockfile_write_overlap::overlap_enabled() {
+                    let write_inputs = lockfile_write_overlap::LockfileWriteInputs {
+                        // `into_owned` reuses the `times`-stripped clone when
+                        // one was made, so the task owns exactly the bytes the
+                        // inline path would have written and the strip costs
+                        // no second clone.
+                        graph: write_graph.into_owned(),
+                        manifest: manifest.clone(),
+                        manifests: manifests.clone(),
+                        lockfile_dir: lockfile_dir.clone(),
+                        lockfile_importer_key: lockfile_importer_key.clone(),
+                        cwd: cwd.clone(),
+                        write_kind,
+                        shared_workspace_lockfile,
+                        has_workspace,
+                        per_project_write_selection: per_project_write_selection.clone(),
+                    };
+                    lockfile_write_handle = Some(lockfile_write_overlap::spawn(write_inputs));
+                } else {
+                    // Killswitch-disabled inline write: borrow the call-site
+                    // values directly, same error point.
+                    lockfile_write_overlap::write_one(
                         &write_graph,
                         &manifest,
-                        write_kind,
-                    )
-                    .into_diagnostic()
-                    .wrap_err("failed to write lockfile")?;
-                    // Log the basename (matches the format resolve.bats and
-                    // similar tests assert against — e.g. "Wrote aube-lock.yaml").
-                    tracing::debug!(
-                        "Wrote {}",
-                        written_path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| written_path.display().to_string())
-                    );
-                } else {
-                    write_per_project_lockfiles(
-                        &cwd,
-                        &write_graph,
                         &manifests,
+                        &lockfile_dir,
+                        &lockfile_importer_key,
+                        &cwd,
                         write_kind,
+                        shared_workspace_lockfile,
+                        has_workspace,
                         per_project_write_selection.as_ref(),
                     )?;
                 }
@@ -2506,11 +2739,27 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                     apply_computed_integrities(&mut graph, &catchup_integrities);
                     if let Some(lock_graph) = lockfile_graph_for_integrity_rewrite.as_mut() {
                         apply_computed_integrities(lock_graph, &catchup_integrities);
+                        // The integrity rewrite overwrites the lockfile the
+                        // overlapped write produced. Join the in-flight write
+                        // first so the two never race the same atomic-write
+                        // rename and the on-disk result is the rewrite (the
+                        // serial ordering the inline path had: write, then
+                        // catch-up rewrite). Consumes the handle so the
+                        // post-match join is a no-op.
+                        if let Some(handle) = lockfile_write_handle.take() {
+                            lockfile_write_overlap::join(handle).await?;
+                        }
+                        // Same `time:`-strip the main write applied: this
+                        // rewrite overwrites that output, so it must honor
+                        // `persist_times` identically or it re-introduces a
+                        // `time:` block on non-time-based lockfiles.
+                        let lock_write_graph =
+                            lockfile_dir::lockfile_graph_for_write(lock_graph, persist_times);
                         if shared_workspace_lockfile || !has_workspace {
                             write_lockfile_dir_remapped(
                                 &lockfile_dir,
                                 &lockfile_importer_key,
-                                lock_graph,
+                                &lock_write_graph,
                                 &manifest,
                                 write_kind,
                             )
@@ -2519,7 +2768,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                         } else {
                             write_per_project_lockfiles(
                                 &cwd,
-                                lock_graph,
+                                &lock_write_graph,
                                 &manifests,
                                 write_kind,
                                 per_project_write_selection.as_ref(),
@@ -2645,7 +2894,12 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     let (jail_policy, jail_policy_warnings) =
         JailBuildPolicy::from_settings(&settings_ctx, &ws_config_shared);
     let node_version_override = aube_settings::resolved::node_version(&settings_ctx);
+    // Two questions with two answers: the `engines.node` check honors the
+    // validation-only `node-version` override; the ABI cache keys must reflect
+    // the Node that actually compiles the artifacts, which the override never
+    // switches.
     let node_version = crate::engines::effective_node_version(node_version_override.as_deref());
+    let build_node_version = crate::engines::build_node_version();
     crate::engines::run_checks(
         &aube_dir,
         &manifest,
@@ -2666,10 +2920,10 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // output across bar frames. Route through safe_eprintln which
     // pauses the bar and holds the terminal lock for atomic output.
     for w in &policy_warnings {
-        crate::progress::safe_eprintln(&format!("warn: {w}"));
+        control::output(InstallOutputLevel::Warning, None, w.to_string());
     }
     for w in &jail_policy_warnings {
-        crate::progress::safe_eprintln(&format!("warn: {w}"));
+        control::output(InstallOutputLevel::Warning, None, w.to_string());
     }
 
     // Built here (before linking) — the link phase needs it too: the
@@ -2703,7 +2957,8 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         manifests: &manifests,
         manifest: &manifest,
         build_policy: &build_policy,
-        node_version: node_version.as_deref(),
+        default_trust_enabled,
+        node_version: build_node_version.as_deref(),
         prewarm_graph_hashes: prewarm_graph_hashes.as_ref(),
         aube_dir: &aube_dir,
         modules_dir_name: &modules_dir_name,
@@ -2720,12 +2975,22 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         prog_ref,
         phase_timings: &mut phase_timings,
     })?;
+    // Join the overlapped lockfile write before finalize re-reads the
+    // graph. The write ran concurrently with the link phase above; a write
+    // error surfaces here (it is not dropped). `None` on every inline-write
+    // path, so this is a no-op there.
+    if let Some(handle) = lockfile_write_handle.take() {
+        lockfile_write_overlap::join(handle).await?;
+    }
     finalize::run_finalize_phase(finalize::FinalizePhaseInput {
         cwd: &cwd,
         settings_ctx: &settings_ctx,
         store: store.as_ref(),
         graph: &graph,
         graph_for_link: &graph_for_link,
+        manifest: &manifest,
+        ws_dirs: &ws_dirs,
+        has_workspace,
         manifests: &manifests,
         lifecycle_manifests: &lifecycle_manifests,
         direct_dep_info: &direct_dep_info,
@@ -2743,6 +3008,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         aube_dir: &aube_dir,
         virtual_store_dir_max_length,
         child_concurrency,
+        node_version: build_node_version.as_deref(),
         side_effects_cache_setting,
         side_effects_cache_readonly_setting,
         strict_dep_builds_setting,
@@ -2775,6 +3041,59 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod build_may_key_engine_tests {
+    use super::*;
+
+    fn pkg(name: &str) -> aube_lockfile::LockedPackage {
+        aube_lockfile::LockedPackage {
+            name: name.into(),
+            version: "1.0.0".into(),
+            dep_path: format!("{name}@1.0.0"),
+            ..Default::default()
+        }
+    }
+
+    fn empty_policy() -> aube_scripts::BuildPolicy {
+        aube_scripts::BuildPolicy::from_config(&BTreeMap::new(), &[], &[], false).0
+    }
+
+    #[test]
+    fn floor_trusted_package_keys_the_engine_without_an_explicit_allow() {
+        // The regression: the lifecycle phase builds `better-sqlite3` off the
+        // default-trust floor, but the virtual-store path folded the engine
+        // only for an explicitly allowed package — so its native build landed
+        // in a machine-global directory shared by every Node major.
+        let policy = empty_policy();
+        assert!(
+            build_may_key_engine(&policy, &pkg("better-sqlite3"), true),
+            "a floor-built package writes native artifacts and must key the engine"
+        );
+        assert!(
+            !build_may_key_engine(&policy, &pkg("better-sqlite3"), false),
+            "with the floor off the package cannot build, so the path stays engine-agnostic"
+        );
+        assert!(
+            !build_may_key_engine(&policy, &pkg("left-pad"), true),
+            "an unlisted package the floor never trusts must not fold the engine"
+        );
+    }
+
+    #[test]
+    fn floor_trust_does_not_extend_to_non_registry_sources() {
+        // Mirrors `DefaultTrustFloor::trusts`: an alias or a file:/git package
+        // must not borrow a listed name's bucket.
+        let policy = empty_policy();
+        let mut local = pkg("better-sqlite3");
+        local.local_source = Some(aube_lockfile::LocalSource::Directory("../vendored".into()));
+        assert!(!build_may_key_engine(&policy, &local, true));
+
+        let mut hosted = pkg("better-sqlite3");
+        hosted.registry_git_hosted = true;
+        assert!(!build_may_key_engine(&policy, &hosted, true));
+    }
 }
 
 #[cfg(test)]

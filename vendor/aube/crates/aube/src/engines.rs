@@ -87,25 +87,45 @@ pub fn resolve_node_version(override_: Option<&str>) -> Option<String> {
     PROBED.get_or_init(probe_node_version).clone()
 }
 
-/// The Node version aube should report for engines checks once
-/// runtime switching is in play:
+/// The Node the install's build artifacts are actually compiled by. This is
+/// what every ABI-sensitive cache key must fold in — the virtual-store path,
+/// the side-effects cache and its marker, the delta and freshness gates:
 ///
-/// 1. an explicit `node-version` `.npmrc` override always wins
-///    (validation-only knob, pnpm semantics);
-/// 2. otherwise the resolved runtime context's version — engines must
-///    validate the node scripts will actually run on, not whatever
-///    PATH happened to carry;
+/// 1. the resolved runtime context's version — the Node scripts will run on;
+/// 2. otherwise the version an embedder provisioned
+///    ([`EngineContext::runtime_node_version`]) — the same, for a host that
+///    owns provisioning itself and so leaves the resolver inert;
 /// 3. otherwise the memoized `node --version` probe.
-pub fn effective_node_version(override_: Option<&str>) -> Option<String> {
-    if override_.is_some() {
-        return resolve_node_version(override_);
-    }
+///
+/// Deliberately NOT the `.npmrc` `node-version` override: that knob is
+/// validation-only (pnpm semantics — it never switches the runtime scripts
+/// run on), so letting it name the engine would key artifacts to a Node that
+/// never compiled them. Use [`effective_node_version`] where the override is
+/// meant to win — the `engines.node` check and `doctor`.
+///
+/// [`EngineContext::runtime_node_version`]: aube_util::EngineContext::runtime_node_version
+pub fn build_node_version() -> Option<String> {
     if let Some(rt) = crate::runtime::current()
         && let Some(v) = &rt.version
     {
         return Some(v.clone());
     }
+    if let Some(v) = aube_util::engine_context().runtime_node_version {
+        return Some(v);
+    }
     resolve_node_version(None)
+}
+
+/// The Node version for the `engines.node` check and `doctor` display: the
+/// `.npmrc` `node-version` override wins (validation-only knob, pnpm
+/// semantics), else [`build_node_version`]. Do NOT use this to key an
+/// ABI-sensitive cache — the override does not switch the runtime, so it would
+/// mis-key. That is [`build_node_version`]'s job.
+pub fn effective_node_version(override_: Option<&str>) -> Option<String> {
+    if override_.is_some() {
+        return resolve_node_version(override_);
+    }
+    build_node_version()
 }
 
 fn probe_node_version() -> Option<String> {
@@ -784,6 +804,50 @@ mod tests {
             result.is_err(),
             "permission-denied read must propagate, got {result:?}"
         );
+    }
+
+    #[test]
+    fn embedder_node_version_outranks_probe_but_not_override() {
+        // An embedder that owns Node provisioning leaves aube's resolver inert,
+        // so without this tier `effective_node_version` falls to the ambient
+        // PATH probe — and the GVS engine fingerprint keyed off it then names a
+        // different node than the one lifecycle scripts build against. The
+        // `.npmrc` `node-version` knob still outranks it (pnpm semantics).
+        let prev = aube_util::engine_context().runtime_node_version;
+        aube_util::update_engine_context(|c| c.runtime_node_version = Some("18.19.0".into()));
+        assert_eq!(
+            effective_node_version(None).as_deref(),
+            Some("18.19.0"),
+            "the embedder's provisioned version must win over the PATH probe"
+        );
+        assert_eq!(
+            effective_node_version(Some("v20.11.0")).as_deref(),
+            Some("20.11.0"),
+            "an explicit `node-version` override must still win"
+        );
+        aube_util::update_engine_context(|c| c.runtime_node_version = prev);
+    }
+
+    #[test]
+    fn build_node_version_ignores_the_validation_only_override() {
+        // `build_node_version` keys the ABI-sensitive caches, so it must reflect
+        // the Node that actually compiles — the provisioned/resolved one — never
+        // the `.npmrc` `node-version` knob, which is validation-only and never
+        // switches the runtime. `effective_node_version` still honors the
+        // override for the `engines.node` check.
+        let prev = aube_util::engine_context().runtime_node_version;
+        aube_util::update_engine_context(|c| c.runtime_node_version = Some("22.15.0".into()));
+        assert_eq!(
+            build_node_version().as_deref(),
+            Some("22.15.0"),
+            "the build version is the provisioned Node, regardless of any override"
+        );
+        assert_eq!(
+            effective_node_version(Some("v18.19.0")).as_deref(),
+            Some("18.19.0"),
+            "the validation path still honors the override — the split is intentional"
+        );
+        aube_util::update_engine_context(|c| c.runtime_node_version = prev);
     }
 
     #[test]

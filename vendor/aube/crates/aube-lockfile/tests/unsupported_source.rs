@@ -46,6 +46,7 @@ static STRICT: Embedder = Embedder {
     primer_ttl: None,
     cpu_budget: None,
     tty_progress: false,
+    rich_update_picker: false,
     strict_unsupported_source: true,
     warm_trust_revalidate: true,
     trust_policy_ignore_after_default: None,
@@ -206,6 +207,177 @@ fn clean_classic_lockfile_does_not_fatal() {
         ("yarn.lock", lock),
     ])
     .expect("a clean lockfile must not fatal under strict");
+    assert!(graph.importers["."].iter().any(|d| d.name == "lodash"));
+    assert!(graph.importers["."].iter().any(|d| d.name == "link-dep"));
+}
+
+// ─── bun.lock — the by-name-walk adaptation of the same policy ───
+
+/// A syntactically-valid sha512 SRI for hand-authored registry entries.
+fn sri() -> String {
+    format!("sha512-{}==", "a".repeat(86))
+}
+
+#[test]
+fn bun_unknown_protocol_dep_is_a_fatal() {
+    aube_util::set_embedder(&STRICT);
+    let lock = r#"{
+  "lockfileVersion": 1,
+  "workspaces": { "": { "dependencies": { "foo": "exotic:bar" } } },
+  "packages": { "foo": ["foo@exotic:bar", {}] }
+}"#;
+    let r = parse(&[
+        (
+            "package.json",
+            r#"{"name":"t","dependencies":{"foo":"exotic:bar"}}"#,
+        ),
+        ("bun.lock", lock),
+    ]);
+    assert_unsupported(r, "exotic");
+}
+
+#[test]
+fn bun_optional_unknown_protocol_warns_and_is_skipped() {
+    aube_util::set_embedder(&STRICT);
+    let lock = r#"{
+  "lockfileVersion": 1,
+  "workspaces": { "": { "optionalDependencies": { "foo": "exotic:bar" } } },
+  "packages": { "foo": ["foo@exotic:bar", {}] }
+}"#;
+    let graph = parse(&[
+        (
+            "package.json",
+            r#"{"name":"t","optionalDependencies":{"foo":"exotic:bar"}}"#,
+        ),
+        ("bun.lock", lock),
+    ])
+    .expect("an optional unsupported bun dep must NOT be fatal");
+    assert!(
+        !graph.importers["."].iter().any(|d| d.name == "foo"),
+        "the optional unsupported dep should be dropped from the importer"
+    );
+    assert_eq!(
+        graph.skipped_optional_dependencies["."]
+            .get("foo")
+            .map(String::as_str),
+        Some("exotic:bar"),
+        "the dropped optional must be recorded as skipped for drift tolerance"
+    );
+}
+
+#[test]
+fn bun_transitive_unknown_protocol_dep_is_a_fatal() {
+    // The bun-specific edge shape: transitive deps resolve BY NAME through
+    // the nested-key walk, not per-spec — the walk must land on the
+    // withheld entry and fatal, instead of silently dropping the edge.
+    aube_util::set_embedder(&STRICT);
+    let lock = format!(
+        r#"{{
+  "lockfileVersion": 1,
+  "workspaces": {{ "": {{ "dependencies": {{ "a": "^1.0.0" }} }} }},
+  "packages": {{
+    "a": ["a@1.0.0", "", {{ "dependencies": {{ "foo": "exotic:bar" }} }}, "{0}"],
+    "foo": ["foo@exotic:bar", {{}}]
+  }}
+}}"#,
+        sri()
+    );
+    let r = parse(&[
+        (
+            "package.json",
+            r#"{"name":"t","dependencies":{"a":"^1.0.0"}}"#,
+        ),
+        ("bun.lock", &lock),
+    ]);
+    assert_unsupported(r, "exotic");
+}
+
+#[test]
+fn bun_hoisted_entry_does_not_mask_a_withheld_nested_one() {
+    // The nested-key walk must treat a withheld `parent/bar` as still
+    // occupying its position in bun's nesting resolution: falling through
+    // to the supported hoisted `bar` would silently hand parent the WRONG
+    // version — the exact divergence the policy refuses.
+    aube_util::set_embedder(&STRICT);
+    let lock = format!(
+        r#"{{
+  "lockfileVersion": 1,
+  "workspaces": {{ "": {{ "dependencies": {{ "parent": "^1.0.0", "bar": "^2.0.0" }} }} }},
+  "packages": {{
+    "parent": ["parent@1.0.0", "", {{ "dependencies": {{ "bar": "exotic:x" }} }}, "{0}"],
+    "parent/bar": ["bar@exotic:x", {{}}],
+    "bar": ["bar@2.0.0", "", {{}}, "{0}"]
+  }}
+}}"#,
+        sri()
+    );
+    let r = parse(&[
+        (
+            "package.json",
+            r#"{"name":"t","dependencies":{"parent":"^1.0.0","bar":"^2.0.0"}}"#,
+        ),
+        ("bun.lock", &lock),
+    ]);
+    assert_unsupported(r, "exotic");
+}
+
+#[test]
+fn bun_transitive_optional_unknown_protocol_is_skipped() {
+    aube_util::set_embedder(&STRICT);
+    let lock = format!(
+        r#"{{
+  "lockfileVersion": 1,
+  "workspaces": {{ "": {{ "dependencies": {{ "a": "^1.0.0" }} }} }},
+  "packages": {{
+    "a": ["a@1.0.0", "", {{ "optionalDependencies": {{ "foo": "exotic:bar" }} }}, "{0}"],
+    "foo": ["foo@exotic:bar", {{}}]
+  }}
+}}"#,
+        sri()
+    );
+    let graph = parse(&[
+        (
+            "package.json",
+            r#"{"name":"t","dependencies":{"a":"^1.0.0"}}"#,
+        ),
+        ("bun.lock", &lock),
+    ])
+    .expect("a transitive OPTIONAL unsupported bun dep must NOT be fatal");
+    let a = graph
+        .packages
+        .values()
+        .find(|p| p.name == "a")
+        .expect("a must be in the graph");
+    assert!(
+        !a.dependencies.contains_key("foo"),
+        "the unsupported optional edge should be dropped, not resolved"
+    );
+}
+
+#[test]
+fn clean_bun_lockfile_does_not_fatal() {
+    // Anti-regression twin of the classic case: every recognized bun source
+    // (registry pin, link) must still parse under strict — no false positive.
+    aube_util::set_embedder(&STRICT);
+    let lock = format!(
+        r#"{{
+  "lockfileVersion": 1,
+  "workspaces": {{ "": {{ "dependencies": {{ "lodash": "^4.17.0", "link-dep": "link:./local" }} }} }},
+  "packages": {{
+    "lodash": ["lodash@4.17.21", "", {{}}, "{0}"],
+    "link-dep": ["link-dep@link:./local"]
+  }}
+}}"#,
+        sri()
+    );
+    let graph = parse(&[
+        (
+            "package.json",
+            r#"{"name":"t","dependencies":{"lodash":"^4.17.0","link-dep":"link:./local"}}"#,
+        ),
+        ("bun.lock", &lock),
+    ])
+    .expect("a clean bun.lock must not fatal under strict");
     assert!(graph.importers["."].iter().any(|d| d.name == "lodash"));
     assert!(graph.importers["."].iter().any(|d| d.name == "link-dep"));
 }

@@ -6,6 +6,7 @@ import {
   TOCScrollArea,
 } from 'fumadocs-ui/components/toc';
 import { TOCItems, TOCItem } from 'fumadocs-ui/components/toc/default';
+import { TocStarNudge } from '@/components/toc-star-nudge';
 
 /**
  * Persistent right-gutter table of contents for the blog post, mirroring the
@@ -41,6 +42,7 @@ export function BlogTOC({ toc }: { toc: TableOfContents }) {
           ))}
         </TOCItems>
       </TOCScrollArea>
+      <TocStarNudge href="https://github.com/nubjs/nub" />
     </TOCProvider>
   );
 }

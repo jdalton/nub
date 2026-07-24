@@ -427,6 +427,9 @@ pub(crate) fn build_resolver(
     // tools' lockfiles coexist undeclared.
     let target_lockfile_kind =
         Some(resolve_lockfile_kind_for_write(cwd)?.unwrap_or_else(|| default_lockfile_kind(&ctx)));
+    // `add`/`update`/`dedupe`/`audit` route `<alias>:<spec>` deps the same as
+    // install; empty under any non-pnpm posture.
+    let named_registries = super::discover_named_registries(cwd);
     Ok(install::configure_resolver(
         aube_resolver::Resolver::new(std::sync::Arc::new(make_client(cwd))),
         cwd,
@@ -435,6 +438,7 @@ pub(crate) fn build_resolver(
             settings_ctx: &ctx,
             workspace_config: &ws_config,
             workspace_catalogs: &catalogs,
+            named_registries: &named_registries,
             minimum_release_age_override: None,
             target_lockfile_kind,
             dependency_policy: None,
@@ -667,7 +671,13 @@ pub(crate) fn resolve_virtual_store_dir_for_cwd(cwd: &std::path::Path) -> std::p
 /// the user cache dir can't be resolved (rare).
 pub(crate) fn packument_cache_dir() -> std::path::PathBuf {
     let cwd = crate::dirs::cwd().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
-    resolved_cache_dir(&cwd).join("packuments-v1")
+    packument_cache_dir_for_cwd(&cwd)
+}
+
+/// Disk cache directory for packument metadata resolved against an explicit
+/// project directory. Embedders must use this form instead of logical cwd.
+pub(crate) fn packument_cache_dir_for_cwd(cwd: &std::path::Path) -> std::path::PathBuf {
+    resolved_cache_dir(cwd).join("packuments-v1")
 }
 
 /// Disk cache directory for *full* (non-corgi) packument JSON used by
@@ -676,6 +686,13 @@ pub(crate) fn packument_cache_dir() -> std::path::PathBuf {
 pub(crate) fn packument_full_cache_dir() -> std::path::PathBuf {
     let cwd = crate::dirs::cwd().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
     resolved_cache_dir(&cwd).join("packuments-full-v1")
+}
+
+/// [`packument_full_cache_dir`] against an explicit project dir instead of
+/// the process-global logical cwd — for embed-safe paths like
+/// `add_to_project`, which must not consult the host process's cwd.
+pub(crate) fn packument_full_cache_dir_for_cwd(cwd: &std::path::Path) -> std::path::PathBuf {
+    resolved_cache_dir(cwd).join("packuments-full-v1")
 }
 
 #[cfg(test)]

@@ -552,11 +552,16 @@ fn project_js_decorator_routes_to_transform() {
 fn js_parent_no_extensionless_probe() {
     // Contract: a non-TS (`.js`) parent does NOT get nub's TS-parent extensionless
     // probing, so `import "./nonexistent"` from a `.js` fails. The EXACT failure is
-    // Node-version-specific (not nub's): with detect-module (default on Node 22+)
-    // the `.js` is treated as ESM and the missing specifier surfaces as
-    // ERR_MODULE_NOT_FOUND; below that the `.js` is CommonJS, so the `import`
-    // keyword itself is a SyntaxError before any resolution. Either way nub didn't
-    // probe — assert the contract (it fails) with the version-appropriate error.
+    // module-syntax-detection-specific: when detection is active the `.js` is treated as
+    // ESM and the missing specifier surfaces as ERR_MODULE_NOT_FOUND ("Cannot find
+    // module"); otherwise the `.js` is CommonJS, so the `import` keyword itself is a
+    // SyntaxError before any resolution. Detection is native default-on from Node
+    // 20.19 / 22.7, and nub's feature matrix ALSO injects `--experimental-detect-module`
+    // on the bands below that (20.10–20.18, 21.1–22.6), so under nub the ESM path applies
+    // from Node 20.10 up. The coarse `>=22` split below picks the ESM assertion for the
+    // native-default range; the below-22 in-band legs (e.g. host Node 20.11) land in the
+    // `else` and match ERR_MODULE_NOT_FOUND via its `|| "Cannot find"` clause. Either way
+    // nub didn't probe — assert the contract (it fails) with the version-appropriate error.
     let (_stdout, stderr, code) = run_nub("vanilla-ts", "js-no-probe.js");
     assert_ne!(code, 0, ".js importing extensionless should fail: {stderr}");
     if node_at_least((22, 0, 0)) {
@@ -737,14 +742,11 @@ fn urlpattern_available() {
 
 #[test]
 fn web_locks_spec_behavior() {
-    // Web Locks works to the spec under nub on every supported Node: the hand-rolled
-    // polyfill below 24.5, native at/above. The fixture asserts steal, option/name
-    // validation, reader/writer fairness, AbortSignal, and core mutual exclusion —
-    // every assertion holds on BOTH paths, so this is a true differential test (a
-    // regression on either turns it red). On the 18.19–20.x compat legs it also proves
-    // the navigator backfill hosts navigator.locks. Verified against the WPT web-locks
-    // suite (68/68 of the runnable subtests, matching native Node) across 18.19/20.19/
-    // 22.15/24.4 at implementation time.
+    // The fixture asserts shared Web Locks behavior across the hand-rolled polyfill
+    // below Node 24.5 and native Web Locks at/above it. For known native Node Web IDL
+    // conversion divergences, it requires the spec behavior on the polyfill tier and
+    // records the native result separately. On the 18.19–20.x compat legs it also
+    // proves the navigator backfill hosts navigator.locks.
     let (stdout, stderr, code) = run_nub("web-locks", "main.mjs");
     assert_eq!(
         code, 0,
@@ -1388,6 +1390,73 @@ fn concurrent_nub_processes_no_shim_collision() {
     assert_eq!(pids.len(), 5, "all 5 should produce distinct PIDs");
     let unique: std::collections::HashSet<&String> = pids.iter().collect();
     assert_eq!(unique.len(), 5, "PIDs should be unique: {pids:?}");
+}
+
+#[test]
+#[cfg(windows)]
+fn running_windows_nub_cleans_hardlinked_path_shim() {
+    let nub = nub_binary();
+    let root = nub.parent().unwrap().join(format!(
+        "nub-running-hardlink-cleanup-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).unwrap();
+
+    // Keep TEMP on the executable's volume and verify this filesystem actually
+    // supports hardlinks, so the child exercises publication from its mapped
+    // nub.exe rather than the cross-volume copy fallback.
+    let probe = root.join("hardlink-probe.exe");
+    if let Err(error) = std::fs::hard_link(&nub, &probe) {
+        eprintln!("skipping mapped-executable cleanup: hardlinks unavailable: {error}");
+        std::fs::remove_dir_all(root).unwrap();
+        return;
+    }
+    std::fs::remove_file(probe).unwrap();
+
+    let script = root.join("probe.cjs");
+    std::fs::write(
+        &script,
+        r#"const fs = require('node:fs');
+const path = require('node:path');
+const shim = path.join(process.env.PATH.split(path.delimiter)[0], 'node.exe');
+const shimStat = fs.statSync(shim, { bigint: true });
+const sourceStat = fs.statSync(process.env.TEST_SOURCE_EXE, { bigint: true });
+console.log(`shim-hardlink:${shimStat.dev === sourceStat.dev && shimStat.ino === sourceStat.ino}`);
+"#,
+    )
+    .unwrap();
+    let output = Command::new(&nub)
+        .arg(&script)
+        .current_dir(&root)
+        .env("TEMP", &root)
+        .env("TMP", &root)
+        .env("TEST_SOURCE_EXE", &nub)
+        .output()
+        .expect("spawn Nub from a same-volume TEMP");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "mapped-executable probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("shim-hardlink:true"),
+        "mapped-executable probe did not use a hardlinked PATH shim: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let leaked: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().starts_with("nub-node-shim-"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "running nub.exe leaked PATH shim directories: {leaked:?}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Nub must not inject a `nub` global or any `NUB_*` environment
@@ -3435,6 +3504,899 @@ fn env_file_flag_preserves_unquoted_json_value_without_auto_dotenv() {
 }
 
 #[test]
+fn no_env_file_suppresses_auto_dotenv_but_keeps_augmentation() {
+    // `--no-env-file` means "load zero env files": the auto-discovered `.env`
+    // must not reach the child, while the OTHER augmentation stays ON — a `.ts`
+    // entrypoint (type-annotated source) still runs.
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"noenvfile"}"#).unwrap();
+    std::fs::write(dir.join(".env"), "SECRET=from-dotenv\n").unwrap();
+    std::fs::write(
+        dir.join("main.ts"),
+        "const answer: number = 7;\n\
+         console.log('TS=' + answer);\n\
+         console.log('SECRET=[' + (process.env.SECRET ?? '') + ']');\n",
+    )
+    .unwrap();
+
+    let out = Command::new(nub_binary())
+        .arg("--no-env-file")
+        .arg("main.ts")
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .output()
+        .expect("failed to spawn nub");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("TS=7"),
+        "non-env augmentation (TS enum) must still run under --no-env-file: {stdout}"
+    );
+    assert!(
+        stdout.contains("SECRET=[]"),
+        "--no-env-file must suppress the auto-loaded `.env`: {stdout}"
+    );
+}
+
+#[test]
+fn no_env_file_wins_over_explicit_env_file() {
+    // Precedence (decided 2026-07-07): `--no-env-file` beats `--env-file` — the
+    // explicit file is ignored too, so the child gets ZERO env-file vars.
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"noenvfile-wins"}"#).unwrap();
+    std::fs::write(dir.join(".env"), "SECRET=from-dotenv\n").unwrap();
+    std::fs::write(dir.join("custom.env"), "FROMCUSTOM=custom-val\n").unwrap();
+    std::fs::write(
+        dir.join("app.js"),
+        "console.log('SECRET=[' + (process.env.SECRET ?? '') + ']');\n\
+         console.log('FROMCUSTOM=[' + (process.env.FROMCUSTOM ?? '') + ']');\n",
+    )
+    .unwrap();
+
+    let out = Command::new(nub_binary())
+        .args(["--no-env-file", "--env-file=custom.env", "app.js"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .output()
+        .expect("failed to spawn nub");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("SECRET=[]"),
+        "auto `.env` must stay suppressed under --no-env-file: {stdout}"
+    );
+    assert!(
+        stdout.contains("FROMCUSTOM=[]"),
+        "--no-env-file must ignore the explicit --env-file (precedence): {stdout}"
+    );
+}
+
+#[test]
+fn no_env_file_wins_over_env_file_if_exists() {
+    // `--no-env-file` beats `--env-file-if-exists` too — the whole `--env-file*`
+    // family feeds one collected map that the kill-switch suppresses. The named
+    // file exists (so `-if-exists` would otherwise load it), proving suppression.
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"noenvfile-ifexists"}"#).unwrap();
+    std::fs::write(dir.join("present.env"), "FROMCUSTOM=custom-val\n").unwrap();
+    std::fs::write(
+        dir.join("app.js"),
+        "console.log('FROMCUSTOM=[' + (process.env.FROMCUSTOM ?? '') + ']');\n",
+    )
+    .unwrap();
+
+    let out = Command::new(nub_binary())
+        .args([
+            "--no-env-file",
+            "--env-file-if-exists=present.env",
+            "app.js",
+        ])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .output()
+        .expect("failed to spawn nub");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("FROMCUSTOM=[]"),
+        "--no-env-file must ignore an existing --env-file-if-exists target: {stdout}"
+    );
+}
+
+/// The `Nubx` clap grammar carries no env-file flags, so `run_nubx` consumes
+/// `--no-env-file` in the leading region itself — otherwise clap rejects it as
+/// unknown. Pins that the flag survives that hand-off and still suppresses the
+/// auto `.env` for the launched bin. Runs the binary AS `nubx` (argv0 dispatch) to
+/// exercise `run_nubx`. Unix-only (symlink + mode bits).
+#[cfg(unix)]
+#[test]
+fn no_env_file_is_honored_on_standalone_nubx() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let nubx = dir.join("nubx");
+    std::os::unix::fs::symlink(nub_binary(), &nubx).expect("symlink nub -> nubx");
+    std::fs::write(dir.join("package.json"), r#"{"name":"nubx-noenvfile"}"#).unwrap();
+    std::fs::write(dir.join(".env"), "SECRET=from-dotenv\n").unwrap();
+
+    // A local bin — the only tier nubx resolves — reporting what it inherited.
+    let bin_dir = dir.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let bin = bin_dir.join("showenv");
+    std::fs::write(
+        &bin,
+        "#!/usr/bin/env node\nconsole.log('SECRET=[' + (process.env.SECRET ?? '') + ']');\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = Command::new(&nubx)
+        .args(["--no-env-file", "showenv"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .output()
+        .expect("failed to spawn nubx");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("SECRET=[]"),
+        "standalone nubx --no-env-file must suppress auto `.env`: {stdout}"
+    );
+}
+
+fn remove_ambient_watch_control_vars(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(nub_core::workspace::env::is_denied_env_file_key)
+        {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env_remove("__NUB_WATCH_ENV_GUARD");
+}
+
+fn spawn_watch_probe(cmd: &mut Command) -> std::process::Child {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    cmd.spawn().expect("spawn nub watch")
+}
+
+fn finish_watch_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: `spawn_watch_probe` makes the child the leader of a fresh process
+    // group. A negative pid targets only that probe's Nub + Node subtree.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_for_watch_snapshot(
+    path: &Path,
+    needle: &str,
+    child: &mut std::process::Child,
+    stderr: &Path,
+) -> String {
+    for _ in 0..150 {
+        if let Ok(snapshot) = std::fs::read_to_string(path)
+            && snapshot.contains(needle)
+        {
+            return snapshot;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            finish_watch_probe(child);
+            panic!(
+                "watch probe exited {status} before writing {needle:?}; stderr: {:?}",
+                std::fs::read_to_string(stderr).ok()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    finish_watch_probe(child);
+    panic!(
+        "watch probe never wrote {needle:?}; last snapshot: {:?}; stderr: {:?}",
+        std::fs::read_to_string(path).ok(),
+        std::fs::read_to_string(stderr).ok()
+    );
+}
+
+fn node_supports_watch_env_files() -> bool {
+    target_node_version() >= (20, 6, 0)
+}
+
+fn node_reloads_watched_env_files() -> bool {
+    target_node_version() >= (22, 0, 0)
+}
+
+/// The guard marker is internal cross-process state. If it is absent or corrupt,
+/// the preload must clear every known denied key and abort before user code can
+/// observe a raw env-file value.
+#[test]
+fn watch_env_guard_fails_closed_on_malformed_state() {
+    let guard = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/watch-env-guard.cjs");
+    let script = r#"
+      try {
+        require(process.argv[1]);
+        throw new Error('guard unexpectedly accepted malformed state');
+      } catch (error) {
+        const denied = ['NODE_OPTIONS','NODE_TLS_REJECT_UNAUTHORIZED','NODE_EXTRA_CA_CERTS','NODE_REPL_EXTERNAL_MODULE'];
+        const visible = Object.keys(process.env).filter((key) => denied.includes(key.toUpperCase()));
+        process.stdout.write(JSON.stringify({ code: error.code, visible, markerPresent: Object.hasOwn(process.env, '__NUB_WATCH_ENV_GUARD') }));
+      }
+    "#;
+    let mut cmd = Command::new("node");
+    cmd.args(["-e", script]).arg(guard);
+    remove_ambient_watch_control_vars(&mut cmd);
+    cmd.env("__NUB_WATCH_ENV_GUARD", "{not-json")
+        .env("NODE_OPTIONS", "--no-warnings")
+        .env("NODE_TLS_REJECT_UNAUTHORIZED", "0")
+        .env("NODE_EXTRA_CA_CERTS", "/file-derived-ca.pem")
+        .env("NODE_REPL_EXTERNAL_MODULE", "./file-derived-repl.cjs");
+    let output = cmd.output().expect("run malformed watch env guard probe");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["code"], "ERR_NUB_WATCH_ENV_GUARD", "{value}");
+    assert_eq!(value["visible"], serde_json::json!([]), "{value}");
+    assert_eq!(value["markerPresent"], false, "{value}");
+}
+
+/// Missing marker state on the main thread is not a compat-worker re-entry. It
+/// must clear every denied key and abort before user code can observe a value.
+#[test]
+fn watch_env_guard_missing_main_state_clears_denied_and_aborts() {
+    let guard = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/watch-env-guard.cjs");
+    let script = r#"
+      try {
+        require(process.argv[1]);
+        throw new Error('guard unexpectedly accepted missing main-thread state');
+      } catch (error) {
+        const denied = ['NODE_OPTIONS','NODE_TLS_REJECT_UNAUTHORIZED','NODE_EXTRA_CA_CERTS','NODE_REPL_EXTERNAL_MODULE'];
+        const visible = Object.keys(process.env).filter((key) => denied.includes(key.toUpperCase()));
+        process.stdout.write(JSON.stringify({ code: error.code, visible, markerPresent: Object.hasOwn(process.env, '__NUB_WATCH_ENV_GUARD') }));
+      }
+    "#;
+    let mut cmd = Command::new("node");
+    cmd.args(["-e", script]).arg(guard);
+    remove_ambient_watch_control_vars(&mut cmd);
+    cmd.env("NODE_OPTIONS", "--no-warnings")
+        .env("NODE_TLS_REJECT_UNAUTHORIZED", "0")
+        .env("NODE_EXTRA_CA_CERTS", "/file-derived-ca.pem")
+        .env("NODE_REPL_EXTERNAL_MODULE", "./file-derived-repl.cjs");
+    let output = cmd.output().expect("run missing watch env guard probe");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["code"], "ERR_NUB_WATCH_ENV_GUARD", "{value}");
+    assert_eq!(value["visible"], serde_json::json!([]), "{value}");
+    assert_eq!(value["markerPresent"], false, "{value}");
+}
+
+/// An ordinary Worker can also re-run the guard off the main thread. With no
+/// marker, it must preserve the already-sanitized ambient environment.
+#[test]
+fn watch_env_guard_non_main_reentry_preserves_sanitized_ambient() {
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let guard = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/watch-env-guard.cjs");
+    let worker = dir.join("worker.cjs");
+    std::fs::write(
+        &worker,
+        "const { parentPort } = require('node:worker_threads');\n\
+         parentPort.postMessage({\n\
+           nodeOptions: process.env.NODE_OPTIONS,\n\
+           tls: process.env.NODE_TLS_REJECT_UNAUTHORIZED,\n\
+           ca: process.env.NODE_EXTRA_CA_CERTS,\n\
+           repl: process.env.NODE_REPL_EXTERNAL_MODULE,\n\
+           markerPresent: Object.hasOwn(process.env, '__NUB_WATCH_ENV_GUARD')\n\
+         });\n",
+    )
+    .unwrap();
+    let script = r#"
+      const { Worker } = require('node:worker_threads');
+      const worker = new Worker(process.argv[1], { execArgv: ['--require', process.argv[2]] });
+      worker.once('message', (value) => process.stdout.write(JSON.stringify(value)));
+      worker.once('error', (error) => { throw error; });
+    "#;
+    let mut cmd = Command::new("node");
+    cmd.args(["-e", script]).arg(&worker).arg(&guard);
+    remove_ambient_watch_control_vars(&mut cmd);
+    cmd.env("NODE_OPTIONS", "--no-warnings")
+        .env("NODE_TLS_REJECT_UNAUTHORIZED", "1")
+        .env("NODE_EXTRA_CA_CERTS", "/ambient-ca.pem")
+        .env("NODE_REPL_EXTERNAL_MODULE", "./ambient-repl.cjs");
+    let output = cmd.output().expect("run Worker watch env guard probe");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["nodeOptions"], "--no-warnings", "{value}");
+    assert_eq!(value["tls"], "1", "{value}");
+    assert_eq!(value["ca"], "/ambient-ca.pem", "{value}");
+    assert_eq!(value["repl"], "./ambient-repl.cjs", "{value}");
+    assert_eq!(value["markerPresent"], false, "{value}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// On the compat tier, `module.register()` creates a loader worker that re-runs
+/// NODE_OPTIONS preloads after the main guard consumed its marker. Both the next
+/// user preload and the loader hook must observe the restored ambient values.
+#[test]
+fn watch_env_guard_compat_loader_worker_preserves_ambient() {
+    if !node_at_least((20, 6, 0)) || node_at_least((22, 15, 0)) {
+        eprintln!("skipping: target Node is outside the compat loader-worker tier");
+        return;
+    }
+
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let guard = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/watch-env-guard.cjs");
+    let user_snapshot = dir.join("user-preload.json");
+    let loader_snapshot = dir.join("loader.json");
+    std::fs::write(
+        dir.join("user-preload.cjs"),
+        format!(
+            "if (!require('node:worker_threads').isMainThread) {{\n\
+               require('fs').writeFileSync({path:?}, JSON.stringify({{\n\
+                 nodeOptions: process.env.NODE_OPTIONS,\n\
+                 tls: process.env.NODE_TLS_REJECT_UNAUTHORIZED,\n\
+                 ca: process.env.NODE_EXTRA_CA_CERTS,\n\
+                 repl: process.env.NODE_REPL_EXTERNAL_MODULE,\n\
+                 markerPresent: Object.hasOwn(process.env, '__NUB_WATCH_ENV_GUARD')\n\
+               }}));\n\
+             }}\n",
+            path = user_snapshot.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("loader.mjs"),
+        format!(
+            "import fs from 'node:fs';\n\
+             fs.writeFileSync({path:?}, JSON.stringify({{\n\
+               nodeOptions: process.env.NODE_OPTIONS,\n\
+               tls: process.env.NODE_TLS_REJECT_UNAUTHORIZED,\n\
+               ca: process.env.NODE_EXTRA_CA_CERTS,\n\
+               repl: process.env.NODE_REPL_EXTERNAL_MODULE,\n\
+               markerPresent: Object.hasOwn(process.env, '__NUB_WATCH_ENV_GUARD')\n\
+             }}));\n\
+             export async function resolve(specifier, context, nextResolve) {{\n\
+               return nextResolve(specifier, context);\n\
+             }}\n",
+            path = loader_snapshot.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("bootstrap.mjs"),
+        "import { register } from 'node:module';\n\
+         register('./loader.mjs', import.meta.url);\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("entry.cjs"), "// loader probe entry\n").unwrap();
+
+    let ambient_node_options = format!("--require={}", dir.join("user-preload.cjs").display());
+    let effective_node_options = format!("--require={} {ambient_node_options}", guard.display());
+    let state = serde_json::json!({
+        "denylist": nub_core::workspace::env::denied_env_file_keys(),
+        "ambientKeys": nub_core::workspace::env::denied_env_file_keys(),
+        "nodeOptions": ambient_node_options,
+    });
+    let mut cmd = Command::new("node");
+    cmd.args(["--import", "./bootstrap.mjs", "entry.cjs"])
+        .current_dir(&dir);
+    remove_ambient_watch_control_vars(&mut cmd);
+    cmd.env(
+        "__NUB_WATCH_ENV_GUARD",
+        serde_json::to_string(&state).unwrap(),
+    )
+    .env("NODE_OPTIONS", effective_node_options)
+    .env("NODE_TLS_REJECT_UNAUTHORIZED", "1")
+    .env("NODE_EXTRA_CA_CERTS", "/ambient-ca.pem")
+    .env("NODE_REPL_EXTERNAL_MODULE", "./ambient-repl.cjs");
+    let output = cmd.output().expect("run compat loader-worker guard probe");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (label, path) in [
+        ("user preload", &user_snapshot),
+        ("loader hook", &loader_snapshot),
+    ] {
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            value["nodeOptions"], ambient_node_options,
+            "{label}: {value}"
+        );
+        assert_eq!(value["tls"], "1", "{label}: {value}");
+        assert_eq!(value["ca"], "/ambient-ca.pem", "{label}: {value}");
+        assert_eq!(value["repl"], "./ambient-repl.cjs", "{label}: {value}");
+        assert_eq!(value["markerPresent"], false, "{label}: {value}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Raw auto-discovered env files are re-read on every Node watch restart. A
+/// runtime-control key added after Nub starts must stay filtered for the whole
+/// watcher lifetime, while an ordinary sibling still live-reloads.
+#[test]
+fn watch_filters_late_runtime_control_env_keys_but_reloads_ordinary_vars() {
+    if !node_reloads_watched_env_files() {
+        eprintln!("skipping: target Node does not restart on --env-file edits");
+        return;
+    }
+
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"watch-env-filter"}"#).unwrap();
+    std::fs::write(dir.join(".env"), "ORDINARY=one\n").unwrap();
+    let snapshots = dir.join("snapshots.ndjson");
+    let stderr = dir.join("stderr.txt");
+    let attacker = dir.join("attacker-ran.txt");
+    std::fs::write(
+        dir.join("attacker.cjs"),
+        format!(
+            "require('fs').appendFileSync({path:?}, 'ran\\n');\n",
+            path = attacker.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("probe.cjs"),
+        format!(
+            "const fs = require('fs');\n\
+             const denied = ['NODE_OPTIONS','NODE_TLS_REJECT_UNAUTHORIZED','NODE_EXTRA_CA_CERTS','NODE_REPL_EXTERNAL_MODULE'];\n\
+             const visible = Object.keys(process.env).filter((key) => denied.includes(key.toUpperCase()));\n\
+             const snapshot = {{ ordinary: process.env.ORDINARY, denied: visible, markerPresent: Object.hasOwn(process.env, '__NUB_WATCH_ENV_GUARD') }};\n\
+             fs.appendFileSync({path:?}, JSON.stringify(snapshot) + '\\n');\n",
+            path = snapshots.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let stderr_file = std::fs::File::create(&stderr).unwrap();
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(["--watch", "probe.cjs"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file));
+    remove_ambient_watch_control_vars(&mut cmd);
+    let mut child = spawn_watch_probe(&mut cmd);
+
+    let first = wait_for_watch_snapshot(&snapshots, r#""ordinary":"one""#, &mut child, &stderr);
+    assert!(first.contains(r#""denied":[]"#), "first child: {first}");
+    assert!(
+        first.contains(r#""markerPresent":false"#),
+        "first child: {first}"
+    );
+
+    std::fs::write(
+        dir.join(".env"),
+        "NODE_OPTIONS=--require ./attacker.cjs\n\
+         NODE_TLS_REJECT_UNAUTHORIZED=0\n\
+         NODE_EXTRA_CA_CERTS=/definitely/not/a/ca.pem\n\
+         node_repl_external_module=./attacker.cjs\n\
+         ORDINARY=two\n",
+    )
+    .unwrap();
+    let snapshots_text =
+        wait_for_watch_snapshot(&snapshots, r#""ordinary":"two""#, &mut child, &stderr);
+    finish_watch_probe(&mut child);
+
+    for line in snapshots_text.lines() {
+        assert!(line.contains(r#""denied":[]"#), "snapshot: {line}");
+        assert!(
+            line.contains(r#""markerPresent":false"#),
+            "snapshot: {line}"
+        );
+    }
+    assert!(
+        !attacker.exists(),
+        "file-sourced NODE_OPTIONS preload must never execute"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #479: an explicit `--env-file` forwards to the watched Node, so an edit both
+/// triggers the restart (no `--watch-path` needed) and is re-read by the
+/// restarted child — matching `node --env-file --watch` — instead of freezing at
+/// the startup snapshot.
+#[test]
+fn watch_reloads_explicit_env_file_across_restarts() {
+    if !node_reloads_watched_env_files() {
+        eprintln!("skipping: target Node does not restart on --env-file edits");
+        return;
+    }
+
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Named outside the `.env*` cascade (and no package.json), so the explicit
+    // channel alone is what reloads — auto-discovery never enters the picture.
+    std::fs::write(dir.join("custom.env"), "ORDINARY=one\n").unwrap();
+    let snapshots = dir.join("snapshots.ndjson");
+    let stderr = dir.join("stderr.txt");
+    std::fs::write(
+        dir.join("probe.cjs"),
+        format!(
+            "const fs = require('fs');\n\
+             const snapshot = {{ ordinary: process.env.ORDINARY, added: process.env.ADDED ?? null }};\n\
+             fs.appendFileSync({path:?}, JSON.stringify(snapshot) + '\\n');\n",
+            path = snapshots.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let stderr_file = std::fs::File::create(&stderr).unwrap();
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(["--env-file=custom.env", "--watch", "probe.cjs"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file));
+    remove_ambient_watch_control_vars(&mut cmd);
+    let mut child = spawn_watch_probe(&mut cmd);
+
+    let first = wait_for_watch_snapshot(&snapshots, r#""ordinary":"one""#, &mut child, &stderr);
+    assert!(first.contains(r#""added":null"#), "first child: {first}");
+
+    // Changed values AND keys added after startup must both reach the
+    // restarted child (the #479 failure froze the startup snapshot).
+    std::fs::write(dir.join("custom.env"), "ORDINARY=two\nADDED=three\n").unwrap();
+    let reloaded = wait_for_watch_snapshot(&snapshots, r#""ordinary":"two""#, &mut child, &stderr);
+    finish_watch_probe(&mut child);
+
+    assert!(
+        reloaded.contains(r#""added":"three""#),
+        "reloaded: {reloaded}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ambient runtime-control values remain shell-wins. The cleanup preload must run
+/// before the user's ambient preload and restore the sanitized NODE_OPTIONS text
+/// rather than exposing Nub's temporary guard token.
+#[test]
+fn watch_preserves_ambient_runtime_control_env_values() {
+    if !node_supports_watch_env_files() {
+        eprintln!("skipping: target Node predates --env-file support");
+        return;
+    }
+
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"watch-env-ambient"}"#).unwrap();
+    std::fs::write(
+        dir.join(".env"),
+        "NODE_OPTIONS=--require ./attacker.cjs\n\
+         NODE_TLS_REJECT_UNAUTHORIZED=0\n\
+         NODE_EXTRA_CA_CERTS=/file-ca.pem\n\
+         NODE_REPL_EXTERNAL_MODULE=./file-repl.cjs\n",
+    )
+    .unwrap();
+    let preload_snapshot = dir.join("preload.json");
+    let entry_snapshot = dir.join("entry.json");
+    let stderr = dir.join("stderr.txt");
+    let attacker = dir.join("attacker-ran.txt");
+    std::fs::write(
+        dir.join("attacker.cjs"),
+        format!(
+            "require('fs').writeFileSync({path:?}, 'ran');\n",
+            path = attacker.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let snapshot_source = |path: &Path| {
+        format!(
+            "require('fs').writeFileSync({path:?}, JSON.stringify({{\n\
+               nodeOptions: process.env.NODE_OPTIONS,\n\
+               tls: process.env.NODE_TLS_REJECT_UNAUTHORIZED,\n\
+               ca: process.env.NODE_EXTRA_CA_CERTS,\n\
+               repl: process.env.NODE_REPL_EXTERNAL_MODULE,\n\
+               commonPreloaded: Object.keys(require.cache).some((key) => key.endsWith('preload-common.cjs')),\n\
+               markerPresent: Object.hasOwn(process.env, '__NUB_WATCH_ENV_GUARD')\n\
+             }}));\n",
+            path = path.to_string_lossy()
+        )
+    };
+    std::fs::write(
+        dir.join("user-preload.cjs"),
+        snapshot_source(&preload_snapshot),
+    )
+    .unwrap();
+    std::fs::write(dir.join("probe.cjs"), snapshot_source(&entry_snapshot)).unwrap();
+    // Resolve through the watch supervisor's cwd so the preload and env file
+    // share one directory spelling in Node's Windows watcher.
+    let node_options = "--require=./user-preload.cjs".to_string();
+
+    let stderr_file = std::fs::File::create(&stderr).unwrap();
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(["--watch", "probe.cjs"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file));
+    remove_ambient_watch_control_vars(&mut cmd);
+    cmd.env("NODE_OPTIONS", &node_options)
+        .env("NODE_TLS_REJECT_UNAUTHORIZED", "1")
+        .env("NODE_EXTRA_CA_CERTS", "/ambient-ca.pem")
+        .env("NODE_REPL_EXTERNAL_MODULE", "./ambient-repl.cjs");
+    let mut child = spawn_watch_probe(&mut cmd);
+
+    wait_for_watch_snapshot(&entry_snapshot, "nodeOptions", &mut child, &stderr);
+    finish_watch_probe(&mut child);
+    for (label, path) in [
+        ("user preload", &preload_snapshot),
+        ("entry", &entry_snapshot),
+    ] {
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["nodeOptions"], node_options, "{label}: {value}");
+        assert_eq!(value["tls"], "1", "{label}: {value}");
+        assert_eq!(value["ca"], "/ambient-ca.pem", "{label}: {value}");
+        assert_eq!(value["repl"], "./ambient-repl.cjs", "{label}: {value}");
+        assert_eq!(
+            value["commonPreloaded"],
+            label == "entry",
+            "{label}: {value}"
+        );
+        assert_eq!(value["markerPresent"], false, "{label}: {value}");
+    }
+    assert!(!attacker.exists(), "file NODE_OPTIONS must lose to ambient");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Auto-discovered watch env files are passed relative to the watcher's cwd.
+/// This is required by Node 20.11 on Linux, which rejects an existing absolute
+/// `--env-file` path. Cover the ancestor-project case where the relative path
+/// must traverse upward rather than being the simple root-level `.env` form.
+#[test]
+fn watch_loads_auto_env_file_from_ancestor_project_root() {
+    if !node_supports_watch_env_files() {
+        eprintln!("skipping: target Node predates --env-file support");
+        return;
+    }
+
+    let root = unique_test_cache();
+    let member = root.join("packages").join("app");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"watch-env-ancestor"}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join(".env"), "FROM_ROOT=from-root\n").unwrap();
+    let snapshot = member.join("snapshot.txt");
+    let stderr = member.join("stderr.txt");
+    std::fs::write(
+        member.join("probe.cjs"),
+        format!(
+            "require('fs').writeFileSync({path:?}, process.env.FROM_ROOT || 'missing');\n",
+            path = snapshot.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let stderr_file = std::fs::File::create(&stderr).unwrap();
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(["--watch", "probe.cjs"])
+        .current_dir(&member)
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file));
+    remove_ambient_watch_control_vars(&mut cmd);
+    let mut child = spawn_watch_probe(&mut cmd);
+
+    let snapshot_text = wait_for_watch_snapshot(&snapshot, "from-root", &mut child, &stderr);
+    finish_watch_probe(&mut child);
+    assert_eq!(snapshot_text, "from-root");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Unix permits a mixed-case ambient key alongside the canonical spelling Node
+/// consumes at startup. The mixed-case value must survive, while a canonical raw
+/// env-file value is occupied in the supervisor and then removed in the child.
+#[cfg(unix)]
+#[test]
+fn watch_mixed_case_ambient_key_does_not_unblock_canonical_env_file_key() {
+    if !node_supports_watch_env_files() {
+        eprintln!("skipping: target Node predates --env-file support");
+        return;
+    }
+
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"watch-env-case"}"#).unwrap();
+    let invalid_ca = dir.join("file-derived-invalid-ca.pem");
+    std::fs::write(
+        dir.join(".env"),
+        format!("NODE_EXTRA_CA_CERTS={}\n", invalid_ca.display()),
+    )
+    .unwrap();
+    let snapshot = dir.join("snapshot.json");
+    let stderr = dir.join("stderr.txt");
+    std::fs::write(
+        dir.join("probe.cjs"),
+        format!(
+            "const denied = Object.fromEntries(Object.keys(process.env)\n\
+               .filter((key) => key.toUpperCase() === 'NODE_EXTRA_CA_CERTS')\n\
+               .map((key) => [key, process.env[key]]));\n\
+             require('fs').writeFileSync({path:?}, JSON.stringify({{ denied, lookalike: process.env['NODE_OPTION\\u017f'], markerPresent: Object.hasOwn(process.env, '__NUB_WATCH_ENV_GUARD') }}));\n\
+             process.kill(process.ppid, 'SIGTERM');\n",
+            path = snapshot.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let stderr_file = std::fs::File::create(&stderr).unwrap();
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(["--watch", "probe.cjs"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file));
+    remove_ambient_watch_control_vars(&mut cmd);
+    cmd.env("node_extra_ca_certs", "ambient-lower")
+        .env("NODE_OPTION\u{017f}", "ordinary-unicode");
+    let mut child = spawn_watch_probe(&mut cmd);
+
+    let snapshot_text = wait_for_watch_snapshot(&snapshot, "ambient-lower", &mut child, &stderr);
+    finish_watch_probe(&mut child);
+    let value: serde_json::Value = serde_json::from_str(&snapshot_text).unwrap();
+    assert_eq!(value["denied"]["node_extra_ca_certs"], "ambient-lower");
+    assert!(
+        value["denied"].get("NODE_EXTRA_CA_CERTS").is_none(),
+        "canonical file key must be absent: {value}"
+    );
+    assert_eq!(value["lookalike"], "ordinary-unicode");
+    assert_eq!(value["markerPresent"], false);
+    let stderr_text = std::fs::read_to_string(&stderr).unwrap();
+    assert!(
+        !stderr_text.contains(invalid_ca.to_string_lossy().as_ref()),
+        "Node consumed the canonical file-derived CA before cleanup: {stderr_text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cleanup marker is JSON and Node exposes environment values as strings, so
+/// a non-UTF-8 ambient NODE_OPTIONS value cannot be restored losslessly. Refuse
+/// the guarded raw-file path instead of silently replacing the shell value.
+#[cfg(unix)]
+#[test]
+fn watch_env_guard_rejects_non_utf8_ambient_node_options() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"watch-env-bytes"}"#).unwrap();
+    std::fs::write(dir.join(".env"), "ORDINARY=one\n").unwrap();
+    std::fs::write(dir.join("probe.cjs"), "throw new Error('must not run');\n").unwrap();
+
+    let mut cmd = Command::new(nub_binary());
+    cmd.args(["--watch", "probe.cjs"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"));
+    remove_ambient_watch_control_vars(&mut cmd);
+    cmd.env(
+        "NODE_OPTIONS",
+        std::ffi::OsString::from_vec(vec![b'-', b'-', 0xff]),
+    );
+    let output = cmd.output().expect("run nub watch preflight");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("watch env-file filtering requires NODE_OPTIONS to be valid UTF-8"),
+        "stderr: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--no-env-file` on the watch path: the `.env*` files are neither handed to the
+/// watched Node as `--env-file` args nor injected via `Command::env`, so the child
+/// sees none of them. The watch loop never exits on its own, so the probe writes
+/// its findings to a sentinel file on its first run; the test polls, then kills
+/// the watcher. Unix-only (uses a process kill), mirroring the NODE_COMPAT watch
+/// test.
+#[cfg(unix)]
+#[test]
+fn no_env_file_suppresses_dotenv_under_watch() {
+    let dir = unique_test_cache();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("package.json"), r#"{"name":"noenvfile-watch"}"#).unwrap();
+    std::fs::write(dir.join(".env"), "WATCH_ENV=from_dotenv\n").unwrap();
+    let out_file = dir.join("probe-out.txt");
+    std::fs::write(
+        dir.join("probe.js"),
+        format!(
+            "const fs=require('fs');\n\
+             fs.writeFileSync({out:?}, 'WATCH_ENV='+(process.env.WATCH_ENV||'')+'\\n');\n",
+            out = out_file.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(nub_binary())
+        .args(["--watch", "--no-env-file", "probe.js"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn nub watch");
+
+    let mut snapshot = None;
+    for _ in 0..100 {
+        if let Ok(s) = std::fs::read_to_string(&out_file)
+            && s.contains("WATCH_ENV=")
+        {
+            snapshot = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let snapshot = snapshot.expect("`nub watch` probe never ran (no sentinel file)");
+    assert!(
+        snapshot.contains("WATCH_ENV=\n"),
+        "--no-env-file `nub watch` must NOT hand `.env` to Node: {snapshot:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn env_precedence_with_app_env_mode() {
     // `APP_ENV` selects the mode (`.env.development` here); `NODE_ENV` no longer
     // does (dropped as a mode source — it is the app's own dev/prod variable).
@@ -4680,37 +5642,12 @@ fn nub_dlx_is_not_consent_gated() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// SCRIPT tier: `nubx <name>` runs a `package.json` script of that name — nub's
-/// addition over npx (which only resolves bins). A local script must win over the
-/// registry: no download, no prompt, even in CI / non-TTY.
+/// The removed unified tiers: `nubx <name>` resolves BINS ONLY. A `package.json`
+/// script and a verbatim file of the same name must both be ignored — the token is
+/// a bin/package name, so it falls through to the consent-gated registry (and
+/// fails closed under CI). Files are `nub <file>`; scripts are `nub run <script>`.
 #[test]
-fn nubx_resolves_a_local_script() {
-    let (nubx, dir) = nubx_alias();
-    std::fs::write(
-        dir.join("package.json"),
-        r#"{"name":"t","scripts":{"greet":"node -e \"console.log('FROM-SCRIPT')\""}}"#,
-    )
-    .unwrap();
-    let out = Command::new(&nubx)
-        .arg("greet")
-        .current_dir(&dir)
-        .env("CI", "1") // a script never reaches the gate
-        .output()
-        .expect("spawn nubx greet");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stdout.contains("FROM-SCRIPT"),
-        "nubx must run the local script: stdout={stdout} stderr={stderr}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// FILE beats SCRIPT: when a token is both a verbatim-existing file and a script
-/// name, the file wins (precedence file > script, matching run/mux). The file is
-/// extensionless `greet`; the file runner runs it through Node.
-#[test]
-fn nubx_file_wins_over_script() {
+fn nubx_ignores_local_files_and_scripts() {
     let (nubx, dir) = nubx_alias();
     std::fs::write(
         dir.join("package.json"),
@@ -4727,193 +5664,15 @@ fn nubx_file_wins_over_script() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("FROM-FILE") && !stdout.contains("FROM-SCRIPT"),
-        "the verbatim file must win over the same-named script: stdout={stdout} stderr={stderr}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The nubx flag/argv resolution spec (`wiki/research/nubx-flag-env-resolution.md`
-/// §3 edge-case table). nubx is a pure pass-through runner: it locates the SUBJECT
-/// token, decides its TIER by precedence (file > script > bin > registry), then
-/// hands the RAW remaining argv to that tier's runner. This drives the table as
-/// real argv0 invocations and asserts each lands in the right tier with the right
-/// raw argv — the file tier (the headline #224 fix), the `-r`/`-p` collision
-/// rulings, and the SCRIPT re-dispatch to `nub run`. Registry/consent rows live in
-/// their own focused tests above.
-#[test]
-fn nubx_resolution_spec() {
-    let (nubx, dir) = nubx_alias();
-    // `app.js` echoes the argv + execArgv Node actually received, so a delegated
-    // file invocation is verified by what reached Node — not just exit codes.
-    std::fs::write(
-        dir.join("app.js"),
-        "console.log('ARGV='+JSON.stringify(process.argv.slice(2))+\
-         ' EXEC='+JSON.stringify(process.execArgv));\n",
-    )
-    .unwrap();
-    std::fs::create_dir_all(dir.join("sub")).unwrap();
-    std::fs::write(dir.join("sub/x.js"), "console.log('SUBX');\n").unwrap();
-    std::fs::write(
-        dir.join("package.json"),
-        r#"{"name":"t","scripts":{"build":"node -e \"console.log('SCRIPT-BUILD')\""}}"#,
-    )
-    .unwrap();
-    // A real `node_modules/.bin` entry is platform-shaped: a bare shebang file on
-    // POSIX, but on Windows `find_bin` only matches `.cmd`/`.exe`/`.bat`/`.ps1`, so
-    // a Windows bin needs a `.cmd` shim alongside the JS (exactly what npm/pnpm
-    // write, and what the nubx-test fixture's `hello`+`hello.cmd` pair does). The
-    // `.cmd` runs `node <bare-file> %*` so args forward; the bare file's shebang is
-    // stripped by Node. Without the shim, the Bin tier misses on Windows and falls
-    // through to the gated registry — the windows-latest-only failure this fixes.
-    let bin_dir = dir.join("node_modules/.bin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    std::fs::write(
-        bin_dir.join("mytool"),
-        "#!/usr/bin/env node\nconsole.log('BIN '+JSON.stringify(process.argv.slice(2)));\n",
-    )
-    .unwrap();
-    #[cfg(windows)]
-    std::fs::write(
-        bin_dir.join("mytool.cmd"),
-        "@ECHO off\nnode \"%~dp0\\mytool\" %*\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(
-            bin_dir.join("mytool"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
-    }
-
-    let nx = |args: &[&str]| -> (String, String, i32) {
-        let out = Command::new(&nubx)
-            .args(args)
-            .current_dir(&dir)
-            .env("CI", "1") // pin the non-TTY registry branch deterministically
-            .env("XDG_CACHE_HOME", dir.join("xdg-cache"))
-            .output()
-            .expect("spawn nubx");
-        (
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-            out.status.code().unwrap_or(-1),
-        )
-    };
-
-    // ── FILE tier — a leading Node flag, eval, stdin, `--`, and `--node` compat
-    // all reach Node; the raw argv (minus nub's own `--node`) is preserved. This is
-    // the half #224 broke: clap used to reject any Node flag before the file.
-    //
-    // Augmentation PREPENDS nub's own execArgv (the preload + experimental flags)
-    // and APPENDS the user's verbatim, so the user's leading flags are the TAIL of
-    // execArgv, in their original order. Assert that tail — NOT an exact-from-start
-    // match, which only holds when augmentation is off (the trap that masked this
-    // locally: a worktree target dir outside the tree can't find runtime/, so the
-    // dev binary ran un-augmented while CI ran augmented).
-    let (o, e, _) = nx(&["--inspect-port=0", "--enable-source-maps", "app.js"]);
-    assert!(
-        o.contains(r#""--inspect-port=0","--enable-source-maps"]"#),
-        "leading Node flags must reach Node verbatim, in order, as the execArgv tail: {o}{e}"
-    );
-    let (o, _, _) = nx(&["--import", "./app.js", "app.js", "tail"]); // value-flag skips its value
-    assert!(
-        o.contains(r#"ARGV=["tail"]"#),
-        "a Node value-flag consumes its value; the next bare token is the subject: {o}"
+        !stdout.contains("FROM-FILE") && !stdout.contains("FROM-SCRIPT"),
+        "nubx must not resolve a local file or script: stdout={stdout} stderr={stderr}"
     );
     assert!(
-        nx(&["-e", "console.log(2+2)"]).0.contains('4'),
-        "`-e` eval is the Node tier"
+        !out.status.success() && stderr.contains("refusing to download"),
+        "the token must reach the gated registry tier and fail closed in CI: \
+         status={:?} stderr={stderr}",
+        out.status.code()
     );
-    // `--` is PRESERVED into Node's argv (not stripped) — node `app.js -- --foo`
-    // keeps `--` as a program arg.
-    assert!(
-        nx(&["app.js", "--", "--foo"])
-            .0
-            .contains(r#"ARGV=["--","--foo"]"#),
-        "the first `--` after a file must reach Node, not be stripped"
-    );
-    assert!(
-        nx(&["--node", "app.js"]).0.contains(r#"EXEC=[]"#),
-        "`--node` is stripped + forces compat: no augmentation flags in execArgv"
-    );
-    // The review's P0 re-confirm: a relative / bare path that EXISTS resolves as a
-    // FILE, never falling through to the registry.
-    assert!(
-        nx(&["./app.js"]).0.contains("ARGV="),
-        "`./app.js` runs as a file"
-    );
-    assert!(
-        nx(&["sub/x.js"]).0.contains("SUBX"),
-        "a bare relative path that exists runs as a file"
-    );
-    assert!(
-        nx(&["app.js"]).0.contains("ARGV="),
-        "a bare filename that exists runs as a file"
-    );
-
-    // ── SCRIPT tier — a bare script re-dispatches to `nub run`, gaining its full
-    // flag surface. A run-only flag (`--if-present`) now works; a Node flag on a
-    // script is a clean clap error, never a silent registry fetch.
-    assert!(
-        nx(&["build"]).0.contains("SCRIPT-BUILD"),
-        "a bare script runs via `nub run`"
-    );
-    assert!(
-        nx(&["--if-present", "build"]).0.contains("SCRIPT-BUILD"),
-        "`--if-present` reaches `nub run` (the script tier's full grammar)"
-    );
-    let (_, e, code) = nx(&["--inspect", "build"]);
-    assert!(
-        code != 0 && e.contains("--inspect") && !e.to_lowercase().contains("download"),
-        "a Node flag on a script is a clean error from `nub run`, not a registry attempt: {e}"
-    );
-
-    // ── BIN tier — flags after the bin reach the bin; the post-target `--` is
-    // KEPT verbatim (Option A, decided 2026-06-28 — = pnpm 10 exec / node).
-    assert!(
-        nx(&["mytool", "a1"]).0.contains(r#"BIN ["a1"]"#),
-        "a local bin runs with its args"
-    );
-    assert!(
-        nx(&["mytool", "--help"]).0.contains(r#"BIN ["--help"]"#),
-        "a flag after the bin reaches it"
-    );
-    assert!(
-        nx(&["mytool", "--", "--fix"])
-            .0
-            .contains(r#"BIN ["--","--fix"]"#),
-        "the bin's post-target `--` is kept verbatim (Option A)"
-    );
-
-    // ── Collisions (decided): `-p` = `--package` (registry force, NOT Node print);
-    // `-r` = `--recursive` (workspace, NOT Node `--require`).
-    let (_, e, _) = nx(&["-p", "cowsay", "mytool"]);
-    assert!(
-        e.to_lowercase().contains("download") || e.to_lowercase().contains("ci"),
-        "`-p` forces the registry tier even with a local `mytool`: {e}"
-    );
-    let (_, e, code) = nx(&["-p", "cowsay", "--no-install", "mytool"]);
-    assert!(
-        code == 127 && e.contains("--no-install"),
-        "`-p`+`--no-install` errors 127, no fetch: {e}"
-    );
-    let (_, e, code) = nx(&["-r", "build"]);
-    assert!(
-        code != 0 && e.to_lowercase().contains("workspace"),
-        "`-r` is `--recursive` (workspace run), never Node's `--require`: {e}"
-    );
-
-    // ── No subject at all → the missing-name bail (registry consent never fires).
-    let (_, e, code) = nx(&["--node"]);
-    assert!(
-        code != 0 && e.contains("missing binary name"),
-        "no subject bails: {e}"
-    );
-
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5231,9 +5990,10 @@ fn dotenv_node_env_stripped_and_app_env_selects_env_file() {
         "nub must warn that a `.env` NODE_ENV was ignored: {err_a}"
     );
 
-    // (b) ambient NODE_ENV=production: passes through untouched but does NOT select
-    //     `.env.production` — NODE_ENV is no longer a mode source. No spurious
-    //     warning (the ambient value wins over the `.env` value before the strip).
+    // (b) ambient NODE_ENV=production (APP_ENV unset): passes through untouched AND
+    //     selects `.env.production` as the clamped fallback (`production` is
+    //     canonical — Next.js/Bun parity). No spurious warning (the ambient value
+    //     wins over the `.env` value before the strip).
     let (out_b, err_b, code_b) = run(Some("production"), None);
     assert_eq!(code_b, 0, "run must succeed; stderr: {err_b}");
     assert!(
@@ -5241,12 +6001,26 @@ fn dotenv_node_env_stripped_and_app_env_selects_env_file() {
         "ambient NODE_ENV must pass through: {out_b}"
     );
     assert!(
-        out_b.contains("PROD=[]"),
-        "ambient NODE_ENV must NOT select `.env.production` (no longer a mode source): {out_b}"
+        out_b.contains("PROD=[prod]"),
+        "canonical ambient NODE_ENV must select `.env.production` (clamped fallback): {out_b}"
     );
     assert!(
         !err_b.contains("ignoring NODE_ENV set in .env"),
         "no warning when an ambient NODE_ENV wins over the `.env` value: {err_b}"
+    );
+
+    // (b2) ambient NODE_ENV=staging: NON-canonical, so it is ignored for file
+    //      selection — only `.env` loads, never `.env.production`. Use APP_ENV for
+    //      arbitrary modes.
+    let (out_b2, err_b2, code_b2) = run(Some("staging"), None);
+    assert_eq!(code_b2, 0, "run must succeed; stderr: {err_b2}");
+    assert!(
+        out_b2.contains("NE=[staging]"),
+        "ambient NODE_ENV must pass through: {out_b2}"
+    );
+    assert!(
+        out_b2.contains("PROD=[]"),
+        "non-canonical NODE_ENV must NOT select a `.env.<mode>` file: {out_b2}"
     );
 
     // (c) APP_ENV=production selects `.env.production` (the mode mechanism), while

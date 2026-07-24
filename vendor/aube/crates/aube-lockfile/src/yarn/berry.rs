@@ -112,28 +112,43 @@ pub(super) fn parse_berry_str(
         let local_source = match res_protocol {
             "npm" => None,
             "workspace" => {
-                // The root workspace block lives here (`name@workspace:.`)
-                // and is driven by `package.json`, not the lockfile. We
-                // rely on the manifest pass below to populate
-                // `importers["."]`, and skip emitting workspace blocks
-                // as `LockedPackage` entries.
+                // Workspace blocks are importers, not packages: the root
+                // (`name@workspace:.`) and every member (`name@workspace:pkgs/x`).
+                // We never emit them as `LockedPackage` entries — the root
+                // and member importers are rebuilt from their on-disk
+                // `package.json` manifests below (mirroring the classic reader,
+                // #154), resolving each declared range against the specs
+                // recorded here. Recording every workspace descriptor (both
+                // `@x/a@workspace:*` and `@x/a@workspace:packages/a` from a
+                // multi-spec header) is what lets an inter-member `workspace:*`
+                // dep resolve to its sibling's dep_path.
                 for spec in &specs {
                     spec_to_dep_path.insert(spec.clone(), format!("{res_name}@{version}"));
                 }
                 continue;
             }
-            "patch" => {
-                let Some(patch_path) = patch_protocol_path(res_body) else {
+            "patch" => match patch_protocol_path(res_body) {
+                PatchSelector::Single(patch_path) => {
+                    patched_dependencies.insert(format!("{res_name}@{version}"), patch_path);
+                    None
+                }
+                PatchSelector::Skip => {
                     tracing::warn!(
                         code = aube_codes::warnings::WARN_AUBE_YARN_BERRY_UNSUPPORTED,
                         "yarn berry patch protocol in block '{}' is not supported — entry skipped",
                         key_str,
                     );
                     continue;
-                };
-                patched_dependencies.insert(format!("{res_name}@{version}"), patch_path);
-                None
-            }
+                }
+                PatchSelector::Multiple => {
+                    return Err(Error::parse(
+                        path,
+                        format!(
+                            "yarn berry patch block '{key_str}' lists multiple patch files in one selector; aube applies one patch per package"
+                        ),
+                    ));
+                }
+            },
             "portal" => Some(LocalSource::Portal(PathBuf::from(strip_hash_fragment(
                 res_body,
             )))),
@@ -210,6 +225,22 @@ pub(super) fn parse_berry_str(
 
         for spec in &specs {
             spec_to_dep_path.insert(spec.clone(), dep_path.clone());
+            // A `patch:` block header carries `::locator=…` (and sometimes
+            // `::version=…&hash=…`) qualifiers that a resolution's patch value
+            // and a transitive patch edge do NOT — yarn appends them when it
+            // writes the lock. Register the qualifier-stripped descriptor too,
+            // or a `resolutions: {pkg: "patch:pkg@<ver>#./.yarn/patches/…"}`
+            // pin (or a transitive edge to the patched package) misses the
+            // suffixed header and the patched package silently drops from the
+            // importer (cal.com's `libphonenumber-js` absent at `apps/web`).
+            // The base encoding (`npm%3A` vs bare) is preserved verbatim from
+            // the resolution value into the header, so a plain prefix strip
+            // matches without any URL-decoding.
+            if let Some((stripped, _)) = spec.split_once("::")
+                && stripped.contains("@patch:")
+            {
+                spec_to_dep_path.insert(stripped.to_string(), dep_path.clone());
+            }
         }
 
         // Transitive deps: `name: "protocol:range"`. We store the raw
@@ -263,6 +294,22 @@ pub(super) fn parse_berry_str(
         }
     }
 
+    // A root `resolutions` entry rewrites the descriptor yarn writes
+    // to the lockfile, so the block is keyed by the *resolved* range,
+    // not the manifest range. With `resolutions: {"@types/node":
+    // "18.x"}` and a manifest range of `^18.14`, yarn.lock holds only
+    // `@types/node@npm:18.x`; matching the raw range misses and the dep
+    // is silently dropped. Applied to direct deps in `push_direct` below
+    // AND to transitive edges in the second pass (a `resolutions` pin
+    // rewrites a TRANSITIVE descriptor's block key too — cal.com pins
+    // `picomatch@^2.3.1` to `2.3.2`, so micromatch's `picomatch@^2.3.1`
+    // edge misses the `picomatch@npm:2.3.2` block and drops the whole
+    // subtree). `overrides_map` collects yarn `resolutions` (alongside
+    // npm/pnpm overrides, harmless here); `override_match` handles both
+    // bare-name (`@types/node`) and descriptor-keyed (`lru-cache@^10.0.1`)
+    // resolution keys.
+    let resolution_rules = crate::override_match::compile(&manifest.overrides_map());
+
     // Second pass: resolve raw header specs on each package's
     // `dependencies` / `optional_dependencies` map to canonical dep_paths.
     let mut resolved_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
@@ -281,6 +328,32 @@ pub(super) fn parse_berry_str(
                     path,
                 )? {
                     out.insert(name.clone(), target);
+                    continue;
+                }
+                // Miss: a root `resolutions` may have rewritten this
+                // transitive descriptor's block key (see the note above).
+                // Retry the resolution-rewritten candidate before giving up,
+                // mirroring `push_direct`. `raw_spec` is `name@<tail>`; strip
+                // the `name@` and any `npm:` protocol to get the semver range
+                // `override_match` reasons about.
+                let range = raw_spec
+                    .strip_prefix(&format!("{name}@"))
+                    .unwrap_or(raw_spec);
+                let bare = range.strip_prefix("npm:").unwrap_or(range);
+                if let Some(resolved) = crate::override_match::apply(&resolution_rules, name, bare)
+                {
+                    for candidate in berry_spec_candidates(name, bare, Some(resolved)) {
+                        if let Some(target) = crate::resolve_dep_spec(
+                            &candidate,
+                            optional,
+                            &spec_to_dep_path,
+                            &unsupported,
+                            path,
+                        )? {
+                            out.insert(name.clone(), target);
+                            break;
+                        }
+                    }
                 }
             }
             Ok(out)
@@ -299,29 +372,65 @@ pub(super) fn parse_berry_str(
         }
     }
 
-    // A root `resolutions` entry rewrites the descriptor yarn writes
-    // to the lockfile, so the block is keyed by the *resolved* range,
-    // not the manifest range. With `resolutions: {"@types/node":
-    // "18.x"}` and a manifest range of `^18.14`, yarn.lock holds only
-    // `@types/node@npm:18.x`; matching the raw range misses and the dep
-    // is silently dropped from the importer. Apply the resolution to
-    // each direct dep before building its lockfile-spec candidates so
-    // the resolved descriptor is tried too. `overrides_map` collects
-    // yarn `resolutions` (alongside npm/pnpm overrides, harmless here);
-    // `override_match` handles both bare-name (`@types/node`) and
-    // descriptor-keyed (`lru-cache@^10.0.1`) resolution keys.
-    let resolution_rules = crate::override_match::compile(&manifest.overrides_map());
+    // Discover the workspace members from disk, mirroring the classic reader
+    // (#154). Berry DOES record a `@name@workspace:<path>` block per member, but
+    // it merges each member's `dependencies` + `devDependencies` into one block
+    // field — so the dev/prod split is unrecoverable from the lockfile. Reading
+    // the member manifests instead keeps the split exact and reuses the same
+    // resolution path as the root importer. `member_versions` (name → on-disk
+    // version) backs the workspace-sibling link fallback below.
+    let project_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut member_versions: BTreeMap<String, String> = BTreeMap::new();
+    let mut member_manifests: Vec<(String, aube_manifest::PackageJson)> = Vec::new();
+    if let Some(workspaces) = &manifest.workspaces {
+        for member_dir in super::discover_workspace_members(project_dir, workspaces.patterns()) {
+            let member_pj_path = project_dir.join(&member_dir).join("package.json");
+            let Ok(member_pj) = aube_manifest::PackageJson::from_path(&member_pj_path) else {
+                continue;
+            };
+            if let Some(name) = &member_pj.name {
+                member_versions.insert(
+                    name.clone(),
+                    member_pj.version.clone().unwrap_or_else(|| "0.0.0".into()),
+                );
+            }
+            member_manifests.push((member_dir, member_pj));
+        }
+    }
 
-    // Build direct deps from the manifest, using the yarn berry
-    // convention that a range `"^1.0.0"` corresponds to the spec
-    // `"name@npm:^1.0.0"`. If the manifest range already carries a
-    // protocol prefix (`workspace:*`, `file:./pkgs/foo`, ...), it's
-    // already a valid spec suffix and we try it verbatim first.
-    let mut direct: Vec<DirectDep> = Vec::new();
+    // A dep on a workspace SIBLING binds to the local member. Berry usually
+    // records the sibling's `workspace:*` descriptor in `spec_to_dep_path`
+    // (tried first below), but a bare-semver ref to a member has no such spec,
+    // so fall back to matching the member's on-disk version — the same rule as
+    // the classic reader's `workspace_link`. The emitted `dep_path`
+    // (`name@version`) has NO `packages` entry, the convention the linker keys
+    // on to symlink the sibling dir.
+    let workspace_link = |name: &str, range: &str| -> Option<String> {
+        let version = member_versions.get(name)?;
+        let matches = match range
+            .strip_prefix("workspace:")
+            .or_else(|| range.strip_prefix("link:"))
+            .or_else(|| range.strip_prefix("portal:"))
+        {
+            Some("" | "*" | "^" | "~") => true,
+            Some(_) if range.starts_with("link:") || range.starts_with("portal:") => true,
+            Some(rest) => super::version_satisfies(version, rest),
+            None if range.is_empty() || range == "*" => true,
+            None => super::version_satisfies(version, range),
+        };
+        matches.then(|| format!("{name}@{version}"))
+    };
+
+    // Build one importer's direct deps from a manifest, using the yarn berry
+    // convention that a range `"^1.0.0"` maps to the spec `"name@npm:^1.0.0"`. A
+    // range already carrying a protocol (`workspace:*`, `file:./pkgs/foo`) is a
+    // valid spec suffix and tried verbatim first. `importer` keys the skipped-
+    // optional map; a resolved miss falls back to a workspace-sibling link.
     let push_direct = |name: &str,
                        range: &str,
                        dep_type: DepType,
-                       direct: &mut Vec<DirectDep>,
+                       importer: &str,
+                       into: &mut Vec<DirectDep>,
                        skipped: &mut BTreeMap<String, BTreeMap<String, String>>|
      -> Result<(), Error> {
         let resolved = crate::override_match::apply(&resolution_rules, name, range);
@@ -335,7 +444,7 @@ pub(super) fn parse_berry_str(
             if let Some(dep_path) =
                 crate::resolve_dep_spec(candidate, optional, &spec_to_dep_path, &unsupported, path)?
             {
-                direct.push(DirectDep {
+                into.push(DirectDep {
                     name: name.to_string(),
                     dep_path,
                     dep_type,
@@ -349,44 +458,63 @@ pub(super) fn parse_berry_str(
             // platform-filtered optional (drift.rs `skipped_optional_dependencies`).
             if optional && unsupported.contains_key(candidate) {
                 skipped
-                    .entry(".".to_string())
+                    .entry(importer.to_string())
                     .or_default()
                     .insert(name.to_string(), range.to_string());
                 return Ok(());
             }
         }
+        if let Some(dep_path) = workspace_link(name, range) {
+            into.push(DirectDep {
+                name: name.to_string(),
+                dep_path,
+                dep_type,
+                specifier: None,
+            });
+        }
         Ok(())
     };
-    for (name, range) in &manifest.dependencies {
-        push_direct(
-            name,
-            range,
-            DepType::Production,
-            &mut direct,
-            &mut skipped_optional,
-        )?;
-    }
-    for (name, range) in &manifest.dev_dependencies {
-        push_direct(
-            name,
-            range,
-            DepType::Dev,
-            &mut direct,
-            &mut skipped_optional,
-        )?;
-    }
-    for (name, range) in &manifest.optional_dependencies {
-        push_direct(
-            name,
-            range,
-            DepType::Optional,
-            &mut direct,
-            &mut skipped_optional,
-        )?;
-    }
+
+    // Build the direct deps for one manifest (root or member) in dependency-
+    // type order, so a member importer carries its own dev/prod/optional split.
+    let build_importer = |importer: &str,
+                          pj: &aube_manifest::PackageJson,
+                          skipped: &mut BTreeMap<String, BTreeMap<String, String>>|
+     -> Result<Vec<DirectDep>, Error> {
+        let mut out: Vec<DirectDep> = Vec::new();
+        for (name, range) in &pj.dependencies {
+            push_direct(
+                name,
+                range,
+                DepType::Production,
+                importer,
+                &mut out,
+                skipped,
+            )?;
+        }
+        for (name, range) in &pj.dev_dependencies {
+            push_direct(name, range, DepType::Dev, importer, &mut out, skipped)?;
+        }
+        for (name, range) in &pj.optional_dependencies {
+            push_direct(name, range, DepType::Optional, importer, &mut out, skipped)?;
+        }
+        Ok(out)
+    };
 
     let mut importers = BTreeMap::new();
-    importers.insert(".".to_string(), direct);
+    importers.insert(
+        ".".to_string(),
+        build_importer(".", manifest, &mut skipped_optional)?,
+    );
+
+    // Reconstruct each workspace-member importer from its on-disk manifest.
+    // Without this, a frozen install off a berry yarn.lock links only the root
+    // and silently skips every member (the cal.com 114-workspace bug: exit 0,
+    // members absent).
+    for (member_dir, member_pj) in &member_manifests {
+        let member_direct = build_importer(member_dir, member_pj, &mut skipped_optional)?;
+        importers.insert(member_dir.clone(), member_direct);
+    }
 
     Ok(LockfileGraph {
         importers,
@@ -551,41 +679,75 @@ pub(super) fn file_protocol_source(body: &str) -> LocalSource {
     }
 }
 
-/// Extract the local patch file from Yarn's `patch:` protocol body.
+/// Classification of a Yarn `patch:` selector's real-file list.
+pub(super) enum PatchSelector {
+    /// Exactly one real project patch file to apply.
+    Single(String),
+    /// No real patch — all `builtin<…>` compat shims, or empty. Skip the entry.
+    Skip,
+    /// Two or more real patch files in one selector. aube stores one patch
+    /// path per package and can't represent this, so it's a hard error rather
+    /// than a partial apply (which would materialize a package that doesn't
+    /// match the lockfile).
+    Multiple,
+}
+
+/// Classify Yarn's `patch:` protocol body into a [`PatchSelector`].
 ///
 /// Berry encodes patched npm packages as
-/// `name@patch:name@npm%3Aversion#./.yarn/patches/name.patch::version=...`.
-/// Aube applies the patch through its existing git-diff materializer, so
-/// the only part needed here is the project-relative path after `#`.
+/// `name@patch:name@npm%3Aversion#<selector>::version=...&hash=...`.
+/// Aube applies a single patch through its existing git-diff materializer.
 ///
-/// Returns `None` for builtin-compat patches — yarn's internal shims for
-/// packages like `resolve`/`typescript`, which carry no real patch file
-/// and resolve from the companion `npm:` block. These appear bare
-/// (`builtin<compat/resolve>`, `~builtin<...>`) or with a `<qualifier>!`
-/// prefix (`optional!builtin<compat/resolve>` — the common berry form via
-/// eslint-plugin-import/webpack/rollup). The qualifier is stripped before
-/// the builtin check so the `!`-qualified target isn't mistaken for a
-/// filesystem path.
-fn patch_protocol_path(body: &str) -> Option<String> {
-    let (_, after_hash) = body.split_once('#')?;
-    let path = after_hash
+/// The selector is a `&`-joined list of patch paths (Yarn's
+/// `patchUtils.ts` grammar). `builtin<…>` segments are Yarn's internal
+/// compat shims with no project file to apply — aube ignores them (the
+/// package still resolves via its plain `npm:` block). `::`-params are split
+/// off first because they contain their own `&`. One real patch →
+/// [`PatchSelector::Single`]; all-builtin/empty → [`PatchSelector::Skip`];
+/// multiple real patches → [`PatchSelector::Multiple`] (Yarn permits this but
+/// its CLI never emits it).
+pub(super) fn patch_protocol_path(body: &str) -> PatchSelector {
+    let Some((_, after_hash)) = body.split_once('#') else {
+        return PatchSelector::Skip;
+    };
+    let selector = after_hash
         .split_once("::")
         .map(|(p, _)| p)
         .unwrap_or(after_hash);
-    // A `<qualifier>!builtin<...>` target carries one or more `!`-joined
-    // qualifiers (e.g. `optional!`) ahead of the selector. Strip up to and
-    // including the last `!` so the builtin check sees the bare selector.
-    let selector = path.rsplit_once('!').map(|(_, s)| s).unwrap_or(path);
-    if selector.is_empty() || selector.starts_with("builtin<") || selector.starts_with("~builtin<")
-    {
-        return None;
+    let mut reals = selector.split('&').filter_map(|path| {
+        // Strip `!`-delimited flags up to the last `!` (Yarn 4.0+).
+        let path = path.rsplit_once('!').map_or(path, |(_, p)| p);
+        // Strip the `~/` project-root prefix (Yarn 4.0+ `onProject`), or the
+        // legacy bare-`~` optional flag (Yarn 3.x, `~builtin<…>`). They never
+        // collide: a project path is `~/…` (slash), the flag is `~`+non-slash.
+        let path = if let Some(rest) = path.strip_prefix("~/") {
+            rest
+        } else if let Some(rest) = path.strip_prefix('~') {
+            rest
+        } else {
+            path
+        };
+        let is_builtin = path.starts_with("builtin<") && path.ends_with('>');
+        (!path.is_empty() && !is_builtin).then_some(path)
+    });
+    let Some(first) = reals.next() else {
+        return PatchSelector::Skip;
+    };
+    if reals.next().is_some() {
+        return PatchSelector::Multiple;
     }
-    Some(path.to_string())
+    PatchSelector::Single(first.to_string())
 }
 
 fn patch_spec_path(spec: &str) -> Option<String> {
     let (_, protocol, body) = parse_berry_spec(spec)?;
-    (protocol == "patch").then(|| patch_protocol_path(body))?
+    if protocol != "patch" {
+        return None;
+    }
+    match patch_protocol_path(body) {
+        PatchSelector::Single(p) => Some(p),
+        PatchSelector::Skip | PatchSelector::Multiple => None,
+    }
 }
 
 fn patch_spec_matches(
@@ -678,6 +840,26 @@ pub fn write_berry(
     // specifiers in the same map.
     let canonical = crate::build_canonical_map(graph);
 
+    // Berry's `patch:` protocol keys resolutions by the concrete
+    // `name@version`, but the declared patch keys may be ranges / `*` /
+    // bare names. Resolve them against the graph up front (pnpm's
+    // `getPatchInfo`) so the exact `spec_key()` lookups below find the
+    // patch instead of silently dropping it from the emitted lockfile.
+    // For all-exact keys this equals `graph.patched_dependencies`.
+    let resolved_patched = crate::patch_groups::resolve_patched_by_version(
+        &graph.patched_dependencies,
+        &graph.packages,
+    )
+    .map_err(|e| match e {
+        crate::patch_groups::PatchResolveError::InvalidRange(r) => {
+            Error::PatchNonSemverRange(r.message())
+        }
+        crate::patch_groups::PatchResolveError::Conflict(c) => Error::PatchKeyConflict {
+            message: c.message(),
+            hint: c.hint(),
+        },
+    })?;
+
     // `extra_specs[canonical_key]` is the set of range-form
     // specifiers (e.g. `"foo@npm:^1.0.0"`) that should appear in the
     // block header alongside the exact `foo@npm:1.2.3` one. Collecting
@@ -712,10 +894,10 @@ pub fn write_berry(
         };
         let manifest_spec = format_berry_spec(&dep.name, range);
         let pkg = canonical.get(&canonical_key).copied().unwrap();
-        if patch_spec_matches(&manifest_spec, pkg, &graph.patched_dependencies) {
+        if patch_spec_matches(&manifest_spec, pkg, &resolved_patched) {
             patch_specs.insert(canonical_key.clone(), manifest_spec.clone());
         }
-        let exact_spec = berry_exact_spec(pkg, &graph.patched_dependencies, &patch_specs);
+        let exact_spec = berry_exact_spec(pkg, &resolved_patched, &patch_specs);
         if manifest_spec != exact_spec {
             extra_specs
                 .entry(canonical_key)
@@ -736,11 +918,10 @@ pub fn write_berry(
                 continue;
             };
             let manifest_spec = format_berry_spec(dep_name, range);
-            if patch_spec_matches(&manifest_spec, target_pkg, &graph.patched_dependencies) {
+            if patch_spec_matches(&manifest_spec, target_pkg, &resolved_patched) {
                 patch_specs.insert(target.clone(), manifest_spec.clone());
             }
-            let exact_spec =
-                berry_exact_spec(target_pkg, &graph.patched_dependencies, &patch_specs);
+            let exact_spec = berry_exact_spec(target_pkg, &resolved_patched, &patch_specs);
             if manifest_spec != exact_spec {
                 extra_specs.entry(target).or_default().insert(manifest_spec);
             }
@@ -783,7 +964,7 @@ pub fn write_berry(
         // (a package nothing in this graph references by range — rare, e.g.
         // an orphaned transitive) do we fall back to the exact spec so the
         // block still has a parseable header.
-        let exact_spec = berry_exact_spec(pkg, &graph.patched_dependencies, &patch_specs);
+        let exact_spec = berry_exact_spec(pkg, &resolved_patched, &patch_specs);
         let mut header_specs: Vec<String> = Vec::new();
         if let Some(extras) = extra_specs.get(canonical_key) {
             for s in extras {
@@ -830,7 +1011,7 @@ pub fn write_berry(
             &pkg.dependencies,
             &pkg.declared_dependencies,
             &canonical,
-            &graph.patched_dependencies,
+            &resolved_patched,
             &patch_specs,
         );
         write_berry_dep_map(
@@ -839,7 +1020,7 @@ pub fn write_berry(
             &pkg.optional_dependencies,
             &pkg.declared_dependencies,
             &canonical,
-            &graph.patched_dependencies,
+            &resolved_patched,
             &patch_specs,
         );
         write_berry_peer_deps(&mut out, &pkg.peer_dependencies);

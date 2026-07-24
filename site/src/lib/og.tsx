@@ -74,14 +74,18 @@ type CardProps = {
 };
 
 /* Size the headline by length: short titles read large, long ones step down so
-   they still fit one or two lines. Sized generously — these cards render small
-   in a feed, so the title has to carry from a thumbnail. Element titles (the
-   home tagline) use a fixed size since their length can't be measured here. */
+   they still fit the card with clear space above the footer wordmark (the
+   longest bucket wraps to three lines). Sized generously — these cards render
+   small in a feed, so the title has to carry from a thumbnail. Element titles
+   (the home tagline) use a fixed size since their length can't be measured
+   here. */
 function titleFontSize(title: ReactElement | string): string {
   if (typeof title !== 'string') return '108px';
   if (title.length <= 16) return '132px';
   if (title.length <= 24) return '112px';
-  return '92px';
+  if (title.length <= 40) return '92px';
+  if (title.length <= 58) return '80px';
+  return '72px';
 }
 
 /* The card body, shared by the home and per-page cards. The ember glow, ink

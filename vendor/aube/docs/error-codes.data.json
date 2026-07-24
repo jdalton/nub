@@ -19,6 +19,12 @@
       "exit_code": 12
     },
     {
+      "name": "ERR_AUBE_LOCKFILE_UNSUPPORTED_SOURCE",
+      "category": "Lockfile",
+      "description": "A lockfile entry's dependency source (protocol) can't be resolved from that lockfile — e.g. a git or jsr source in a yarn.lock — so the installed tree would silently diverge from the incumbent's. Install with the original package manager, or remove the dependency.",
+      "exit_code": 14
+    },
+    {
       "name": "ERR_AUBE_RESOLUTION_SHAPE_MISMATCH",
       "category": "Lockfile",
       "description": "A registry-style lockfile dependency path is backed by a git, local directory, or direct tarball resolution.",
@@ -99,7 +105,7 @@
     {
       "name": "ERR_AUBE_TRUST_EXCLUDE_INVALID_VERSION_UNION",
       "category": "Resolver",
-      "description": "A `trustPolicyExclude` pattern had a non-exact version.",
+      "description": "A `trustPolicyExclude` pattern had an invalid semver range.",
       "exit_code": null
     },
     {
@@ -151,6 +157,12 @@
       "exit_code": 40
     },
     {
+      "name": "ERR_AUBE_ACCESS_ENTITY_NOT_FOUND",
+      "category": "Registry / network",
+      "description": "Registry returned 404 for an access user, organization, or team.",
+      "exit_code": null
+    },
+    {
       "name": "ERR_AUBE_VERSION_NOT_FOUND",
       "category": "Registry / network",
       "description": "Package exists but the requested version doesn't.",
@@ -159,8 +171,14 @@
     {
       "name": "ERR_AUBE_UNAUTHORIZED",
       "category": "Registry / network",
-      "description": "Registry returned 401/403 — missing or invalid auth. Run `aube login`.",
+      "description": "Registry returned 401 — missing or invalid auth. Run `aube login`.",
       "exit_code": 42
+    },
+    {
+      "name": "ERR_AUBE_FORBIDDEN",
+      "category": "Registry / network",
+      "description": "Registry returned 403 — authenticated but forbidden (insufficient permissions, token scope, or blocked by policy). The registry's message is included.",
+      "exit_code": null
     },
     {
       "name": "ERR_AUBE_OFFLINE",
@@ -245,6 +263,24 @@
       "category": "Linker",
       "description": "Applying a `pnpm.patchedDependencies` patch failed.",
       "exit_code": 60
+    },
+    {
+      "name": "ERR_AUBE_PATCH_KEY_CONFLICT",
+      "category": "Linker",
+      "description": "Two `patchedDependencies` version ranges both match one resolved package.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_PATCH_NON_SEMVER_RANGE",
+      "category": "Linker",
+      "description": "A `patchedDependencies` key's version selector is not a valid semver range.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_UNUSED_PATCH",
+      "category": "Linker",
+      "description": "A declared `patchedDependencies` key matched no installed package. Set `allowUnusedPatches` to downgrade it to a warning.",
+      "exit_code": null
     },
     {
       "name": "ERR_AUBE_LINK_FAILED",
@@ -343,9 +379,21 @@
       "exit_code": null
     },
     {
+      "name": "ERR_AUBE_NO_BRANDED_CONFIG_FILE",
+      "category": "Engine / CLI",
+      "description": "A `config set` write targeted the tool's own user/project config file, but the active embedder profile has no branded config file (`config_namespace = None`) — it keeps settings on the neutral `.npmrc` + environment surface. Set the value in `.npmrc`, `pnpm-workspace.yaml`/`package.json`, or via an environment variable instead. Unreachable for standalone aube, which always has a `~/.config/aube/config.toml`.",
+      "exit_code": null
+    },
+    {
       "name": "ERR_AUBE_CONFLICTING_BUILD_FLAGS",
       "category": "Engine / CLI",
       "description": "`aube add` was passed the same package name in both `--allow-build` and `--deny-build`.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_ACCESS_INVALID_ARGUMENT",
+      "category": "Engine / CLI",
+      "description": "`aube access` received an invalid access setting, permission level, team, or package argument.",
       "exit_code": null
     },
     {
@@ -409,6 +457,12 @@
       "exit_code": null
     },
     {
+      "name": "ERR_AUBE_INSTALL_CANCELLED",
+      "category": "Misc / safety",
+      "description": "An in-process install was cooperatively cancelled by its embedding host. Cancellation is observed at safe install boundaries so an in-flight filesystem phase is not abandoned mid-mutation.",
+      "exit_code": null
+    },
+    {
       "name": "ERR_AUBE_UNSAFE_INDEX_KEY",
       "category": "Misc / safety",
       "description": "A package index key tried to escape its directory (path traversal defense in depth).",
@@ -419,6 +473,54 @@
       "category": "Misc / safety",
       "description": "A `#!` shebang named an unsafe interpreter when generating a shim — substituted with `node` instead. Surfaced as `tracing::error!` but install continues.",
       "exit_code": 91
+    },
+    {
+      "name": "ERR_AUBE_EMBED_INVALID_PROJECT",
+      "category": "Misc / safety",
+      "description": "An in-process embedder was given a project directory that could not be created, inspected, or resolved.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_EMBED_INSTALL_FAILED",
+      "category": "Misc / safety",
+      "description": "An in-process embedder could not initialize its host callback or received an install failure without a more specific stable code.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_EMBED_INVALID_SETTING",
+      "category": "Misc / safety",
+      "description": "An in-process embedder passed a setting default whose name is not a canonical aube setting.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_EMBED_ALREADY_INITIALIZED",
+      "category": "Misc / safety",
+      "description": "An in-process embedder tried to register setting defaults after the process already initialized its embedder profile.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_FFI_INVALID_ARGUMENT",
+      "category": "Misc / safety",
+      "description": "A C ABI call received a null pointer, invalid UTF-8, malformed JSON, or an unsupported option value.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_FFI_UNKNOWN_HANDLE",
+      "category": "Misc / safety",
+      "description": "A C ABI wait or cancellation call referenced an unknown or already-consumed operation handle.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_FFI_RUNTIME",
+      "category": "Misc / safety",
+      "description": "The C ABI could not initialize or use its internal asynchronous runtime.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_FFI_PANIC",
+      "category": "Misc / safety",
+      "description": "A panic was caught at the C ABI boundary before it could cross into the host process.",
+      "exit_code": null
     },
     {
       "name": "ERR_AUBE_UNSAFE_PACKAGE_NAME",
@@ -480,6 +582,12 @@
       "name": "WARN_AUBE_IGNORED_BUILD_SCRIPTS",
       "category": "Install lifecycle",
       "description": "Dep had `preinstall`/`install`/`postinstall` scripts but isn't on the `allowBuilds` allowlist. Run `aube approve-builds`.",
+      "exit_code": null
+    },
+    {
+      "name": "WARN_AUBE_DEFAULT_TRUST_BUILDS",
+      "category": "Install lifecycle",
+      "description": "The `defaultTrust` floor let listed packages run build scripts without an explicit `allowBuilds` entry. Disclosure, not an error — set `defaultTrust=false` or an explicit `allowBuilds: false` entry to opt out.",
       "exit_code": null
     },
     {
@@ -567,6 +675,12 @@
       "exit_code": null
     },
     {
+      "name": "WARN_AUBE_UNUSED_PATCH",
+      "category": "Settings / config validation",
+      "description": "A declared `patchedDependencies` key matched no installed package, downgraded from an error by `allowUnusedPatches`.",
+      "exit_code": null
+    },
+    {
       "name": "WARN_AUBE_INVALID_PEER_PATTERN",
       "category": "Settings / config validation",
       "description": "A `peerDependencyRules` pattern was unparseable and skipped.",
@@ -588,6 +702,12 @@
       "name": "WARN_AUBE_MANAGED_CONFIG_ENFORCED",
       "category": "Settings / config validation",
       "description": "Managed hardening config enforced a stricter value than local config, env, or CLI requested.",
+      "exit_code": null
+    },
+    {
+      "name": "WARN_AUBE_INVALID_NAMED_REGISTRY_URL",
+      "category": "Settings / config validation",
+      "description": "A `namedRegistries` alias mapped to a value that is not a valid http(s) URL. The alias was dropped.",
       "exit_code": null
     },
     {
@@ -795,6 +915,12 @@
       "exit_code": null
     },
     {
+      "name": "WARN_AUBE_LOCKFILE_UNSUPPORTED_SOURCE",
+      "category": "Lockfile",
+      "description": "An OPTIONAL dependency's source (protocol) can't be resolved from the lockfile (e.g. a git or jsr source). It was skipped; the install continues. A non-optional such dependency is a hard error (ERR_AUBE_LOCKFILE_UNSUPPORTED_SOURCE) instead.",
+      "exit_code": null
+    },
+    {
       "name": "WARN_AUBE_LOCKFILE_MALFORMED_PEER_SUFFIX",
       "category": "Lockfile",
       "description": "A pnpm dep_path peer suffix had unbalanced parentheses (a truncated or hand-corrupted lockfile entry). The key is preserved verbatim instead of silently dropping everything after the `(`, so a later install surfaces the bad entry rather than mis-resolving it.",
@@ -804,6 +930,12 @@
       "name": "WARN_AUBE_GLOBAL_OUTDATED_NO_LOCKFILE",
       "category": "Lockfile",
       "description": "`aube outdated -g` found a global install without a lockfile and skipped that install.",
+      "exit_code": null
+    },
+    {
+      "name": "WARN_AUBE_LOCKFILE_LEGACY_INCOMPLETE_GRAPH",
+      "category": "Lockfile",
+      "description": "A legacy npm lockfile (lockfileVersion 1 / pre-2017 npm-shrinkwrap.json) hoists a package to the top level with no recorded dependency edge — pre-npm-5 shrinkwraps omit the `requires` links that record which package depends on it. The package is unreachable from the project's dependencies and will not be installed. Re-lock with npm 7+ (or `nub install` then commit the regenerated lockfile) for a complete graph.",
       "exit_code": null
     },
     {

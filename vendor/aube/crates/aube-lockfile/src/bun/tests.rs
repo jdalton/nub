@@ -2202,3 +2202,28 @@ fn test_parse_rejects_unsupported_lockfile_version() {
         "unsupported version error should name the version and the supported set, got: {msg}"
     );
 }
+
+/// The LENIENT default (standalone aube, `strict_unsupported_source:
+/// false`): an ident tail with an unrecognized protocol falls through to
+/// a plain registry pin, exactly as before the strict policy existed —
+/// the in-crate suite runs under the default embedder, so this pins the
+/// fork-discipline guarantee that only a strict profile changes behavior.
+#[test]
+fn test_unknown_protocol_tail_stays_a_registry_pin_by_default() {
+    assert!(!aube_util::embedder().strict_unsupported_source);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let content = r#"{
+  "lockfileVersion": 1,
+  "workspaces": { "": { "dependencies": { "foo": "exotic:bar" } } },
+  "packages": { "foo": ["foo@exotic:bar", {}] }
+}"#;
+    std::fs::write(tmp.path(), content).unwrap();
+    let graph = parse(tmp.path()).expect("lenient default must not fatal");
+    let foo = graph
+        .packages
+        .values()
+        .find(|p| p.name == "foo")
+        .expect("foo reclassified as a registry package");
+    assert_eq!(foo.version, "exotic:bar");
+    assert!(foo.local_source.is_none());
+}

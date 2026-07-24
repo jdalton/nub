@@ -5,14 +5,14 @@
     "runtime",
     "watch",
     "runner",
+    "init",
     "install",
     "node",
     "pm",
-    "pm-shim",
+    "deployment",
     "plugins",
     "faq",
     "---",
-    "setup-nub",
-    "docker"
+    "[Guides](/guides)"
   ]
 }

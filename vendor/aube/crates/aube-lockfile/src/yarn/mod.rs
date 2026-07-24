@@ -117,5 +117,66 @@ pub fn is_berry_path(path: &Path) -> bool {
         .any(|(i, w)| w == needle && (i == 0 || buf[i - 1] == b'\n'))
 }
 
+/// Expand the root manifest's `workspaces` globs against the on-disk
+/// tree, returning each member's project-relative directory (POSIX
+/// `/`-separated, the importer-key form) that contains a `package.json`.
+/// Mirrors npm/yarn workspace globbing: a `packages/*` pattern matches
+/// direct child directories; an explicit `packages/app` matches that one
+/// directory. Shared by both the classic and berry readers to reconstruct
+/// member importers from disk (a berry yarn.lock records members but merges
+/// their dep types; classic records no member structure at all).
+pub(super) fn discover_workspace_members(project_dir: &Path, patterns: &[String]) -> Vec<String> {
+    let mut members: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for pattern in patterns {
+        // Negation patterns (`!packages/excluded`) and the root itself
+        // aren't member sources here.
+        if pattern.starts_with('!') || pattern == "." {
+            continue;
+        }
+        let glob_pat = project_dir.join(pattern);
+        let Some(glob_str) = glob_pat.to_str() else {
+            continue;
+        };
+        let Ok(paths) = glob::glob(glob_str) else {
+            continue;
+        };
+        for entry in paths.flatten() {
+            if !entry.is_dir() || !entry.join("package.json").is_file() {
+                continue;
+            }
+            let Ok(rel) = entry.strip_prefix(project_dir) else {
+                continue;
+            };
+            // Importer keys are POSIX-relative (`packages/app`), never
+            // the host's `\`-separated form.
+            let rel_posix = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            if !rel_posix.is_empty() {
+                members.insert(rel_posix);
+            }
+        }
+    }
+    members.into_iter().collect()
+}
+
+/// Does `version` satisfy the semver `range`? An empty/whitespace range
+/// means "any" (npm/yarn/pnpm treat it as `*`; `node_semver` rejects it).
+/// Mirrors the resolver's `version_satisfies` for the workspace-link
+/// match — a bare uncached parse, since the workspace-sibling path runs
+/// only over the handful of member-to-member deps, not a resolver hot loop.
+pub(super) fn version_satisfies(version: &str, range: &str) -> bool {
+    let range = if range.trim().is_empty() { "*" } else { range };
+    let (Ok(v), Ok(r)) = (
+        node_semver::Version::parse(version),
+        node_semver::Range::parse(range),
+    ) else {
+        return false;
+    };
+    v.satisfies(&r)
+}
+
 #[cfg(test)]
 mod tests;

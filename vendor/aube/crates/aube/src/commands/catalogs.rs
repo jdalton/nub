@@ -13,7 +13,7 @@
 use aube_settings::resolved::CatalogMode;
 use miette::WrapErr;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Outcome of matching an `aube add` spec against the default catalog.
 #[derive(Debug)]
@@ -273,6 +273,164 @@ pub(crate) fn upsert_catalog_entries(
         )
     })?;
     Ok(())
+}
+
+/// Where `--save-catalog` / `--save-catalog-name` entries are written.
+/// Identity-selected: an embedder whose active incumbent does not read
+/// the pnpm-named workspace YAML (nub identity, any non-pnpm incumbent)
+/// must not write the catalog there — the next resolve would not read it
+/// back — so the catalog lands in the neutral `workspaces.catalog(s)`
+/// field of package.json instead.
+pub(crate) enum CatalogWriteTarget {
+    /// pnpm incumbent, or standalone aube's default: the workspace YAML
+    /// is the canonical catalog home.
+    WorkspaceYaml(PathBuf),
+    /// nub identity / non-pnpm incumbent: `workspaces.catalog(s)` in the
+    /// workspace-root package.json — catalog-discovery source 1, the same
+    /// neutral field `nub pm use nub` migrates catalogs into.
+    Manifest(PathBuf),
+}
+
+/// Resolve (and validate) where queued catalog entries must land,
+/// WITHOUT mutating anything. Callers resolve this BEFORE writing the
+/// dependent manifest, so a `--save-catalog` that cannot land its entry
+/// fails before rewriting a manifest to an unresolvable `catalog:`
+/// reference (issue #369: nub identity wrote the catalog to a
+/// pnpm-named YAML it then refused to read, leaving `package.json`
+/// mutated but unresolvable).
+pub(crate) fn resolve_catalog_write_target(cwd: &Path) -> miette::Result<CatalogWriteTarget> {
+    // `read_branded_pnpm_config` is the exact gate deciding whether the
+    // pnpm-named workspace YAML is a read surface. When it is (pnpm
+    // incumbent, or standalone aube's default) the YAML is the catalog
+    // home — unchanged. When it is not, `workspace_yaml_names()` drops
+    // that YAML from every read, so a catalog written there is invisible
+    // and must live in `workspaces.catalog` in package.json.
+    if aube_util::engine_context().read_branded_pnpm_config {
+        let yaml_root = crate::dirs::find_workspace_yaml_root(cwd)
+            .or_else(|| crate::dirs::find_workspace_root(cwd))
+            .unwrap_or_else(|| cwd.to_path_buf());
+        return Ok(CatalogWriteTarget::WorkspaceYaml(
+            aube_manifest::workspace::workspace_yaml_target(&yaml_root),
+        ));
+    }
+    let manifest_root = crate::dirs::find_workspace_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let manifest_path = manifest_root.join("package.json");
+    // The catalog is written into an EXISTING package.json. Require it in
+    // the pre-flight so the apply (which runs AFTER the dependent manifest
+    // is written) cannot fail on a missing target and leave a dangling
+    // `catalog:` reference behind — this keeps the #369 guarantee from
+    // silently depending on the embedder's `workspace_yaml`/root-discovery
+    // shape.
+    if !manifest_path.is_file() {
+        return Err(miette::miette!(
+            "cannot save to a catalog: no package.json found at the workspace root ({})",
+            manifest_root.display()
+        ));
+    }
+    // A bare-string `workspaces` cannot carry the object-form `catalog`
+    // key. Reject up front so the pre-flight fails before any manifest
+    // mutation rather than half-way through.
+    let manifest = crate::commands::load_manifest(&manifest_path)?;
+    if matches!(manifest.workspaces, Some(aube_manifest::Workspaces::String(_))) {
+        return Err(miette::miette!(
+            "cannot save to a catalog: package.json#workspaces is a bare string; \
+             convert it to an array or object form to hold a `workspaces.catalog`"
+        ));
+    }
+    Ok(CatalogWriteTarget::Manifest(manifest_path))
+}
+
+/// Apply queued catalog entries to a pre-resolved [`CatalogWriteTarget`].
+pub(crate) fn apply_catalog_upserts(
+    target: &CatalogWriteTarget,
+    entries: &[CatalogUpsert],
+) -> miette::Result<()> {
+    match target {
+        CatalogWriteTarget::WorkspaceYaml(path) => upsert_catalog_entries(path, entries),
+        CatalogWriteTarget::Manifest(path) => upsert_catalog_entries_in_manifest(path, entries),
+    }
+}
+
+/// Insert-only upsert of catalog entries into the neutral
+/// `workspaces.catalog(s)` object of a package.json, preserving the
+/// file's top-level key order via [`update_manifest_json_object`]
+/// (indentation is re-normalized, as with every aube manifest edit).
+/// Mirrors [`upsert_catalog_entries`]' never-overwrite semantics.
+/// Normalizes an array-form `workspaces` into the object form (packages
+/// preserved) so it can carry a catalog — the same shape `nub pm use
+/// nub` writes.
+fn upsert_catalog_entries_in_manifest(
+    manifest_path: &Path,
+    entries: &[CatalogUpsert],
+) -> miette::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    crate::commands::update_manifest_json_object(manifest_path, |obj| {
+        let ws = obj
+            .entry("workspaces")
+            .or_insert_with(|| serde_json::json!({ "packages": [] }));
+        match ws {
+            // Array (membership-only) form -> object form, packages kept.
+            serde_json::Value::Array(_) => {
+                let packages = std::mem::take(ws);
+                *ws = serde_json::json!({ "packages": packages });
+            }
+            // Guarded in resolve_catalog_write_target; keep the invariant
+            // local in case a caller reaches here by another path.
+            serde_json::Value::String(_) => {
+                return Err(miette::miette!(
+                    "package.json#workspaces is a bare string and cannot hold a catalog"
+                ));
+            }
+            _ => {}
+        }
+        let serde_json::Value::Object(ws_obj) = ws else {
+            return Err(miette::miette!(
+                "package.json#workspaces must be an object to hold a catalog"
+            ));
+        };
+        for entry in entries {
+            let CatalogUpsert {
+                catalog,
+                package,
+                range,
+            } = entry;
+            let submap = if catalog == "default" {
+                manifest_catalog_submap(ws_obj, "catalog")?
+            } else {
+                let catalogs = manifest_catalog_submap(ws_obj, "catalogs")?;
+                manifest_catalog_submap(catalogs, catalog.as_str())?
+            };
+            submap
+                .entry(package.clone())
+                .or_insert_with(|| serde_json::Value::String(range.clone()));
+        }
+        Ok(())
+    })
+    .wrap_err_with(|| {
+        format!(
+            "failed to write {} after --save-catalog",
+            manifest_path.display()
+        )
+    })
+}
+
+/// Get-or-create a nested JSON object under `key`, erroring when an
+/// existing value is a non-object.
+fn manifest_catalog_submap<'a>(
+    obj: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> miette::Result<&'a mut serde_json::Map<String, serde_json::Value>> {
+    match obj
+        .entry(key.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+    {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => Err(miette::miette!(
+            "package.json#workspaces.{key} must be an object"
+        )),
+    }
 }
 
 /// Inner-mapping accessor mirroring `aube-manifest::workspace::workspace_yaml_submap`,
@@ -560,5 +718,73 @@ catalog:
         let dropped = prune_unused_catalog_entries(&path, &declared, &used).unwrap();
         assert!(dropped.is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    fn upsert(catalog: &str, package: &str, range: &str) -> CatalogUpsert {
+        CatalogUpsert {
+            catalog: catalog.into(),
+            package: package.into(),
+            range: range.into(),
+        }
+    }
+
+    fn write_pkg(dir: &std::path::Path, body: &str) -> PathBuf {
+        let path = dir.join("package.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    // The regression home for issue #369: under nub identity the catalog
+    // must land in `workspaces.catalog(s)` in package.json (a surface the
+    // resolver reads), not a pnpm-named yaml it refuses to read.
+    #[test]
+    fn manifest_upsert_adds_default_catalog_preserving_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pkg(dir.path(), r#"{"name":"root","workspaces":{"packages":["apps/*"]}}"#);
+        upsert_catalog_entries_in_manifest(&path, &[upsert("default", "@types/node", "^26.1.0")])
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["workspaces"]["packages"], serde_json::json!(["apps/*"]));
+        assert_eq!(v["workspaces"]["catalog"]["@types/node"], "^26.1.0");
+    }
+
+    #[test]
+    fn manifest_upsert_normalizes_array_workspaces_to_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pkg(dir.path(), r#"{"name":"root","workspaces":["apps/*"]}"#);
+        upsert_catalog_entries_in_manifest(&path, &[upsert("default", "left-pad", "^1.3.0")])
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["workspaces"]["packages"], serde_json::json!(["apps/*"]));
+        assert_eq!(v["workspaces"]["catalog"]["left-pad"], "^1.3.0");
+    }
+
+    // Insert-only: an existing entry is never overwritten, mirroring the
+    // yaml writer — a re-run with a different range is a no-op.
+    #[test]
+    fn manifest_upsert_is_insert_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pkg(
+            dir.path(),
+            r#"{"workspaces":{"packages":["a/*"],"catalog":{"react":"^18.2.0"}}}"#,
+        );
+        upsert_catalog_entries_in_manifest(&path, &[upsert("default", "react", "^19.0.0")])
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["workspaces"]["catalog"]["react"], "^18.2.0");
+    }
+
+    #[test]
+    fn manifest_upsert_named_catalog_nests_under_catalogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pkg(dir.path(), r#"{"workspaces":{"packages":["a/*"]}}"#);
+        upsert_catalog_entries_in_manifest(&path, &[upsert("types", "@types/node", "^26.1.0")])
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["workspaces"]["catalogs"]["types"]["@types/node"], "^26.1.0");
     }
 }

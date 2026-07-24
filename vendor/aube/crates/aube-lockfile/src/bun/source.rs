@@ -150,6 +150,27 @@ pub(super) fn classify_bun_ident(
     Ok((name, raw_version.to_string(), None, alias_of))
 }
 
+/// The protocol token of a version tail that reached
+/// [`classify_bun_ident`]'s registry-pin fall-through while carrying a
+/// `<token>:` protocol prefix — i.e. a source the classifier has no
+/// branch for (an unknown/future bun protocol, or a malformed spec like
+/// a `git+…` tail `parse_git_spec` rejected). A genuine registry pin is
+/// an exact semver version, which can never contain `:`, so a
+/// protocol-shaped tail here means "unresolvable from this lockfile",
+/// not "registry". Consulted only under `strict_unsupported_source`;
+/// the lenient default keeps the historical reclassify-to-registry
+/// behavior without ever calling this.
+pub(super) fn unrecognized_protocol(raw_version: &str) -> Option<&str> {
+    let token = &raw_version[..raw_version.find(':')?];
+    let mut chars = token.chars();
+    if !chars.next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    chars
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+        .then_some(token)
+}
+
 pub(super) fn rebase_workspace_scoped_local_source(
     key: &str,
     local: LocalSource,
@@ -223,10 +244,16 @@ pub(super) fn bin_value_to_map(
 /// We walk up the key's ancestors, first checking the package's own nested
 /// scope then each ancestor's, finally falling back to the hoisted entry
 /// at just the bare `dep_name`.
+///
+/// `contains` abstracts the key set being walked: the reader passes the
+/// parsed `key_info` for normal resolution, and (under
+/// `strict_unsupported_source`) re-walks with the unsupported-entry set
+/// so an edge whose target was withheld as unsupported is distinguished
+/// from a genuinely absent one.
 pub(super) fn resolve_nested_bun(
     pkg_key: &str,
     dep_name: &str,
-    key_info: &BTreeMap<String, (String, String)>,
+    contains: impl Fn(&str) -> bool,
 ) -> Option<String> {
     let mut base = pkg_key.to_string();
     loop {
@@ -235,7 +262,7 @@ pub(super) fn resolve_nested_bun(
         } else {
             format!("{base}/{dep_name}")
         };
-        if key_info.contains_key(&candidate) {
+        if contains(&candidate) {
             return Some(candidate);
         }
         if base.is_empty() {
@@ -274,21 +301,21 @@ pub(super) fn resolve_workspace_dep(
     ws_path: &str,
     ws_name: Option<&str>,
     dep_name: &str,
-    key_info: &BTreeMap<String, (String, String)>,
+    contains: impl Fn(&str) -> bool,
 ) -> Option<String> {
     if let Some(ws_name) = ws_name {
         let ws_specific = format!("{ws_name}/{dep_name}");
-        if key_info.contains_key(&ws_specific) {
+        if contains(&ws_specific) {
             return Some(ws_specific);
         }
     }
     if !ws_path.is_empty() {
         let ws_specific = format!("{ws_path}/{dep_name}");
-        if key_info.contains_key(&ws_specific) {
+        if contains(&ws_specific) {
             return Some(ws_specific);
         }
     }
-    if key_info.contains_key(dep_name) {
+    if contains(dep_name) {
         return Some(dep_name.to_string());
     }
     None
