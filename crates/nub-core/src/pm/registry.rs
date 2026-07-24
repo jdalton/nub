@@ -1256,6 +1256,26 @@ mod tests {
         );
     }
 
+    /// The success side of the trust gate: once the operator opts in
+    /// (`project_trusted = true`, via `PNPM_CONFIG_NPMRC_AUTH_FILE`), the project
+    /// `.npmrc` registry DOES expand `${VAR}` — the distinct trusted branch of
+    /// [`resolve_base`], the counterpart to `untrusted_project_registry_is_not_env_expanded`.
+    /// Deterministic without touching process env: an UNDEFINED var expands to
+    /// empty (npm's rule), so the `${...}` is consumed rather than left literal.
+    #[test]
+    fn trusted_project_registry_is_env_expanded() {
+        let base = resolve_base(
+            None,
+            Some("https://r.example/${NUB_UNSET_PROJ_REG_VAR_XYZ}/pkg".to_string()),
+            None,
+            true,
+        );
+        assert_eq!(
+            base, "https://r.example//pkg",
+            "a trusted project `.npmrc` registry must expand `${{VAR}}` (undefined → empty)"
+        );
+    }
+
     /// The pnpm trust flag is a PATH, not a boolean: it re-trusts the project
     /// `.npmrc` ONLY when it resolves to that exact file. A value pointing at a
     /// different auth file must leave the repo `.npmrc` untrusted, or the
