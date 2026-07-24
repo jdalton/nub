@@ -1,6 +1,6 @@
 ---
 name: soak
-description: Manages the repo's supply-chain soak window (SOAK_DAYS) — checks and fixes the derived surfaces, bumps or disables the window, adds dated per-package exclusions, and bumps pinned external tools. Use when a task touches minimumReleaseAge, min-release-age, min-publish-age, the nightly toolchain pin, external-tools.json, renovate.json, or taze cooldowns, or when investigating why a freshly published version won't install.
+description: Manages the repo's supply-chain soak window (SOAK_DAYS) — checks and fixes the derived surfaces, bumps or disables the window, adds dated per-package exclusions, and bumps pinned external tools. Use when a task touches minimumReleaseAge, min-release-age, min-publish-age, external-tools.json, renovate.json, or taze cooldowns, or when investigating why a freshly published version won't install.
 ---
 
 # The soak window
@@ -15,7 +15,6 @@ against it:
 | Surface | Key | Units |
 |---|---|---|
 | `.cargo/config.toml` | `global-min-publish-age` | `"N days"` |
-| `rust-toolchain.toml` | nightly channel date vs `# adopted:` line | days |
 | `tools/pnpm-workspace.yaml` | `minimumReleaseAge` | minutes |
 | `.npmrc` | `min-release-age` | days |
 | `tools/taze.config.mts` | `maturityPeriod` | imports `SOAK_DAYS` |
@@ -65,11 +64,19 @@ window). `published` must be the real registry publish date. Once
 need no annotation. External tools use the same shape via a `soakBypass`
 object in `external-tools.json`.
 
-## Bump the nightly toolchain
+## The cargo soak needs nightly — the repo still must not pin one
 
-Pick the newest nightly at least `SOAK_DAYS` old **today**, set it as
-`channel`, and update the `# adopted: <today>` line in
-`rust-toolchain.toml` — `pnpm run soak` enforces the arithmetic.
+`min-publish-age` is an `[unstable]` cargo feature: a stable cargo ignores
+it silently. The repo deliberately ships **no** `rust-toolchain.toml`,
+because a repo-root toolchain file outranks `rustup default` and would
+silently redirect the version-pinned CI jobs (the MSRV `Check` legs) and
+build released binaries on nightly.
+
+The nightly is instead requested per-invocation, at the only step that
+picks versions: `scripts/soak/update-deps.mts` runs `cargo +nightly
+update`. Everything else — every CI job, every shipped binary — builds on
+stable. If you need the cargo soak somewhere new, call `cargo +nightly`
+there; do not add a toolchain file.
 
 ## Maintaining this skill
 

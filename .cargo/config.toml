@@ -2,8 +2,16 @@
 # soak-window rule the PM applies to npm deps via minimumReleaseAge:
 # crate versions younger than the window are pubtime-incompatible and
 # the resolver skips them unless already in Cargo.lock
-# (resolver.incompatible-publish-age defaults to "deny"). The unstable
-# feature is active because rust-toolchain.toml pins a nightly.
+# (resolver.incompatible-publish-age defaults to "deny").
+#
+# min-publish-age is an [unstable] feature, so it is honored ONLY under a
+# nightly cargo and silently ignored elsewhere. The repo deliberately does
+# NOT pin a nightly toolchain: a repo-root rust-toolchain.toml outranks
+# `rustup default`, which would silently redirect the version-pinned CI
+# jobs (the MSRV Check legs) and build released binaries on nightly. So the
+# soak is applied at the one moment it decides versions — dependency
+# updates — where scripts/soak/update-deps.mts invokes `cargo +nightly`.
+# Everything else, including every shipped binary, builds on stable.
 [unstable]
 min-publish-age = true
 

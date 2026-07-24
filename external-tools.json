@@ -53,11 +53,6 @@
       "description": "npm — pinned, SRI-verified registry tarball; installed without self-update",
       "repository": "npm:npm",
       "version": "12.0.0",
-      "soakBypass": {
-        "version": "12.0.0",
-        "published": "2026-07-09",
-        "removable": "2026-07-16"
-      },
       "integrity": "sha512-qzvPQfNSY7louiM6rv7dL0hi5esBGLn1lLwxbdyL5XOIssWzoYMwn8xqvWhYcZL6onTkenYSxrtKxsFrFbUFyw=="
     },
     "sfw-free": {

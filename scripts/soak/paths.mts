@@ -35,9 +35,9 @@ export const NPM_PKG_DIR = path.join(REPO_ROOT, 'tools')
 // Lockfile refreshers tried in order after taze rewrites package.json.
 export const NPM_INSTALLERS: string[][] = [['pnpm', 'install']]
 
-// rustup's cargo shim — the only cargo that reads rust-toolchain.toml and
-// therefore the only one whose `cargo update` honors the [unstable]
-// min-publish-age soak.
+// rustup's cargo shim — the only cargo that understands `+nightly`, and so
+// the only one whose `cargo update` can honor the [unstable]
+// min-publish-age soak (see .cargo/config.toml).
 export const RUSTUP_CARGO = path.join(os.homedir(), '.cargo/bin/cargo')
 
 // Pinned external tool manifest + the local tool rack it installs into:

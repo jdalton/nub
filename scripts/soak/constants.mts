@@ -5,8 +5,8 @@
  *   upstream before it lands. Every soak surface DERIVES from `SOAK_DAYS`
  *   instead of hand-copying the number:
  *
- *   - `.cargo/config.toml`        -> `global-min-publish-age = "<SOAK_DAYS> days"` (cargo -Zmin-publish-age)
- *   - `rust-toolchain.toml`       -> dated nightly adopted only once >= SOAK_DAYS old
+ *   - `.cargo/config.toml`        -> `global-min-publish-age = "<SOAK_DAYS> days"` (cargo -Zmin-publish-age,
+ *                              applied by `cargo +nightly update`; no repo-wide nightly pin)
  *   - `pnpm-workspace.yaml`  -> `minimumReleaseAge: <SOAK_MINUTES>` (aube reads minutes)
  *   - `.npmrc`               -> `min-release-age=<SOAK_DAYS>` (npm >= 11.17, days)
  *   - `taze.config.mts`      -> `maturityPeriod: SOAK_DAYS` (imports this)

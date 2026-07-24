@@ -6,9 +6,10 @@
  *   - npm: taze (maturityPeriod = SOAK_DAYS via the taze config next to the
  *     package.json) rewrites ranges, then the repo's own installer refreshes
  *     the lockfile.
- *   - cargo: `cargo update` under the pinned nightly, where
- *     `.cargo/config.toml` min-publish-age enforces the same window
- *     (too-new crate versions are skipped unless already locked).
+ *   - cargo: `cargo +nightly update`, where `.cargo/config.toml`
+ *     min-publish-age enforces the same window (too-new crate versions are
+ *     skipped unless already locked). The nightly is requested per-invocation
+ *     rather than pinned repo-wide — see .cargo/config.toml for why.
  *
  *   Usage: node scripts/soak/update-deps.mts [--npm|--cargo] [--dry-run]
  *   (no ecosystem flag = both)
@@ -55,15 +56,20 @@ function updateNpm(dryRun: boolean): number {
 }
 
 function updateCargo(dryRun: boolean): number {
-  // The min-publish-age soak is an [unstable] cargo feature: only the
-  // rust-toolchain.toml nightly honors it, and only rustup's cargo shim
-  // reads rust-toolchain.toml. A non-rustup cargo (e.g. Homebrew stable)
-  // would silently update WITHOUT the soak — refuse that.
+  // The min-publish-age soak is an [unstable] cargo feature, honored only
+  // under a nightly cargo. The repo pins no nightly toolchain (that would
+  // outrank `rustup default` and silently redirect the version-pinned CI
+  // jobs and the release build), so the nightly is requested explicitly
+  // HERE — dependency resolution is the only step that picks versions, so
+  // it is the only step that needs the soak. `+nightly` is rustup shim
+  // syntax; a non-rustup cargo (e.g. Homebrew stable) would silently
+  // update WITHOUT the soak, so refuse that rather than bypass it.
   if (!existsSync(RUSTUP_CARGO)) {
     console.error('[update-deps] rustup cargo shim not found — cargo update would bypass the min-publish-age soak')
     return 1
   }
-  return run(RUSTUP_CARGO, dryRun ? ['update', '--dry-run'] : ['update'], REPO_ROOT)
+  const args = dryRun ? ['+nightly', 'update', '--dry-run'] : ['+nightly', 'update']
+  return run(RUSTUP_CARGO, args, REPO_ROOT)
 }
 
 // No flag = both; naming both explicitly also means both — a naive
