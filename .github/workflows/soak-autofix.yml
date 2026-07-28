@@ -25,7 +25,7 @@ jobs:
       pull-requests: write
     steps:
       # persist-credentials stays on: this job pushes its own fix branch.
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1 # zizmor: ignore[artipacked]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
         with:
           # Optional PAT: PRs opened with the default github.token do NOT
           # trigger CI on the PR (GitHub drops workflow events from
@@ -34,7 +34,7 @@ jobs:
           # (a fine-grained PAT with contents+pull-requests write) to make
           # the autofix PRs run CI like any other PR.
           token: ${{ secrets.SOAK_AUTOFIX_TOKEN || github.token }}
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
       - name: Run the soak fixers
