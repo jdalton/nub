@@ -26,9 +26,14 @@ against it:
 - `pnpm run soak` — parity-check every surface (CI-gated in docs-links)
 - `pnpm run soak:fix` — rewrite drifted windows, prune expired exclusions
 - `pnpm run deps:update` — bump npm (taze) + cargo deps through the window
-- `pnpm run tools:check` / `tools:install` — validate / install the
-  SRI-pinned external tools (`external-tools.json`)
+- `pnpm run tools:check` / `tools:fix` / `tools:install` — validate /
+  prune-expired-bypasses / install the SRI-pinned external tools
+  (`external-tools.json`)
 - `pnpm run test:scripts` — the scripts' own unit tests
+
+The gates fail closed when a bypass window clears, but nobody has to
+watch for that: the scheduled `soak-autofix` workflow runs `soak:fix` +
+`tools:fix` daily and commits the pruning as a bot PR.
 
 A soak change is done when `pnpm run soak` and `pnpm run test:scripts`
 both exit 0 — the same gates CI runs. Re-run them after every fix.
