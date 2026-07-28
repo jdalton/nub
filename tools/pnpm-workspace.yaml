@@ -19,6 +19,8 @@ minimumReleaseAge: 10080
 #   # published: YYYY-MM-DD | removable: YYYY-MM-DD   (removable = published + 7d)
 # `pnpm run soak` rejects unannotated or expired pins (and flow-style [..]
 # lists, which the gate can't validate); `soak:fix` prunes expired ones.
+# Schematic example (use the REAL registry publish date, never these
+# placeholders):
 # minimumReleaseAgeExclude:
-#   # published: 2026-01-01 | removable: 2026-01-08
+#   # published: YYYY-MM-DD | removable: YYYY-MM-DD
 #   - 'example@1.2.3'

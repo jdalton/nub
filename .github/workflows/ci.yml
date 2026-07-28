@@ -732,6 +732,10 @@ jobs:
         shell: bash
         env:
           MATRIX_NODE: ${{ matrix.node }}
+          # download() attaches this to github.com fetches only (release
+          # assets: pnpm/sfw binaries) — avoids unauthenticated rate
+          # limits and covers private assets (sfw-enterprise).
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           # The soak scripts are erasable-TS .mts and need a type-stripping
           # Node; the compat legs run them with the side-installed 26.5
