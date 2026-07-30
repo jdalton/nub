@@ -48,6 +48,11 @@ test('checkPins validates soakBypass dates and arithmetic; expiry is a warning, 
   const wrongMath = structuredClone(good)
   wrongMath.a.soakBypass.removable = addDaysIso(pub, 3)
   assert.match(checkPins(wrongMath)[0]!, /removable/)
+  // A bypass vouching for a version other than the one pinned is a hard
+  // finding: the annotation would say an unshipped version was reviewed.
+  const versionMismatch = structuredClone(good)
+  versionMismatch.a.soakBypass.version = '0.9.0'
+  assert.match(checkPins(versionMismatch)[0]!, /soakBypass is for/)
   // Expired-but-valid is STALE, not unsafe: checkPins exits clean, the
   // stale list reports it, and --fix / soak-autofix prunes it.
   const expired = structuredClone(good)
