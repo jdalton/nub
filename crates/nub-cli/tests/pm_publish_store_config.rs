@@ -50,8 +50,13 @@ impl Ctx {
     }
 
     fn run(&self, args: &[&str]) -> (String, String, i32) {
-        let out = Command::new(nub_binary())
-            .args(args)
+        self.run_env(args, &[])
+    }
+
+    /// Like [`Ctx::run`], with extra environment variables.
+    fn run_env(&self, args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32) {
+        let mut cmd = Command::new(nub_binary());
+        cmd.args(args)
             .current_dir(&self.project)
             // The fixture pins a differing `nub@<v>` to exercise nub identity, not
             // the self-shim — opt out so a PM verb doesn't provision that nub.
@@ -59,9 +64,11 @@ impl Ctx {
             .env("HOME", &self.home)
             .env("XDG_DATA_HOME", self.home.join("xdg-data"))
             .env("XDG_CACHE_HOME", self.home.join("xdg-cache"))
-            .env("XDG_CONFIG_HOME", self.home.join("xdg-config"))
-            .output()
-            .expect("failed to spawn nub");
+            .env("XDG_CONFIG_HOME", self.home.join("xdg-config"));
+        for (name, value) in envs {
+            cmd.env(name, value);
+        }
+        let out = cmd.output().expect("failed to spawn nub");
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         assert_brand_clean(args, &stdout, &stderr);
@@ -180,6 +187,125 @@ fn config_path_prints_the_unwritten_global_settings_file() {
         alias_stdout, stdout,
         "the `c` alias must print the same path"
     );
+}
+
+/// The setting takes the store ROOT; `store path` prints the `v1` dir under it.
+fn assert_store_path(stdout: &str, stderr: &str, code: i32, root: &Path) {
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout.trim().replace('\\', "/"),
+        root.join("v1").to_string_lossy().replace('\\', "/"),
+        "store path must resolve to the configured store-dir plus the v1 suffix"
+    );
+}
+
+#[test]
+fn store_path_honors_npm_config_store_dir_env() {
+    let ctx = Ctx::new("store-env", MANIFEST);
+    let relocated = ctx.home.join("relocated-store");
+    let (stdout, stderr, code) = ctx.run_env(
+        &["store", "path"],
+        &[("npm_config_store_dir", relocated.to_str().unwrap())],
+    );
+    assert_store_path(&stdout, &stderr, code, &relocated);
+}
+
+#[test]
+fn store_path_honors_project_npmrc_store_dir() {
+    let ctx = Ctx::new("store-npmrc", MANIFEST);
+    let relocated = ctx.home.join("npmrc-store");
+    std::fs::write(
+        ctx.project.join(".npmrc"),
+        format!("store-dir={}\n", relocated.display()),
+    )
+    .unwrap();
+    let (stdout, stderr, code) = ctx.run(&["store", "path"]);
+    assert_store_path(&stdout, &stderr, code, &relocated);
+}
+
+#[test]
+fn store_path_resolves_relative_store_dir_against_the_project() {
+    let ctx = Ctx::new("store-rel", MANIFEST);
+    std::fs::write(ctx.project.join(".npmrc"), "store-dir=local-store\n").unwrap();
+    let (stdout, stderr, code) = ctx.run(&["store", "path"]);
+    // Canonicalize the expectation: the spawned nub sees the canonical cwd
+    // (`/private/var/…` on macOS, not the `/var/…` symlink the test built).
+    let project = ctx.project.canonicalize().unwrap();
+    assert_store_path(&stdout, &stderr, code, &project.join("local-store"));
+}
+
+#[test]
+fn store_dir_env_wins_over_project_npmrc() {
+    let ctx = Ctx::new("store-prec", MANIFEST);
+    let from_env = ctx.home.join("env-store");
+    std::fs::write(
+        ctx.project.join(".npmrc"),
+        format!("store-dir={}\n", ctx.home.join("npmrc-store").display()),
+    )
+    .unwrap();
+    let (stdout, stderr, code) = ctx.run_env(
+        &["store", "path"],
+        &[("npm_config_store_dir", from_env.to_str().unwrap())],
+    );
+    assert_store_path(&stdout, &stderr, code, &from_env);
+}
+
+/// A relocated store must take every tier with it — the phantom sidecar tier
+/// used to stay at the default data dir, leaking writes into the real store
+/// and leaving detection reading a store the packages aren't in (#643).
+#[test]
+fn store_dir_override_relocates_every_store_tier() {
+    // The undeclared import gives the extract-time phantom scan a verdict to record.
+    let packer = Ctx::new("store-tiers-pack", MANIFEST);
+    std::fs::write(
+        packer.project.join("index.js"),
+        "require('undeclared-phantom');\n",
+    )
+    .unwrap();
+    let (stdout, stderr, code) = packer.run(&["pack"]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let tarball = packer.project.join("pmfam-fixture-1.2.3.tgz");
+    assert!(tarball.is_file(), "pack must produce the fixture tarball");
+
+    let ctx = Ctx::new("store-tiers", r#"{"name":"store-tiers-consumer","version":"1.0.0"}"#);
+    std::fs::copy(&tarball, ctx.project.join("pmfam-fixture-1.2.3.tgz")).unwrap();
+    let relocated = ctx.home.join("relocated-store");
+    let (stdout, stderr, code) = ctx.run_env(
+        &["add", "./pmfam-fixture-1.2.3.tgz"],
+        &[("npm_config_store_dir", relocated.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    assert!(
+        relocated.join("v1/files").is_dir(),
+        "the CAS files tier must land under the override"
+    );
+    let sidecars = count_files(&relocated.join("v1/phantom"));
+    assert!(
+        sidecars > 0,
+        "the phantom sidecar tier must move with the store override"
+    );
+    let default_store = ctx.home.join("xdg-data/nub/store");
+    assert!(
+        !default_store.exists(),
+        "an overridden install must write NOTHING to the default store location: {:?}",
+        std::fs::read_dir(&default_store)
+            .map(|it| it.filter_map(|e| e.ok().map(|e| e.path())).collect::<Vec<_>>())
+    );
+}
+
+/// Recursive file count under `dir`; 0 when the directory does not exist.
+fn count_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let path = e.path();
+            if path.is_dir() { count_files(&path) } else { 1 }
+        })
+        .sum()
 }
 
 /// A pnpm-**v11** manifest. v11 reads scalar settings solely from

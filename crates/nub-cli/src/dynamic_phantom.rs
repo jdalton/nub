@@ -125,12 +125,15 @@ pub fn register() {
     if !enabled() {
         return;
     }
-    let Some(dir) = phantom_cache_dir() else {
-        return;
-    };
     // Extract-time scan: overlap per-version analysis with the fetch phase.
+    // The sidecar dir resolves on first fire, not here: registration precedes
+    // the engine session's `--dir` chdir, and a `store-dir` override is
+    // cwd-dependent.
+    let dir: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     aube_store::set_extract_hook(Box::new(move |index: &PackageIndex| {
-        scan_and_cache(&dir, index);
+        if let Some(dir) = dir.get_or_init(phantom_cache_dir) {
+            scan_and_cache(dir, index);
+        }
     }));
 }
 
@@ -258,16 +261,23 @@ fn write_sidecar_atomic(sidecar: &Path, fingerprint: &str, result: &ScanResult) 
     }
 }
 
-/// Nub's CAS store schema dir: `<nub-data>/store/v1/`, the parent of the CAS
-/// `files/` and `index/` tiers and the `phantom/` sidecar tier. Derives from the
-/// SAME [`crate::pm_engine::nub_data_dir`] nub configures its `storeDir` setting
-/// from (`nub_data_dir()/store`), plus aube's `v1/` schema suffix — so the store
-/// handle and the sidecar dir share ONE base with the real store and cannot drift
-/// (the XDG resolution is not re-implemented here). `None` when no data home
+/// Nub's CAS store schema dir: `<store-root>/v1/`, the parent of the CAS
+/// `files/` and `index/` tiers and the `phantom/` sidecar tier. A configured
+/// `store-dir` override resolves through the engine's own
+/// [`aube::commands::resolved_store_dir`], so the sidecar tier moves WITH the
+/// store it indexes (#643); without one, it derives from the SAME
+/// [`crate::pm_engine::nub_data_dir`] nub configures its `storeDir` setting
+/// from, plus aube's `v1/` schema suffix — either way the store handle and the
+/// sidecar dir share ONE base and cannot drift. `None` when no data home
 /// resolves. `pub(crate)` so the sidecar CONSUMER
-/// ([`crate::pm_engine::phantom_closure`]) derives its store handle from the same
-/// base this producer uses.
+/// ([`crate::pm_engine::phantom_closure`]) derives its store handle from the
+/// same base this producer uses.
 pub(crate) fn store_v1_dir() -> Option<PathBuf> {
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(custom) = aube::commands::resolved_store_dir(&cwd)
+    {
+        return Some(custom.join("v1"));
+    }
     Some(crate::pm_engine::nub_data_dir()?.join("store/v1"))
 }
 
