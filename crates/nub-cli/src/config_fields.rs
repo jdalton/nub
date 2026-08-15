@@ -25,13 +25,14 @@
 //!   concern; reporting them here would make `get` disagree with the file `set`
 //!   just wrote.
 //! - **Scope follows the field.** Writes land in the project file by default and
-//!   in the global file under `--location user|global`. The `dlx` section is
+//!   in the global file under `--global` (or `nub global config`). The `dlx` section is
 //!   global-only (a checkout must not widen a consent decision about the
 //!   machine), so it ignores the default and refuses an explicit project scope.
 
 use std::path::{Path, PathBuf};
 
 use jsonc_parser::cst::CstInputValue;
+use nub_core::workspace::detect::detect_project;
 use serde_json::{Map, Value};
 
 use crate::project_config::{self, ConfigError};
@@ -57,7 +58,7 @@ enum Shape {
     Str,
     /// `string[]`, written as a JSON array.
     StrList,
-    /// `boolean | string | string[]` (`envFile`).
+    /// `boolean | "varlock" | string[]` (`envFile`).
     EnvFile,
     /// `boolean | "warn" | "error"` (`verifyDeps`).
     VerifyDeps,
@@ -128,6 +129,42 @@ const FIELDS: &[Field] = &[
         address: "tsconfig",
         path: "tsconfig",
         shape: Shape::Str,
+        global_only: false,
+    },
+    Field {
+        address: "jsx",
+        path: "jsx",
+        shape: Shape::Str,
+        global_only: false,
+    },
+    Field {
+        address: "jsxFactory",
+        path: "jsxFactory",
+        shape: Shape::Str,
+        global_only: false,
+    },
+    Field {
+        address: "jsxFragmentFactory",
+        path: "jsxFragmentFactory",
+        shape: Shape::Str,
+        global_only: false,
+    },
+    Field {
+        address: "jsxImportSource",
+        path: "jsxImportSource",
+        shape: Shape::Str,
+        global_only: false,
+    },
+    Field {
+        address: "decorators",
+        path: "decorators",
+        shape: Shape::Str,
+        global_only: false,
+    },
+    Field {
+        address: "emitDecoratorMetadata",
+        path: "emitDecoratorMetadata",
+        shape: Shape::Bool,
         global_only: false,
     },
     Field {
@@ -285,19 +322,37 @@ fn write_target(field: &Field, scope: Scope) -> anyhow::Result<PathBuf> {
     }
     Ok(match scope {
         Scope::Global => global_file(field)?,
-        // Writes default to the project file: `--location`'s engine-side default
-        // is `user`, which nub overrides to project for every config write.
+        // Writes default to the project file; `--global` selects the user file.
         Scope::Auto | Scope::Project => project_file(),
     })
 }
 
 /// The project file a write lands in: the one discovery would read, else a new
-/// file at the project root so a `set` from a subdirectory does not create a
-/// second `nub.jsonc` that shadows nothing.
-fn project_file() -> PathBuf {
+/// file at the workspace root when the project is a member, else at the project
+/// root — so a `set` or an `init` from a subdirectory does not create a second
+/// `nub.jsonc` that shadows nothing.
+///
+/// A workspace materializes ONE tree under ONE resolved engine, so its settings
+/// belong to the root rather than to whichever member happened to be the cwd —
+/// the same anchor [`crate::install_engine::anchor`] keys an install's tree at.
+/// Going through [`detect_project`] rather than a second walk keeps the
+/// pnpm-incumbency gate on `pnpm-workspace.yaml` in one place. A member that
+/// wants its own config still gets one: discovery above takes the nearest file.
+///
+/// Membership is deliberately NOT glob-checked against the workspace patterns,
+/// so a nested package the patterns exclude (`examples/*`, a fixture dir) also
+/// resolves to the root. That is the point rather than a gap: absent a local
+/// file, discovery already READS the root config from such a directory, so
+/// anchoring the write there edits the file that governs it. Matching globs
+/// instead would have a `set` mint a local file that SHADOWS the root for that
+/// subtree — the surprise this function exists to avoid.
+pub(crate) fn project_file() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if let Some(found) = project_config::discover_project_config(&cwd) {
         return found;
+    }
+    if let Some(workspace_root) = detect_project(&cwd).and_then(|p| p.workspace_root) {
+        return workspace_root.join(project_config::FILE_NAME);
     }
     for dir in cwd.ancestors() {
         if dir.join("package.json").is_file() {
@@ -382,12 +437,31 @@ fn coerce(field: &Field, raw: &str) -> Result<Value, ConfigError> {
         });
     }
     Ok(match field.shape {
-        // Coercion is identical for these three: a boolean spelling becomes a
+        // Coercion is identical for these two: a boolean spelling becomes a
         // boolean and anything else stays a string. Their grammars differ only
         // in which non-boolean strings the validator then accepts.
-        Shape::Bool | Shape::VerifyDeps | Shape::EnvFile => {
+        Shape::Bool | Shape::VerifyDeps => {
             parse_bool(raw).map_or_else(|| Value::String(raw.into()), Value::Bool)
         }
+        // `envFile` takes a boolean or ONE mode name; a path belongs in an array,
+        // which the structured branch above already took. Refusing anything else
+        // here rather than downstream is what makes `nub config set envFile
+        // .env,.env.local` a diagnostic instead of a config file holding one path
+        // named `.env,.env.local` that fails much later at file resolution.
+        Shape::EnvFile => match parse_bool(raw) {
+            Some(b) => Value::Bool(b),
+            None if raw == crate::project_config::ENV_FILE_VARLOCK => Value::String(raw.into()),
+            None => {
+                return Err(ConfigError::Value {
+                    path: field.path.into(),
+                    message: format!(
+                        "expected a boolean, \"{}\", or a JSON array (for a file path, \
+                         [\"{raw}\"])",
+                        crate::project_config::ENV_FILE_VARLOCK
+                    ),
+                });
+            }
+        },
         Shape::Str | Shape::Linker => Value::String(raw.into()),
         // The two shapes with no scalar spelling of their own: a bare shell
         // string here is a missing pair of brackets or braces, not a value.
@@ -445,6 +519,23 @@ mod tests {
 
     fn coerced(key: &str, raw: &str) -> Value {
         coerce(field(key).expect("known field"), raw).expect("coercible")
+    }
+
+    /// The wart this shape exists to close. A comma-joined path list used to
+    /// coerce to ONE string, so `nub config set` wrote a config naming a file
+    /// called `.env,.env.local` and the run failed much later, at file
+    /// resolution, pointing at a path nobody typed.
+    #[test]
+    fn a_bare_env_file_path_is_refused_where_it_is_typed() {
+        for raw in [".env.local", ".env,.env.local"] {
+            let err = coerce(field("envFile").expect("known field"), raw)
+                .expect_err("a bare path is not a value envFile accepts");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!(r#"["{raw}"]"#)),
+                "the error must hand back the bracketed spelling for {raw:?}: {message}"
+            );
+        }
     }
 
     /// A field the schema accepts but the CLI cannot address is invisible to
@@ -530,6 +621,18 @@ mod tests {
             Value::String("./tsconfig.json".into())
         );
         assert_eq!(
+            coerced("jsx", "react-jsx"),
+            Value::String("react-jsx".into())
+        );
+        assert_eq!(
+            coerced("decorators", "legacy"),
+            Value::String("legacy".into())
+        );
+        assert_eq!(
+            coerced("emitDecoratorMetadata", "false"),
+            Value::Bool(false)
+        );
+        assert_eq!(
             coerced("tsconfig", "[generated]/tsconfig.json"),
             Value::String("[generated]/tsconfig.json".into()),
             "a scalar path is not reinterpreted as JSON from its first byte"
@@ -540,12 +643,12 @@ mod tests {
         );
         assert_eq!(coerced("envFile", "false"), Value::Bool(false));
         assert_eq!(
-            coerced("envFile", ".env.local"),
-            Value::String(".env.local".into())
+            coerced("envFile", "varlock"),
+            Value::String("varlock".into())
         );
         assert_eq!(
-            coerced("envFile", ".env,.env.local"),
-            Value::String(".env,.env.local".into())
+            coerced("envFile", r#"[".env",".env.local"]"#),
+            serde_json::json!([".env", ".env.local"])
         );
         assert_eq!(
             coerced("verifyDeps", "error"),

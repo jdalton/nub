@@ -155,7 +155,10 @@ version:
 	@# nub-native is its own workspace (split for panic=abort vs unwind); its
 	@# version + Cargo.lock entry live under crates/nub-native, updated separately.
 	@cd crates/nub-native && cargo update -p nub-native --precise $(V)
-	@echo "✓ All packages, Cargo.toml, both Cargo.lock files, and runtime/version.mjs set to $(V)"
+	@# nub-launcher is also its own workspace and records nub-core's inlined
+	@# version, so every version bump must refresh its lock before --locked builds.
+	@cd crates/nub-launcher && cargo update -p nub-core --precise $(V)
+	@echo "✓ All packages, Cargo.toml, all three Cargo.lock files, and runtime/version.mjs set to $(V)"
 
 # Verify version consistency across npm packages, Cargo.toml, and version.mjs,
 # AND that @oxc-project/runtime (the emit-helper runtime) is exact-pinned and
@@ -166,6 +169,13 @@ version:
 # Non-zero exit on any mismatch — the pre-release gate (release.yml runs it before
 # building/publishing). Guards the transpile-cache invariant (A12): NUB_VERSION is
 # the sole cache key, valid only because oxc cannot float without a version bump.
+# The schema snapshot is checked only when latest.json is PRESENT. The site
+# withdraws the whole published schema whenever the nub.jsonc config reference is
+# hidden pending ship (3539b65db1), and an absent schema means there is nothing
+# published to be out of step with — the same rule the parser/schema key-set test
+# in crates/nub-cli/src/project_config.rs applies. A latest.json that EXISTS but is
+# corrupt, or whose pinned snapshot is missing or divergent, still fails: deliberate
+# withdrawal removes the file, accidental damage leaves it there.
 version-check:
 	@node -e " \
 		const fs = require('fs'); \
@@ -189,6 +199,12 @@ version-check:
 		const cm = cargo.match(/^version = \x22([^\x22]*)\x22/m); \
 		if (!cm) errors.push('Cargo.toml: workspace version line not found'); \
 		else if (cm[1] !== v) errors.push('Cargo.toml has ' + cm[1] + ', expected ' + v); \
+		for (const m of ['crates/nub-core/Cargo.toml', 'crates/nub-native/Cargo.toml']) { \
+			const t = fs.readFileSync(m, 'utf8'); \
+			const mm = t.match(/^version = \x22([^\x22]*)\x22/m); \
+			if (!mm) errors.push(m + ': inlined version line not found — it must NOT inherit from the workspace (see the manifest comment)'); \
+			else if (mm[1] !== v) errors.push(m + ' has ' + mm[1] + ', expected ' + v + ' — an inlined version is what spawn.rs hands the preload as process.versions.nub, so a stale one makes the runtime misreport itself'); \
+		} \
 		const version = fs.readFileSync('runtime/version.mjs', 'utf8'); \
 		const pm = version.match(/export const NUB_VERSION = \x22([^\x22]*)\x22/); \
 		if (!pm) errors.push('runtime/version.mjs: NUB_VERSION not found'); \
@@ -202,8 +218,11 @@ version-check:
 		if (!om) errors.push('Cargo.toml: oxc workspace dependency (=X.Y.Z pin) not found'); \
 		else if (rt && rt !== om[1]) errors.push('package.json @oxc-project/runtime (' + rt + ') must match the oxc crate compiled into nub-native (Cargo.toml oxc =' + om[1] + ') — the emit helpers and the transformer are one oxc release'); \
 		const pinned = 'v' + v.split('.').slice(0, 2).join('.') + '.json'; \
-		try { \
-			const latest = JSON.parse(fs.readFileSync('site/public/schema/latest.json', 'utf8')); \
+		const latestPath = 'site/public/schema/latest.json'; \
+		if (!fs.existsSync(latestPath)) { \
+			console.log('· no published schema (' + latestPath + ' absent) — snapshot check skipped'); \
+		} else try { \
+			const latest = JSON.parse(fs.readFileSync(latestPath, 'utf8')); \
 			const snapshotPath = 'site/public/schema/' + pinned; \
 			const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8')); \
 			const expectedId = 'https://nubjs.com/schema/' + pinned; \
@@ -213,7 +232,7 @@ version-check:
 			if (!isDeepStrictEqual(snapshot, latest)) errors.push(snapshotPath + ' does not equal latest.json modulo \$$id'); \
 		} catch { errors.push('missing or unreadable schema snapshot for ' + pinned); } \
 		if (errors.length) { console.error('Version mismatch:\\n  ' + errors.join('\\n  ')); process.exit(1); } \
-		else { console.log('✓ All npm packages, Cargo.toml, runtime/version.mjs, and schema snapshot at v' + v + '; @oxc-project/runtime matches nub-native oxc pin (' + (om ? om[1] : '?') + ')'); }"
+		else { console.log('✓ All npm packages, Cargo.toml, and runtime/version.mjs at v' + v + '; @oxc-project/runtime matches nub-native oxc pin (' + (om ? om[1] : '?') + ')'); }"
 
 npm-build: build
 	./npm/build-local.sh

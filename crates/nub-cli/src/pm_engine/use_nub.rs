@@ -1,12 +1,12 @@
 //! `nub pm use nub` — the full switch into nub identity — and the yaml
 //! regeneration half of `nub pm use pnpm` (the exact reverse).
 //!
-//! Spec: wiki/commands/pm/identity-policy.md (`pm use`, the four axioms) +
-//! wiki/commands/pm/workspace-yaml-migration.md (the exhaustive key table and
+//! Spec: `identity-policy` (no such document) (`pm use`, the four axioms) +
+//! `workspace-yaml-migration` (no such document) (the exhaustive key table and
 //! its Bun-names addendum). The two-mode model in one paragraph: compat mode
 //! (default) plays the incumbent PM's role completely — its lockfile, its
 //! config surface, its grammar. `pm use nub` is the explicit graduation:
-//! `devEngines.packageManager {name:"nub", version:"^<ver>", onFail:"warn"}`
+//! `devEngines.packageManager {name:"nub", version:"^<ver>", onFail:"ignore"}`
 //! (the non-locking cross-tool signal, always written) plus — ONLY on the
 //! explicit `pm use nub@<exact>` opt-in — the hard `packageManager: "nub@<exact>"`
 //! pin; the lockfile renamed (or converted) to `nub.lock` (pnpm-v9 bytes,
@@ -529,11 +529,27 @@ pub(crate) fn plan_migration(source: &Map<String, Value>) -> Result<YamlMigratio
 /// when `exact_pin` is `Some` (the `nub pm use nub@<exact>` opt-in or `nub pm
 /// pin`), and REMOVED when `None` (the non-locking `nub pm use nub`, so the
 /// field never contradicts the devEngines entry) — and, always, the
-/// `devEngines.packageManager {name:"nub", version:"^<range>", onFail:"warn"}`
+/// `devEngines.packageManager {name:"nub", version:"^<range>", onFail:"ignore"}`
 /// signal beside it (sibling devEngines entries survive). The pair is kept in
 /// lockstep by this one writer so the exact pin and the caret range can't drift.
+///
+/// `onFail:"ignore"` and not `"warn"`: the entry exists to be READ (it is the PM
+/// signal nub's unbranded lockfile withholds), and detectors read `name`/`version`
+/// only. `"warn"` additionally asks npm to ENFORCE it, which npm does on every
+/// command in the project — including `npx`, which manages no dependencies at all
+/// — for a mismatch npm can never satisfy, since "nub" is not npm. That is a
+/// permanent unactionable warning block bought for no detection benefit. Note the
+/// asymmetry with [`nub_core::pm::resolve::write_declared_pm`], which keeps
+/// `"warn"` when declaring a FOREIGN manager: there the warning names a manager
+/// the user can actually switch to.
 /// Shared by the full into-nub switch ([`apply_manifest_edits`]) and the
 /// lightweight lock (`nub pm pin`), which writes ONLY these two fields.
+///
+/// Why the pin stays EXACT while only devEngines carries a `^` range: turbo
+/// enforces exact 3-part semver on BOTH fields, so a range anywhere the signal
+/// lives costs turbo recognition. The range exists for nub's own self-shim to
+/// satisfy, not for external detection.
+// @lat: [[research/nub-field-write-vs-detection#Which field maximizes coverage]]
 pub(crate) fn write_nub_identity_fields(
     obj: &mut Map<String, Value>,
     exact_pin: Option<&str>,
@@ -553,7 +569,7 @@ pub(crate) fn write_nub_identity_fields(
     if let Some(dev) = dev.as_object_mut() {
         dev.insert(
             "packageManager".into(),
-            json!({ "name": "nub", "version": format!("^{range_version}"), "onFail": "warn" }),
+            json!({ "name": "nub", "version": format!("^{range_version}"), "onFail": "ignore" }),
         );
     }
 }
@@ -889,7 +905,7 @@ pub(crate) fn run_use_nub(root: &Path, exact_pin: Option<&str>) -> Result<i32> {
         println!("  package.json: packageManager = nub@{v}");
     }
     println!(
-        "  package.json: devEngines.packageManager = {{ name: \"nub\", version: \"^{range_version}\", onFail: \"warn\" }}"
+        "  package.json: devEngines.packageManager = {{ name: \"nub\", version: \"^{range_version}\", onFail: \"ignore\" }}"
     );
     if migration.packages.is_some() || migration.catalog.is_some() || migration.catalogs.is_some() {
         println!(
@@ -1297,7 +1313,7 @@ mod tests {
         assert_eq!(obj.get("packageManager"), Some(&json!("nub@0.1.0")));
         assert_eq!(
             obj.get("devEngines").unwrap().get("packageManager"),
-            Some(&json!({ "name": "nub", "version": "^0.1.0", "onFail": "warn" }))
+            Some(&json!({ "name": "nub", "version": "^0.1.0", "onFail": "ignore" }))
         );
         assert_eq!(
             obj.get("workspaces"),
@@ -1317,7 +1333,7 @@ mod tests {
         );
         assert_eq!(
             obj.get("devEngines").unwrap().get("packageManager"),
-            Some(&json!({ "name": "nub", "version": "^0.2.9", "onFail": "warn" })),
+            Some(&json!({ "name": "nub", "version": "^0.2.9", "onFail": "ignore" })),
             "bare use nub still writes the non-locking devEngines range"
         );
 

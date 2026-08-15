@@ -511,16 +511,15 @@ pub fn spawn_group_reaper(child_pid: u32) -> Option<GroupReaper> {
         }
     };
     // `current_exe()` is whatever NAME nub is running under — for any workload
-    // spawned through nub's own PATH shim that is `node`, not `nub`. The verb
-    // below is therefore dispatched in `cli::run()` ABOVE argv0 detection; when
-    // it hung off the `nub`-only argv0 arm, a shim-named re-invocation ran
-    // `__pdeath-watch` as a SCRIPT and spawned another watcher per level (regression from #504).
+    // spawned through nub's own PATH shim that is `node`, not `nub`. Select the
+    // watcher with the launcher's private mode env instead of a reserved argv
+    // token, so its PID/read-fd payload stays ordinary process arguments.
     let Ok(exe) = std::env::current_exe() else {
         close_both();
         return None;
     };
     let mut cmd = Command::new(exe);
-    cmd.arg("__pdeath-watch")
+    cmd.env("__NUB_COMPILED_LAUNCHER_MODE", "pdeath-watch")
         .arg(child_pid.to_string())
         .arg("3")
         .stdin(std::process::Stdio::null())
@@ -612,7 +611,7 @@ impl Drop for GroupReaper {
     }
 }
 
-/// The `__pdeath-watch` hidden-verb entry: `<child-pgid> <read-fd>` — the
+/// The `pdeath-watch` private launcher mode: `<child-pgid> <read-fd>` — the
 /// watcher half of [`spawn_group_reaper`]. Returns the process exit code.
 #[cfg(unix)]
 pub fn run_pdeath_watch(args: &[String]) -> i32 {
@@ -694,6 +693,26 @@ pub struct SpawnConfig<'a> {
     pub show_warnings: bool,
     /// Path to the Nub binary itself (for the PATH shim).
     pub nub_binary: &'a Path,
+    /// An external loader that owns the environment for this project, as
+    /// `(cli, schema_dir)`.
+    ///
+    /// When set, nub does not spawn Node directly — it spawns
+    /// `<loader> run --path <schema_dir> -- <node> <args…>`, so the loader
+    /// resolves, validates and injects the environment, and pipes the child's
+    /// output through its own redaction. nub contributes no environment of its
+    /// own on this path.
+    ///
+    /// `--path` is not an optimization. nub already walked up to find the schema
+    /// before deciding the loader owns this project, and the loader would
+    /// otherwise infer its entry point from cwd — which is a different directory
+    /// for a workspace member, or for a run from a subdirectory. Standing down on
+    /// the strength of a schema and then not saying where it is leaves the child
+    /// erroring about a file nub demonstrably found.
+    ///
+    /// The node command is otherwise unchanged: nub's flags and `NODE_OPTIONS`
+    /// augmentation ride through untouched, so transpilation and the preload
+    /// chain behave exactly as they do on a direct spawn.
+    pub env_owner: Option<(&'a Path, &'a Path)>,
     /// Parsed .env vars to inject into the child environment.
     pub env_vars: &'a std::collections::HashMap<String, String>,
     /// Yarn PnP `.pnp.cjs` path (from `nub_core::pnp::detect`), injected via
@@ -721,10 +740,52 @@ pub struct SpawnResult {
 
 /// Spawn Node with Nub's augmentation pipeline.
 ///
+/// Build the command that launches the env-owner loader.
+///
+/// On Windows an npm-installed loader is a `.cmd` batch file, which
+/// `CreateProcess` cannot launch directly — it has to go through `cmd /C`, the
+/// same route `bin_launcher` and `npm_upgrade_command_invocation` already take
+/// for exactly this reason. Rust's `std::process` does auto-convert, but its own
+/// docs say that behavior "may be removed in the future and so should not be
+/// relied upon", and it returns `InvalidInput` for arguments it cannot escape.
+pub fn loader_command(loader: &Path) -> Command {
+    #[cfg(windows)]
+    if loader
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(loader);
+        return cmd;
+    }
+    Command::new(loader)
+}
+
 /// In compat mode, spawns Node with only the user's args — no flag
 /// injection, no preloads, no PATH shim.
 pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
-    let mut cmd = Command::new(config.node.path.as_str());
+    // With an external env owner, the loader goes in FRONT of Node rather than
+    // inside it: `<loader> run --path <dir> -- <node> …`. That is its full-capability
+    // mode — it owns resolution and pipes the child's streams through its own
+    // redaction, which an in-process integration cannot do for raw
+    // `process.stdout.write` or for anything a subprocess prints.
+    //
+    // nub stays the parent and the node command is unchanged, so every flag and
+    // the whole `NODE_OPTIONS` augmentation chain reach Node exactly as on a
+    // direct spawn.
+    let mut cmd = match config.env_owner {
+        Some((loader, schema_dir)) => {
+            let mut cmd = loader_command(loader);
+            cmd.arg("run")
+                .arg("--path")
+                .arg(schema_dir)
+                .arg("--")
+                .arg(config.node.path.as_str());
+            cmd
+        }
+        None => Command::new(config.node.path.as_str()),
+    };
     // Process-identity fidelity: set argv0 to "node" so the spawned process
     // reports `process.title` and `process.argv0` as "node" — matching what
     // plain `node` reports when invoked by PATH name — instead of the full
@@ -747,8 +808,11 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // Windows — there is nothing to fix there, and nothing the spawner could do
     // to force "node". (See crates/nub-cli/tests/process_identity.rs, which
     // asserts the Unix "node" invariant and the Windows path-passthrough one.)
+    // Only meaningful on a direct spawn. Behind an env-owner loader the process
+    // nub launches IS the loader, and Node is its child — so argv0 here would
+    // rename the loader, and Node's own identity is the loader's to set.
     #[cfg(unix)]
-    {
+    if config.env_owner.is_none() {
         use std::os::unix::process::CommandExt;
         cmd.arg0("node");
     }
@@ -825,7 +889,7 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
     // inherits the parent's NODE_OPTIONS (absolute preload path) + PATH shim,
     // which already carry the augmentation, so re-augmenting here would only add
     // a half-setup (flags + a nested shim, no preload). See
-    // wiki/runtime/hijack-by-default.md.
+    // internal/runtime/hijack-by-default.md.
     if !config.compat_mode && !is_reentrant && preload.is_some() {
         apply_augmentation_restore_markers(|key, value| {
             cmd.env(key, value);
@@ -882,7 +946,7 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // supplied `--experimental-webstorage` / `--no-experimental-webstorage` (no
         // double-add; respect an explicit disable — nub never re-enables over a user
         // negation).
-        if should_inject_webstorage_flag(
+        if flags::should_inject_experimental_webstorage(
             &config.node.version,
             config.user_args,
             node_options.as_deref(),
@@ -901,12 +965,12 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // When the user passes `--localstorage-file`, this is skipped and
         // `localStorage` works normally. The signal is an internal `__NUB_*` env var
         // (brand-boundary-permitted plumbing); the preload deletes it after reading.
-        if should_neutralize_localstorage(
+        if flags::should_neutralize_experimental_webstorage_localstorage(
             &config.node.version,
             config.user_args,
             node_options.as_deref(),
         ) {
-            cmd.env(NEUTRALIZE_LOCALSTORAGE_ENV, "1");
+            cmd.env(flags::NEUTRALIZE_LOCALSTORAGE_ENV, "1");
         }
 
         // PATH shim: prepend a temp dir with a `node` symlink → nub.
@@ -930,9 +994,24 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // loader (tsx/ts-node/--import) on a Node whose sync/async hook composition
         // is broken — the sync fast tier would otherwise crash with
         // ERR_METHOD_NOT_IMPLEMENTED (see force_async_tier_env / node_hook_compose_broken).
+        // An inherited `--import` is FOLDED into nub's chainer below, which removes it
+        // from NODE_OPTIONS — and with it the signal both this scan and the runtime's
+        // own intrinsic check read. A folded import can still register a loader (an
+        // `--import tsx` is exactly that), so stand in a synthetic token for it and
+        // keep the conservative "any such flag on the band takes the async tier"
+        // policy. Without this nub stays on the sync fast tier and a real tsx loader
+        // crashes on the resolveSync stub (nub#460).
+        let folded_import_marker: &[&str] = match node_options.as_deref() {
+            Some(value) if !split_inherited_preloads(value).2.is_empty() => &["--import"],
+            _ => &[],
+        };
         if let Some((k, val)) = force_async_tier_env(
             &config.node.version,
-            config.user_args.iter().map(String::as_str),
+            config
+                .user_args
+                .iter()
+                .map(String::as_str)
+                .chain(folded_import_marker.iter().copied()),
         ) {
             cmd.env(k, val);
         }
@@ -1154,7 +1233,7 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         // `node` re-invocation inherits the flag and `sessionStorage` works out of
         // the box. nub never synthesizes `--localstorage-file`. Same guard: only
         // in-band, and not if the user already supplied/disabled the flag.
-        if should_inject_webstorage_flag(
+        if flags::should_inject_experimental_webstorage(
             &config.node.version,
             config.user_args,
             node_options.as_deref(),
@@ -1168,6 +1247,10 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
             // can't parse (e.g. --experimental-webstorage on Node <22.4) aborts it
             // with exit 9 ("not allowed in NODE_OPTIONS"). See
             // flags::strip_unsupported_node_options.
+            // Preload flags were folded into nub's chainers by the caller
+            // (prepare_preload_chain), so forward only what is left — otherwise they
+            // ride as a second token of a name nub already emits.
+            let (existing, _, _) = split_inherited_preloads(&existing);
             let stripped = flags::strip_unsupported_node_options(&existing, &config.node.version);
             if !stripped.is_empty() {
                 node_opts_parts.push(stripped);
@@ -1348,7 +1431,12 @@ impl Drop for CompileCacheSentinelGuard {
     }
 }
 
-const PATH_SHIM_PREFIX: &str = "nub-node-shim-";
+/// Public so a caller spawning a `#!/usr/bin/env node` tool can REMOVE the shim
+/// from that child's `PATH`. Leaving it in makes the tool's shebang resolve
+/// `node` back to nub, which re-enters and can spawn the same tool again without
+/// bound — see `env_owner::strip_node_shim_from_path`.
+// @lat: [[architecture#Architecture#Composition]]
+pub const PATH_SHIM_PREFIX: &str = "nub-node-shim-";
 const PATH_SHIM_CREATE_RETRIES: usize = 16;
 
 static PATH_SHIM_MANAGER: PathShimManager = PathShimManager::new();
@@ -1905,7 +1993,11 @@ pub fn compute_augmentation_env(
     // `--localstorage-file`. (Scripts have no argv here — the only user channel is
     // NODE_OPTIONS.) Guarded against double-add / a user
     // `--no-experimental-webstorage` disable.
-    if should_inject_webstorage_flag(&node_version, &[], existing_node_options.as_deref()) {
+    if flags::should_inject_experimental_webstorage(
+        &node_version,
+        &[],
+        existing_node_options.as_deref(),
+    ) {
         node_opts_parts.push("--experimental-webstorage".to_string());
     }
     // localStorage-neutralize decision: compute BEFORE `existing_node_options` is
@@ -1913,13 +2005,18 @@ pub fn compute_augmentation_env(
     // NODE_OPTIONS. Neutralize when nub injects the flag (flag-needed band, no user
     // `--no-experimental-webstorage`) AND the user hasn't opted into persistence via
     // `--localstorage-file`.
-    let neutralize_localstorage =
-        should_neutralize_localstorage(&node_version, &[], existing_node_options.as_deref());
+    let neutralize_localstorage = flags::should_neutralize_experimental_webstorage_localstorage(
+        &node_version,
+        &[],
+        existing_node_options.as_deref(),
+    );
     if let Some(existing) = existing_node_options {
         // Snip below-floor version-gated flags out of the inherited NODE_OPTIONS
         // before appending (mirror of the direct-spawn site above) — a gated flag
         // the child Node can't parse otherwise aborts it with exit 9. See
         // flags::strip_unsupported_node_options.
+        // Same fold as the main spawn path — see split_inherited_preloads.
+        let (existing, _, _) = split_inherited_preloads(&existing);
         let stripped = flags::strip_unsupported_node_options(&existing, &node_version);
         if !stripped.is_empty() {
             node_opts_parts.push(stripped);
@@ -1963,7 +2060,7 @@ pub struct AugmentationEnv {
     /// child so nub's preload replaces the throwing `localStorage` getter with
     /// `undefined` (the flag-needed band, no user `--localstorage-file`). Consumers
     /// apply it via [`AugmentationEnv::apply_localstorage_env`]. See
-    /// `should_neutralize_localstorage`.
+    /// `flags::should_neutralize_experimental_webstorage_localstorage`.
     pub neutralize_localstorage: bool,
 }
 
@@ -2014,7 +2111,7 @@ impl AugmentationEnv {
     /// the minimal `env`-setting shape they share.
     pub fn apply_localstorage_env(&self, set_env: impl FnOnce(&str, &str)) {
         if self.neutralize_localstorage {
-            set_env(NEUTRALIZE_LOCALSTORAGE_ENV, "1");
+            set_env(flags::NEUTRALIZE_LOCALSTORAGE_ENV, "1");
         }
     }
 
@@ -2060,84 +2157,6 @@ fn is_permission_flag(arg: &str) -> bool {
     PERMISSION_FLAGS.contains(&token)
 }
 
-/// Whether the user already supplied the `--experimental-webstorage` flag in
-/// either polarity (`--experimental-webstorage` or `--no-experimental-webstorage`)
-/// via argv or NODE_OPTIONS. When true, nub must NOT add its own
-/// `--experimental-webstorage`: a duplicate positive is redundant, and overriding a
-/// user's explicit `--no-experimental-webstorage` would defeat their disable
-/// (and nub never re-enables over a user negation). Pure over its inputs.
-fn user_has_webstorage_flag(user_args: &[String], node_options: Option<&str>) -> bool {
-    let is_ws = |t: &str| t == "--experimental-webstorage" || t == "--no-experimental-webstorage";
-    let in_argv = user_args.iter().any(|a| is_ws(a));
-    let in_opts = node_options
-        .map(|o| o.split_whitespace().any(is_ws))
-        .unwrap_or(false);
-    in_argv || in_opts
-}
-
-/// Whether nub should inject `--experimental-webstorage` for this invocation
-/// (the maintainer, 2026-06-15: "a flag that we inject no matter what"). True iff the Node
-/// version is on the flag-needed band (22.4 through <25, where the flag both EXISTS
-/// and is still REQUIRED) AND the user hasn't already supplied the flag in either
-/// polarity. The inject is UNCONDITIONAL on the band — it does not depend on any
-/// `--localstorage-file` opt-in — so `sessionStorage` works out of the box; it
-/// installs the `localStorage` getter too (which throws on access until the user
-/// supplies their own `--localstorage-file`; nub never synthesizes one). Below 22.4
-/// the flag is a "bad option" startup crash; on 25+ Web Storage is native so the
-/// flag is unnecessary. Pure over its inputs for testability.
-fn should_inject_webstorage_flag(
-    node_version: &super::version::NodeVersion,
-    user_args: &[String],
-    node_options: Option<&str>,
-) -> bool {
-    flags::webstorage_flag_needed(node_version)
-        && !user_has_webstorage_flag(user_args, node_options)
-}
-
-/// Whether the user supplied a `--localstorage-file[=<path>]` (in either argv or
-/// NODE_OPTIONS). When true, the user has explicitly opted into persistent
-/// `localStorage`, so nub must NOT neutralize the global — it forwards the file
-/// verbatim and `localStorage` works normally. Matches both the `=`-joined form
-/// (`--localstorage-file=/p`) and the space-separated form (`--localstorage-file /p`),
-/// which appears as a bare `--localstorage-file` token. Pure over its inputs.
-fn user_has_localstorage_file(user_args: &[String], node_options: Option<&str>) -> bool {
-    let is_lsf = |t: &str| t == "--localstorage-file" || t.starts_with("--localstorage-file=");
-    let in_argv = user_args.iter().any(|a| is_lsf(a));
-    let in_opts = node_options
-        .map(|o| o.split_whitespace().any(is_lsf))
-        .unwrap_or(false);
-    in_argv || in_opts
-}
-
-/// Whether nub should NEUTRALIZE the `localStorage` global to read `undefined`
-/// (matching Node 25+'s clean shape) for this invocation (the maintainer, 2026-06-15). True
-/// iff nub is injecting `--experimental-webstorage` on the flag-needed band AND the
-/// user did NOT supply their own `--localstorage-file`. On that band the injected
-/// flag installs a `localStorage` getter that THROWS `ERR_INVALID_ARG_VALUE` on
-/// access (even `typeof localStorage` throws) until a `--localstorage-file` is
-/// supplied — so when the user hasn't opted into persistence, nub replaces that
-/// throwing getter with a plain `undefined` value in its startup preload, leaving
-/// `sessionStorage` (which needs only the flag) fully working and making
-/// `typeof localStorage === "undefined"` feature-detection safe. When the user DOES
-/// pass `--localstorage-file`, this is false — `localStorage` works normally. The
-/// neutralization is signaled to the preload via the internal
-/// `__NUB_NEUTRALIZE_LOCALSTORAGE` env var. Pure over its inputs for testability.
-fn should_neutralize_localstorage(
-    node_version: &super::version::NodeVersion,
-    user_args: &[String],
-    node_options: Option<&str>,
-) -> bool {
-    should_inject_webstorage_flag(node_version, user_args, node_options)
-        && !user_has_localstorage_file(user_args, node_options)
-}
-
-/// Internal env var that tells nub's startup preload to neutralize the
-/// `localStorage` global (replace the throwing getter with `undefined`). An
-/// internal `__NUB_*` plumbing var, NOT a user knob — explicitly permitted by the
-/// brand boundary. The preload deletes it after reading so it does not leak to
-/// grandchild processes.
-const NEUTRALIZE_LOCALSTORAGE_ENV: &str = "__NUB_NEUTRALIZE_LOCALSTORAGE";
-
 /// Carries the running binary's version (`env!("CARGO_PKG_VERSION")`) to the
 /// preload, which publishes it as `process.versions.nub` — the universal
 /// `process.versions.<runtime>` self-identification marker (cf. `.bun`,
@@ -2150,8 +2169,9 @@ const NEUTRALIZE_LOCALSTORAGE_ENV: &str = "__NUB_NEUTRALIZE_LOCALSTORAGE";
 /// the same preload via NODE_OPTIONS) and they advertise the marker too.
 const VERSION_ENV: &str = "__NUB_VERSION";
 
-/// Carries the resolved `nub.jsonc` snapshot (`preload`, `loader`, `tsconfig`)
-/// to the runtime as JSON. Resolved ONCE by the Rust frontend after the final
+/// Carries the resolved `nub.jsonc` runtime snapshot (preloads, loaders,
+/// TypeScript transforms, and the selected tsconfig) to the runtime as JSON.
+/// Resolved ONCE by the Rust frontend after the final
 /// cwd is known and transported unchanged through nested shim launches, so every
 /// process in a run transpiles against the same config. Internal plumbing, not a
 /// user knob — and denylisted from `.env` sources, since a repo-supplied value
@@ -2526,7 +2546,7 @@ fn augmentation_environment_restoration() -> Vec<(&'static str, Option<OsString>
         COMPAT_PRESENT_ENV,
         RUNTIME_CONFIG_ENV,
         VERSION_ENV,
-        NEUTRALIZE_LOCALSTORAGE_ENV,
+        flags::NEUTRALIZE_LOCALSTORAGE_ENV,
         FORCE_ASYNC_TIER_ENV,
     ] {
         changes.push((marker, None));
@@ -2579,6 +2599,7 @@ pub unsafe fn restore_fresh_invocation_environment() {
 /// inclusive; 24.11.1+/25.2+/26 are fine. Refs nodejs/node#59666. (A later 22.x
 /// that backported the fix would be over-covered here — harmless, since the
 /// async tier composes correctly on every version.)
+// @lat: [[research/registerhooks-coverage-matrix#registerHooks coverage & sync/async-composition matrix (empirical)#Consequences]]
 fn node_hook_compose_broken(v: &super::version::NodeVersion) -> bool {
     use super::version::NodeVersion;
     *v >= NodeVersion::new(22, 15, 0) && *v <= NodeVersion::new(24, 11, 0)
@@ -2702,7 +2723,15 @@ fn is_reentrant_in(node_options: Option<&str>, preload: Option<&str>) -> bool {
 /// `\\?\UNC\`) that `fs::canonicalize` emits. Node's module loader and NODE_PATH
 /// reject them. Returns a native Windows path (backslashes preserved — valid for
 /// NODE_PATH and fs ops). Pure over `windows` so both branches test on any host.
-fn strip_verbatim(path: &str, windows: bool) -> String {
+///
+/// The loader's refusal is not cosmetic. CJS resolution ends in
+/// `fs.realpathSync`, whose Windows walk lstats the path's ROOT first; for
+/// `\\?\C:\…` that root is `\\?\C:\`, which Node's native `ToNamespacedPath`
+/// re-resolves to `\\?\C:` — the volume DEVICE rather than its root directory —
+/// and the call fails `EISDIR: illegal operation on a directory, lstat 'C:'`
+/// (the bare `C:` is the namespace prefix stripped back off for the message).
+/// So a single `\\?\` path handed to Node kills every `require` in the process.
+pub fn strip_verbatim(path: &str, windows: bool) -> String {
     if windows {
         if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
             return format!(r"\\{rest}");
@@ -2712,6 +2741,19 @@ fn strip_verbatim(path: &str, windows: bool) -> String {
         }
     }
     path.to_string()
+}
+
+/// [`strip_verbatim`] for a path that is about to become a Node command-line
+/// argument rather than a filesystem handle.
+///
+/// A path that is not valid UTF-8 is returned untouched: it cannot be handed to
+/// Node as an argument in any spelling, so re-spelling it would only mask the
+/// real failure. Pure over `windows` so both branches test on any host.
+pub fn strip_verbatim_path(path: &Path, windows: bool) -> PathBuf {
+    match path.to_str() {
+        Some(text) => PathBuf::from(strip_verbatim(text, windows)),
+        None => path.to_path_buf(),
+    }
 }
 
 /// Whether a preload spec names an absolute path rather than a bare module
@@ -2748,6 +2790,12 @@ fn is_absolute_path(spec: &str, windows: bool) -> bool {
 /// paths and `file://server/share/...` for UNC. On Unix the path is already an
 /// absolute forward-slash path, so `file://` + path gives the correct
 /// `file:///abs/...`. Pure over `windows` so both branches test on any host.
+/// Public wrapper over [`to_file_url`] for the current platform, for callers that
+/// build their own `--import` value (the synthesized preload chainer).
+pub fn file_url_for(path: &str) -> String {
+    to_file_url(path, cfg!(windows))
+}
+
 fn to_file_url(path: &str, windows: bool) -> String {
     if !windows {
         return format!("file://{path}");
@@ -2822,6 +2870,129 @@ pub fn node_options_token(value: &str) -> String {
     }
 }
 
+/// Split a NODE_OPTIONS-shaped string into individual flag tokens — the inverse of
+/// [`node_options_token`], mirroring Node's own `ParseNodeOptionsEnvVar`
+/// (.repos/node/src/node_options.cc): split on whitespace EXCEPT inside a
+/// double-quoted run, where a backslash escapes the next character.
+///
+/// Needed because callers that accept a raw NODE_OPTIONS string from OUTSIDE
+/// nub.jsonc (npm's `node-options` npmrc field) must hand `compute_augmentation_env`
+/// one element PER FLAG: it re-quotes every element individually, so pushing
+/// `--a --b` as a single element would emit the one broken token `"--a --b"`.
+/// Preload entries carried by an INHERITED `NODE_OPTIONS`, split out so nub can fold
+/// them into its own chainers instead of letting them ride as extra tokens.
+///
+/// Returns `(passthrough, requires, imports)` — the flags to forward unchanged, and
+/// the values of any `--require` / `--import` entries.
+///
+/// Why only those two names: a consumer that re-parses `NODE_OPTIONS` keys it by flag
+/// NAME and keeps one value per key (Next.js does — vercel/next.js#96582), so a token
+/// only collides with nub's own if it shares a name. nub emits exactly `--require`
+/// and `--import`.
+///
+/// Deliberately NOT folded:
+/// - `--loader` / `--experimental-loader` — nub emits neither, so they cannot collide,
+///   and folding one into an `import` would silently drop its hook registration. A
+///   loader is not an import.
+/// - Yarn PnP (`.pnp.cjs`, `.pnp.loader.mjs`) — PnP's resolver has to install before
+///   nub's preload, and the chainers run after it.
+///
+/// Safe against re-entrancy by construction: the caller only rebuilds `NODE_OPTIONS`
+/// when NOT re-entrant, so the inherited value cannot already carry nub's own token.
+pub fn split_inherited_preloads(value: &str) -> (String, Vec<String>, Vec<String>) {
+    // Left in place rather than folded. PnP's resolver must install before nub's
+    // preload, and nub's OWN tokens must stay exactly where they are: a NESTED nub
+    // inherits them, and folding them into the new chainer would re-run nub's preload
+    // from inside itself and break the re-entrancy detection that keys on that token.
+    fn keep_in_place(value: &str) -> bool {
+        let v = value.trim_matches('"').replace('\\', "/");
+        v.ends_with(".pnp.cjs")
+            || v.ends_with(".pnp.loader.mjs")
+            || v.contains("/runtime/preload.")
+            || v.contains("/.nub/preload-chain.")
+    }
+
+    let tokens = split_node_options(value);
+    let mut passthrough: Vec<String> = Vec::new();
+    let mut requires: Vec<String> = Vec::new();
+    let mut imports: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        // Both spellings: `--require=<v>` and `--require <v>`.
+        let split = token
+            .split_once('=')
+            .map(|(flag, value)| (flag, Some(value.to_string())))
+            .unwrap_or((token.as_str(), None));
+        let (flag, inline) = split;
+        let had_inline = inline.is_some();
+        let sink = match flag {
+            "--require" | "-r" => Some(&mut requires),
+            "--import" => Some(&mut imports),
+            _ => None,
+        };
+        match (sink, inline) {
+            (Some(sink), Some(value)) if !keep_in_place(&value) => sink.push(value),
+            (Some(sink), None)
+                if index + 1 < tokens.len() && !keep_in_place(&tokens[index + 1]) =>
+            {
+                sink.push(tokens[index + 1].clone());
+                index += 1;
+            }
+            // A PnP token, or a value-less trailing flag: forward verbatim, taking the
+            // separated value with it so the pair stays intact.
+            _ => {
+                passthrough.push(token.clone());
+                if !had_inline
+                    && matches!(flag, "--require" | "-r" | "--import")
+                    && index + 1 < tokens.len()
+                {
+                    index += 1;
+                    passthrough.push(tokens[index].clone());
+                }
+            }
+        }
+        index += 1;
+    }
+    (
+        passthrough
+            .iter()
+            .map(|token| node_options_token(token))
+            .collect::<Vec<_>>()
+            .join(" "),
+        requires,
+        imports,
+    )
+}
+
+pub fn split_node_options(value: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_string = false;
+    let mut start_new = true;
+    let mut chars = value.chars();
+    while let Some(mut c) = chars.next() {
+        if c == '\\' && in_string {
+            // A trailing escape is malformed; Node aborts, we simply drop it.
+            match chars.next() {
+                Some(next) => c = next,
+                None => break,
+            }
+        } else if c.is_whitespace() && !in_string {
+            start_new = true;
+            continue;
+        } else if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if start_new {
+            out.push(String::new());
+            start_new = false;
+        }
+        out.last_mut().expect("pushed above").push(c);
+    }
+    out
+}
+
 /// Pick the preload injection for a Node version, given the located ESM preload
 /// path (`runtime/preload.mjs`). On the fast tier the sibling `runtime/preload.cjs`
 /// is injected via `--require` (raw path — `require` takes a path, not a URL); on
@@ -2860,6 +3031,13 @@ pub fn preload_injection(
     preload_injection_for(preload_mjs, version, cfg!(windows))
 }
 
+/// SUPERSEDED — no longer on the spawn path. `nub.jsonc` `preload` entries are now
+/// loaded by a single synthesized chainer (`prepare_preload_chain` in nub-cli), because
+/// one NODE_OPTIONS token PER ENTRY is destroyed by any consumer that re-parses the
+/// variable (vercel/next.js#96582). Kept, with its tests, for the two measured Node
+/// facts below — they still govern which channel the chainer rides. Safe to delete
+/// once those facts are restated at the new site.
+///
 /// How a USER preload (`nub.jsonc` `preload`) reaches Node — chosen by tier so it
 /// always lands AFTER nub's own preload and runs exactly once.
 ///
@@ -3310,6 +3488,91 @@ mod tests {
     }
 
     #[test]
+    fn split_inherited_preloads_folds_only_the_names_nub_emits() {
+        let (rest, req, imp) = split_inherited_preloads(
+            "--enable-source-maps --require /a.cjs --import /b.mjs --title=x",
+        );
+        assert_eq!(req, vec!["/a.cjs"]);
+        assert_eq!(imp, vec!["/b.mjs"]);
+        assert_eq!(rest, "--enable-source-maps --title=x");
+
+        // Both spellings, and several of one name (the shape that collides).
+        let (rest, req, imp) =
+            split_inherited_preloads("--require=/a.cjs --require /b.cjs --import=/c.mjs");
+        assert_eq!(req, vec!["/a.cjs", "/b.cjs"]);
+        assert_eq!(imp, vec!["/c.mjs"]);
+        assert!(rest.is_empty(), "everything foldable was folded: {rest:?}");
+
+        // A loader is NOT an import: folding it would drop its hook registration.
+        let (rest, req, imp) =
+            split_inherited_preloads("--loader /l.mjs --experimental-loader=/m.mjs");
+        assert!(req.is_empty() && imp.is_empty());
+        assert_eq!(rest, "--loader /l.mjs --experimental-loader=/m.mjs");
+
+        // Yarn PnP must keep its position ahead of nub's preload.
+        let (rest, req, _) = split_inherited_preloads("--require /proj/.pnp.cjs --require /a.cjs");
+        assert_eq!(req, vec!["/a.cjs"], "only the non-PnP entry folds");
+        assert_eq!(rest, "--require /proj/.pnp.cjs");
+
+        // nub's OWN tokens stay put: a nested nub inherits them, and folding them
+        // would re-run nub's preload from inside itself and defeat re-entrancy
+        // detection, which keys on that exact token.
+        let (rest, req, imp) = split_inherited_preloads(
+            "--require=/nub/runtime/preload.cjs --import=/p/node_modules/.nub/preload-chain.mjs --require /a.cjs",
+        );
+        assert_eq!(req, vec!["/a.cjs"]);
+        assert!(imp.is_empty());
+        assert!(
+            rest.contains("runtime/preload.cjs") && rest.contains("preload-chain.mjs"),
+            "nub's own tokens must be forwarded verbatim: {rest}"
+        );
+
+        // A value with a space survives the round-trip through the tokenizer.
+        let (rest, req, _) = split_inherited_preloads(r#"--require "/a b/c.cjs" --title=t"#);
+        assert_eq!(req, vec!["/a b/c.cjs"]);
+        assert_eq!(rest, "--title=t");
+    }
+
+    #[test]
+    fn split_node_options_is_the_inverse_of_node_options_token() {
+        // One element per FLAG is the contract: `compute_augmentation_env` re-quotes
+        // each element individually, so a value left whole would emit the single
+        // broken token `"--a --b"`.
+        assert_eq!(
+            split_node_options("--max-old-space-size=8192 --trace-warnings"),
+            vec!["--max-old-space-size=8192", "--trace-warnings"]
+        );
+        // A quoted run holds a space together — the reason a naive `split_whitespace`
+        // is wrong. This is the `--require=/Users/John Doe/x.cjs` shape.
+        assert_eq!(
+            split_node_options(r#"--title="a b c" --trace-warnings"#),
+            vec!["--title=a b c", "--trace-warnings"]
+        );
+        // Inside a quoted run a backslash escapes, so a Windows path survives.
+        assert_eq!(
+            split_node_options(r#""--require=C:\\Users\\John Doe\\x.cjs""#),
+            vec![r#"--require=C:\Users\John Doe\x.cjs"#]
+        );
+        // Empty and whitespace-only inputs yield nothing, never a bogus empty flag.
+        assert!(split_node_options("").is_empty());
+        assert!(split_node_options("   ").is_empty());
+
+        // The pair round-trips: anything token() quotes, split() takes back apart.
+        for value in [
+            "--title=plain",
+            "--title=a b c",
+            r#"--title=a"b"#,
+            r#"--require=C:\Users\John Doe\x.cjs"#,
+        ] {
+            assert_eq!(
+                split_node_options(&node_options_token(value)),
+                vec![value.to_string()],
+                "round-trip failed for {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn node_options_token_round_trips_as_one_real_node_option() {
         // The second case is the shape a project `nub.jsonc` can actually deliver:
         // the CLI validator rejects whitespace and NUL but not a double quote, and
@@ -3335,191 +3598,74 @@ mod tests {
     }
 
     #[test]
-    fn webstorage_flag_always_injected_on_band_without_localstorage_file() {
-        // the maintainer, 2026-06-15: nub injects --experimental-webstorage "no matter what"
-        // on the flag-needed band (22.4–24), with NO --localstorage-file present —
-        // so sessionStorage works out of the box. (a) in-band with no file → inject.
-        for ver in [
-            NodeVersion::new(22, 4, 0),
-            NodeVersion::new(22, 15, 0),
-            NodeVersion::new(24, 0, 0),
-            NodeVersion::new(24, 99, 0),
-        ] {
-            assert!(
-                should_inject_webstorage_flag(&ver, &[], None),
-                "must inject --experimental-webstorage on {ver:?} with no --localstorage-file"
-            );
-        }
+    fn direct_spawn_policy_respects_quoted_node_options() {
+        // `spawn_node` passes its original argv plus inherited NODE_OPTIONS to the
+        // shared policy. A quoted explicit disable must prevent a direct child
+        // from receiving nub's positive Web Storage flag.
+        let version = NodeVersion::new(22, 15, 0);
+        let user_args = ["app.js".to_string()];
+        assert!(!flags::should_inject_experimental_webstorage(
+            &version,
+            &user_args,
+            Some("\"--no-experimental-webstorage\""),
+        ));
+        assert!(
+            !flags::should_neutralize_experimental_webstorage_localstorage(
+                &version,
+                &user_args,
+                Some("\"--no-experimental-webstorage\""),
+            )
+        );
+
+        // A quoted storage-file value preserves the flag injection for
+        // sessionStorage while keeping localStorage usable.
+        let storage_file = "--localstorage-file=\"/tmp/nub storage.sqlite\"";
+        assert!(flags::should_inject_experimental_webstorage(
+            &version,
+            &user_args,
+            Some(storage_file),
+        ));
+        assert!(
+            !flags::should_neutralize_experimental_webstorage_localstorage(
+                &version,
+                &user_args,
+                Some(storage_file),
+            )
+        );
     }
 
     #[test]
-    fn webstorage_flag_not_injected_below_floor_or_when_native() {
-        // (b) below 22.4 the flag is an unrecognized "bad option" → never inject.
-        for ver in [NodeVersion::new(18, 19, 0), NodeVersion::new(22, 3, 0)] {
-            assert!(
-                !should_inject_webstorage_flag(&ver, &[], None),
-                "must NOT inject below the 22.4 floor ({ver:?}) — would crash startup"
-            );
-        }
-        // (c) on 25+ Web Storage is native → the flag is unnecessary, don't inject.
-        for ver in [NodeVersion::new(25, 0, 0), NodeVersion::new(26, 2, 0)] {
-            assert!(
-                !should_inject_webstorage_flag(&ver, &[], None),
-                "must NOT inject on {ver:?} — Web Storage is native there"
-            );
-        }
-    }
-
-    #[test]
-    fn webstorage_flag_not_double_injected_when_user_supplied() {
-        // (e) user already passed the flag (either polarity, either channel) → nub
-        // must not double-inject / must respect an explicit disable.
-        let s = |v: &str| v.to_string();
-        let v = NodeVersion::new(22, 15, 0);
-        assert!(!should_inject_webstorage_flag(
-            &v,
-            &[s("--experimental-webstorage")],
-            None
-        ));
-        assert!(!should_inject_webstorage_flag(
-            &v,
+    fn script_spawn_policy_respects_quoted_node_options() {
+        // `compute_augmentation_env` has no argv channel: its script-shell
+        // Web Storage decision comes solely from inherited NODE_OPTIONS. Keep
+        // quoted user intent identical to the ordinary/direct spawn path.
+        let version = NodeVersion::new(22, 15, 0);
+        assert!(!flags::should_inject_experimental_webstorage(
+            &version,
             &[],
-            Some("--experimental-webstorage")
+            Some("'--experimental-webstorage'"),
         ));
-        assert!(!should_inject_webstorage_flag(
-            &v,
-            &[s("--no-experimental-webstorage")],
-            None
-        ));
-        assert!(!should_inject_webstorage_flag(
-            &v,
+        assert!(
+            !flags::should_neutralize_experimental_webstorage_localstorage(
+                &version,
+                &[],
+                Some("'--experimental-webstorage'"),
+            )
+        );
+
+        let storage_file = "--localstorage-file='/tmp/nub storage.sqlite'";
+        assert!(flags::should_inject_experimental_webstorage(
+            &version,
             &[],
-            Some("--no-experimental-webstorage")
+            Some(storage_file),
         ));
-        // A --localstorage-file opt-in does NOT change the in-band decision — the
-        // flag injects either way; (d) nub never synthesizes --localstorage-file, so
-        // its presence/absence is irrelevant to whether the flag is injected.
-        assert!(should_inject_webstorage_flag(
-            &v,
-            &[s("--localstorage-file=/tmp/x.sqlite")],
-            None
-        ));
-    }
-
-    #[test]
-    fn existing_user_webstorage_flag_suppresses_injection() {
-        let s = |v: &str| v.to_string();
-        // Neither polarity present → nub may inject.
-        assert!(!user_has_webstorage_flag(&[s("app.js")], None));
-        // User already passed the positive → don't double-add.
-        assert!(user_has_webstorage_flag(
-            &[s("--experimental-webstorage")],
-            None
-        ));
-        assert!(user_has_webstorage_flag(
-            &[],
-            Some("--experimental-webstorage")
-        ));
-        // User explicitly disabled → respect it, never re-enable.
-        assert!(user_has_webstorage_flag(
-            &[s("--no-experimental-webstorage")],
-            None
-        ));
-        assert!(user_has_webstorage_flag(
-            &[],
-            Some("--no-experimental-webstorage --localstorage-file=/tmp/x")
-        ));
-    }
-
-    #[test]
-    fn user_localstorage_file_detected_in_either_channel() {
-        let s = |v: &str| v.to_string();
-        // Absent → not detected.
-        assert!(!user_has_localstorage_file(&[s("app.js")], None));
-        // `=`-joined form, argv.
-        assert!(user_has_localstorage_file(
-            &[s("--localstorage-file=/tmp/x.sqlite")],
-            None
-        ));
-        // Space-separated form (bare token), argv.
-        assert!(user_has_localstorage_file(
-            &[s("--localstorage-file"), s("/tmp/x.sqlite")],
-            None
-        ));
-        // Via NODE_OPTIONS.
-        assert!(user_has_localstorage_file(
-            &[],
-            Some("--experimental-webstorage --localstorage-file=/tmp/x.sqlite")
-        ));
-        // A look-alike that is NOT the flag must not match.
-        assert!(!user_has_localstorage_file(
-            &[s("--localstorage-file-extra")],
-            None
-        ));
-    }
-
-    #[test]
-    fn neutralize_localstorage_gate_set_iff_flag_injected_and_no_user_file() {
-        let s = |v: &str| v.to_string();
-        // (a) On the flag-needed band with NO user --localstorage-file → neutralize:
-        // nub injects the flag, the user didn't opt into persistence, so the throwing
-        // getter must be replaced with `undefined`.
-        for ver in [
-            NodeVersion::new(22, 4, 0),
-            NodeVersion::new(22, 15, 0),
-            NodeVersion::new(24, 99, 0),
-        ] {
-            assert!(
-                should_neutralize_localstorage(&ver, &[], None),
-                "must neutralize on {ver:?} with no --localstorage-file"
-            );
-        }
-
-        // (b) User passed --localstorage-file (either channel/form) → do NOT
-        // neutralize; localStorage works normally.
-        let v = NodeVersion::new(22, 15, 0);
-        assert!(!should_neutralize_localstorage(
-            &v,
-            &[s("--localstorage-file=/tmp/x.sqlite")],
-            None
-        ));
-        assert!(!should_neutralize_localstorage(
-            &v,
-            &[s("--localstorage-file"), s("/tmp/x.sqlite")],
-            None
-        ));
-        assert!(!should_neutralize_localstorage(
-            &v,
-            &[],
-            Some("--localstorage-file=/tmp/x.sqlite")
-        ));
-
-        // (c) Off the flag-needed band (pre-22.4 / 25+ native) → no flag injected, so
-        // never neutralize regardless of file.
-        for ver in [
-            NodeVersion::new(18, 19, 0),
-            NodeVersion::new(22, 3, 0),
-            NodeVersion::new(25, 0, 0),
-            NodeVersion::new(26, 2, 0),
-        ] {
-            assert!(
-                !should_neutralize_localstorage(&ver, &[], None),
-                "must NOT neutralize off the flag-needed band ({ver:?})"
-            );
-        }
-
-        // User-supplied/disabled --experimental-webstorage suppresses the inject, so
-        // there is no nub-installed throwing getter to neutralize.
-        assert!(!should_neutralize_localstorage(
-            &v,
-            &[s("--experimental-webstorage")],
-            None
-        ));
-        assert!(!should_neutralize_localstorage(
-            &v,
-            &[s("--no-experimental-webstorage")],
-            None
-        ));
+        assert!(
+            !flags::should_neutralize_experimental_webstorage_localstorage(
+                &version,
+                &[],
+                Some(storage_file),
+            )
+        );
     }
 
     #[test]
@@ -5493,6 +5639,15 @@ mod tests {
         assert_eq!(strip_verbatim(r"C:\a\b", true), r"C:\a\b"); // no prefix: unchanged
         // Non-Windows host never strips (a unix path could legitimately start oddly).
         assert_eq!(strip_verbatim(r"\\?\C:\a", false), r"\\?\C:\a");
+        // The `Path` form is the same rule for a path headed to Node's argv.
+        assert_eq!(
+            strip_verbatim_path(Path::new(r"\\?\C:\a\b"), true),
+            PathBuf::from(r"C:\a\b")
+        );
+        assert_eq!(
+            strip_verbatim_path(Path::new(r"\\?\C:\a\b"), false),
+            PathBuf::from(r"\\?\C:\a\b")
+        );
     }
 
     #[test]

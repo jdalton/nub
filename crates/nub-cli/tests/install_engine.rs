@@ -221,7 +221,7 @@ fn install_truly_fresh_project_claims_nub_identity() {
         Some(&serde_json::json!({
             "name": "nub",
             "version": concat!("^", env!("CARGO_PKG_VERSION")),
-            "onFail": "warn"
+            "onFail": "ignore"
         })),
         "a virgin install stamps a devEngines.packageManager caret range: {manifest}"
     );
@@ -854,7 +854,7 @@ fn add_on_a_truly_fresh_project_claims_nub_identity() {
         Some(&serde_json::json!({
             "name": "nub",
             "version": concat!("^", env!("CARGO_PKG_VERSION")),
-            "onFail": "warn"
+            "onFail": "ignore"
         })),
         "a virgin add stamps a devEngines.packageManager caret range: {manifest}"
     );
@@ -1154,4 +1154,487 @@ fn wildcard_peer_binds_resolved_major_not_registry_highest() {
         "the `*` @babel/core peer must reuse the resolved 7.x, never introduce \
          a higher major; store held: {babel_majors:?}"
     );
+}
+
+/// The dep-build fan-out used to bootstrap node-gyp *before* running anything,
+/// for every approved build and without checking whether the graph wanted it.
+/// A cold tool dir plus an unreachable registry therefore aborted an install
+/// whose only build was a plain `node -e` — and the tool dir lives in the cache,
+/// not the store, so restoring a store cache in CI did not help. The bootstrap
+/// is lazy now: nothing is fetched until a script actually runs `node-gyp`.
+///
+/// Hermetic by construction — a `file:` dep needs no registry, and neither must
+/// the node-gyp path. Holds whether or not the host happens to have a node-gyp
+/// on PATH: with one, no shim is written; without, the shim is written but never
+/// invoked. Either way the bootstrap bucket must not appear.
+#[test]
+fn approved_build_that_never_calls_node_gyp_installs_with_no_registry() {
+    let dir = pm_tmpdir("no-gyp-bootstrap");
+    let dep = dir.join("plainbuild");
+    std::fs::create_dir_all(&dep).unwrap();
+    // Writes relative to its own cwd (the materialized package dir) rather than
+    // through an env var — the build jail scrubs the environment, so a marker
+    // path passed as env would not survive.
+    std::fs::write(
+        dep.join("package.json"),
+        r#"{"name":"plainbuild","version":"1.0.0","scripts":{"postinstall":"node -e \"require('fs').writeFileSync('built-ok','ok')\""}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","private":true,"dependencies":{"plainbuild":"file:./plainbuild"},"allowBuilds":{"plainbuild@file:./plainbuild":true}}"#,
+    )
+    .unwrap();
+    // `fetch-retries=0` so a regression fails fast instead of burning the
+    // retry backoff (the original bug took ~70s to surface).
+    std::fs::write(
+        dir.join(".npmrc"),
+        "registry=http://127.0.0.1:1/\nfetch-retries=0\n",
+    )
+    .unwrap();
+
+    let cache = dir.join("xdg-cache");
+    let out = Command::new(nub_binary())
+        .arg("install")
+        .current_dir(&dir)
+        .env("XDG_DATA_HOME", dir.join("xdg-data"))
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .expect("failed to spawn nub");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a non-gyp build must not need a registry: {stderr}"
+    );
+    assert!(
+        dir.join("node_modules/plainbuild/built-ok").exists(),
+        "the approved build script must actually have run: {stderr}"
+    );
+    assert!(
+        !cache.join("nub/pm/tools/node-gyp/v12").exists(),
+        "nothing invoked node-gyp, so it must not have been bootstrapped: {stderr}"
+    );
+}
+
+/// `jailBuilds` is the one case the lazy shim cannot serve on its own: the jail
+/// clears the environment and substitutes a temporary HOME, so a shim re-entry
+/// resolves the tool dir under *that* home, finds nothing, and cannot refetch
+/// because the jail denies network too. Jailed jobs therefore get node-gyp
+/// resolved up front — but best-effort, so failing to reach a registry cannot
+/// sink an install whose builds never wanted node-gyp.
+///
+/// Hermetic in both directions, which took two tries to get right. The dep is a
+/// `file:` dep and the registry is deliberately dead, so the attempt fails on
+/// every run — but the attempt only HAPPENS when node-gyp is not already
+/// resolvable, so `PATH` is scrubbed of it. Without that scrub this passed
+/// vacuously on any machine with a node-gyp installed (nothing was ever
+/// bootstrapped, so nothing warned). The build script is a shell `echo`, not
+/// `node`, so scrubbing cannot take the interpreter with it.
+#[test]
+fn jailed_build_that_never_needs_node_gyp_survives_a_failed_bootstrap() {
+    let dir = pm_tmpdir("jail-no-gyp");
+    let dep = dir.join("plainbuild");
+    std::fs::create_dir_all(&dep).unwrap();
+    // `echo x > file` is spelled the same for sh and cmd.exe, so this needs no
+    // interpreter on PATH and no inline quoting that either shell re-parses.
+    std::fs::write(
+        dep.join("package.json"),
+        r#"{"name":"plainbuild","version":"1.0.0","scripts":{"postinstall":"echo ok > built-ok"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","private":true,"dependencies":{"plainbuild":"file:./plainbuild"},"allowBuilds":{"plainbuild@file:./plainbuild":true}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".npmrc"),
+        "jail-builds=true\nregistry=http://127.0.0.1:1/\nfetch-retries=0\n",
+    )
+    .unwrap();
+
+    // Drop every directory that provides a node-gyp, so the up-front resolve is
+    // actually attempted rather than short-circuiting on the host's own copy.
+    let names: &[&str] = if cfg!(windows) {
+        &["node-gyp.cmd", "node-gyp.exe", "node-gyp"]
+    } else {
+        &["node-gyp"]
+    };
+    let scrubbed = std::env::var_os("PATH").map(|p| {
+        let keep: Vec<_> = std::env::split_paths(&p)
+            .filter(|d| !names.iter().any(|n| d.join(n).exists()))
+            .collect();
+        std::env::join_paths(keep).expect("rejoin PATH")
+    });
+
+    let mut cmd = Command::new(nub_binary());
+    cmd.arg("install")
+        .current_dir(&dir)
+        .env("XDG_DATA_HOME", dir.join("xdg-data"))
+        .env("XDG_CACHE_HOME", dir.join("xdg-cache"));
+    if let Some(p) = scrubbed {
+        cmd.env("PATH", p);
+    }
+    let out = cmd.output().expect("failed to spawn nub");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // What this test actually owns: the bootstrap failure was DEMOTED to a
+    // warning instead of propagating. The presenter rebrands `WARN_AUBE_*` to
+    // `WARN_NUB_*` on the way out, so match either spelling — grepping only the
+    // raw aube one silently finds nothing.
+    assert!(
+        stderr.contains("WARN_AUBE_NODE_GYP_BOOTSTRAP_FAILED")
+            || stderr.contains("WARN_NUB_NODE_GYP_BOOTSTRAP_FAILED"),
+        "the failed up-front resolve must warn rather than abort the install: {stderr}"
+    );
+
+    // Windows aborts node at startup under the build jail (`ncrypto::CSPRNG`
+    // assertion), so the build script cannot run there at all and the install
+    // fails for a reason this test does not own. Asserting success anyway would
+    // pin an unrelated platform defect. Where the jail can run node, the full
+    // contract holds.
+    if stderr.contains("ncrypto::CSPRNG") {
+        return;
+    }
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an unreachable registry must not fail a jailed install that never uses node-gyp: {stderr}"
+    );
+    assert!(
+        dir.join("node_modules/plainbuild/built-ok").exists(),
+        "the approved build script must still have run: {stderr}"
+    );
+}
+
+/// A cold CI install must link only the optional platform variants it actually
+/// materializes. The resolver widens the graph with every platform's optional
+/// native dep so the committed lockfile stays portable, and the virtual-store
+/// prewarm writes one symlink per optional edge — so a prewarm running on the
+/// unfiltered graph leaves a DANGLING link for every variant the host filter
+/// drops (25 of esbuild's 26 `@esbuild/*`). CI is what auto-selects the
+/// isolated layout that prewarm feeds, so this is the shape CI shipped. The
+/// lockfile-reuse path filters before the prewarm and was never affected.
+#[test]
+#[ignore = "network: installs esbuild from the npm registry"]
+fn ci_install_links_only_the_optional_platform_variants_it_materializes() {
+    if !registry_reachable() {
+        eprintln!("skipping: registry.npmjs.org unreachable");
+        return;
+    }
+    let dir = pm_tmpdir("optional-platform-links");
+    // esbuild ships 26 platform-specific optional deps, exactly one of which is
+    // installable on any given host — the widest cheap fixture for this.
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"opt","private":true,"dependencies":{"esbuild":"0.25.10"}}"#,
+    )
+    .unwrap();
+    let (_out, err, code) = run_install_ci(&dir, &["install"]);
+    assert_eq!(code, 0, "cold CI install must succeed: {err}");
+
+    let nested = dir.join("node_modules/.store/esbuild@0.25.10/node_modules/@esbuild");
+    let entries: Vec<_> = std::fs::read_dir(&nested)
+        .unwrap_or_else(|e| panic!("no nested @esbuild dir at {}: {e}: {err}", nested.display()))
+        .map(|e| e.unwrap().path())
+        .collect();
+
+    // Positive control: without this the dangling assertion below passes
+    // vacuously on an empty or absent directory.
+    assert!(
+        !entries.is_empty(),
+        "the host's own @esbuild variant must be linked: {err}"
+    );
+
+    // `Path::exists` follows symlinks, so a link whose target was never
+    // materialized reads as absent — which is exactly the defect.
+    let dangling: Vec<_> = entries
+        .iter()
+        .filter(|p| !p.exists())
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        dangling.is_empty(),
+        "every linked @esbuild variant must be materialized; {} dangling: {dangling:?}",
+        dangling.len()
+    );
+}
+
+/// `--os`/`--cpu` select which platform-specific optional deps get installed,
+/// overriding host detection for the run. The assertion is host-independent by
+/// construction: it names platforms explicitly and never mentions the host, so
+/// it reads the same on every CI leg.
+///
+/// The override is per AXIS — naming `--os` must leave a configured `cpu`
+/// alone. That is the behavior pnpm pins too, and it is the one a union
+/// implementation would silently get wrong (it would install darwin AND linux
+/// here instead of linux only).
+#[test]
+#[ignore = "network: installs esbuild from the npm registry"]
+fn platform_flags_override_the_named_axis_and_leave_the_others_configured() {
+    if !registry_reachable() {
+        eprintln!("skipping: registry.npmjs.org unreachable");
+        return;
+    }
+    let dir = pm_tmpdir("platform-flags");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"pf","private":true,"packageManager":"pnpm@10.15.1",
+            "dependencies":{"esbuild":"0.25.10"},
+            "pnpm":{"supportedArchitectures":{"os":["darwin"],"cpu":["arm64","x64"]}}}"#,
+    )
+    .unwrap();
+    let (_out, err, code) = run_install(&dir, &["install", "--os", "linux"]);
+    assert_eq!(code, 0, "flagged install must succeed: {err}");
+
+    let mut got: Vec<String> = std::fs::read_dir(dir.join("node_modules/.store"))
+        .unwrap_or_else(|e| panic!("no virtual store: {e}: {err}"))
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().to_string_lossy().to_string();
+            name.strip_prefix("@esbuild+")
+                .and_then(|rest| rest.split('@').next())
+                .map(str::to_string)
+        })
+        .collect();
+    got.sort();
+
+    // `os` came from the flag and replaced `darwin`; `cpu` was never named, so
+    // both configured values survive. A union would also install darwin-*.
+    assert_eq!(
+        got,
+        vec!["linux-arm64".to_string(), "linux-x64".to_string()],
+        "--os must replace the configured os and leave cpu alone: {err}"
+    );
+}
+
+/// A platform selection has to invalidate the install-freshness fast path in
+/// BOTH directions. The selection changes which prebuilt is correct, exactly as
+/// swapping machines does, but the host bytes are identical across a flagged
+/// and a bare run — so a flagged install on an already-installed tree reported
+/// "up to date" and fetched nothing, and dropping the flags again left the
+/// foreign tree in place. Neither is visible from a fresh-fixture test, which
+/// is why this one installs twice.
+#[test]
+#[ignore = "network: installs esbuild from the npm registry"]
+fn changing_the_platform_selection_re_materializes_an_already_installed_tree() {
+    if !registry_reachable() {
+        eprintln!("skipping: registry.npmjs.org unreachable");
+        return;
+    }
+    let dir = pm_tmpdir("platform-rematerialize");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"pr","private":true,"packageManager":"pnpm@10.15.1",
+            "dependencies":{"esbuild":"0.25.10"}}"#,
+    )
+    .unwrap();
+
+    // Whichever variant the host earns. Named rather than assumed, so the
+    // assertions below stay true on every CI leg.
+    let (_o, err, code) = run_install(&dir, &["install"]);
+    assert_eq!(code, 0, "baseline install must succeed: {err}");
+    let host_variants = linked_esbuild_variants(&dir);
+    assert_eq!(
+        host_variants.len(),
+        1,
+        "a plain install links exactly the host's variant, got {host_variants:?}: {err}"
+    );
+
+    // win32/x64 is never the host on any leg we run, so this is a real change.
+    let (_o, err, code) = run_install(&dir, &["install", "--os", "win32", "--cpu", "x64"]);
+    assert_eq!(
+        code, 0,
+        "flagged install over a warm tree must succeed: {err}"
+    );
+    assert_eq!(
+        linked_esbuild_variants(&dir),
+        vec!["win32-x64".to_string()],
+        "the warm tree must be re-materialized for the named platform: {err}"
+    );
+
+    // ...and back. The state a flagged install writes must not read as
+    // up-to-date for a bare one.
+    let (_o, err, code) = run_install(&dir, &["install"]);
+    assert_eq!(
+        code, 0,
+        "install after dropping the flags must succeed: {err}"
+    );
+    assert_eq!(
+        linked_esbuild_variants(&dir),
+        host_variants,
+        "dropping the flags must restore the host's own variant: {err}"
+    );
+}
+
+/// The `@esbuild/*` variants actually linked under the `esbuild` package —
+/// resolvable ones only, so a dangling link never counts as present.
+fn linked_esbuild_variants(dir: &Path) -> Vec<String> {
+    let nested = dir.join("node_modules/.store/esbuild@0.25.10/node_modules/@esbuild");
+    let mut out: Vec<String> = std::fs::read_dir(&nested)
+        .unwrap_or_else(|e| panic!("no nested @esbuild dir at {}: {e}", nested.display()))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.exists())
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Build a workspace whose consumer `app` declares `deps`, alongside members
+/// `lib` (name `lib`, 1.0.0, bin `lib-cli`), `@acme/scoped` (2.0.0) and
+/// `shadow` (9.9.9). Each member's `main` returns its own name, so a test can
+/// assert WHICH package answered rather than that something did.
+fn workspace_alias_fixture(tag: &str, deps: &str) -> PathBuf {
+    let dir = pm_tmpdir(tag);
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{ "name": "root", "private": true, "workspaces": ["packages/*"] }"#,
+    )
+    .unwrap();
+    for (member, name, version) in [
+        ("lib", "lib", "1.0.0"),
+        ("scoped", "@acme/scoped", "2.0.0"),
+        ("shadow", "shadow", "9.9.9"),
+    ] {
+        let mdir = dir.join("packages").join(member);
+        std::fs::create_dir_all(&mdir).unwrap();
+        let bin = if member == "lib" {
+            r#", "bin": { "lib-cli": "cli.js" }"#
+        } else {
+            ""
+        };
+        std::fs::write(
+            mdir.join("package.json"),
+            format!(r#"{{ "name": "{name}", "version": "{version}", "main": "index.js"{bin} }}"#),
+        )
+        .unwrap();
+        std::fs::write(mdir.join("index.js"), format!("module.exports = '{name}';")).unwrap();
+        std::fs::write(mdir.join("cli.js"), "#!/usr/bin/env node\n").unwrap();
+    }
+    let app = dir.join("packages/app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        format!(r#"{{ "name": "app", "version": "1.0.0", "dependencies": {{ {deps} }} }}"#),
+    )
+    .unwrap();
+    dir
+}
+
+/// What `require(spec)` returns from `packages/app`, or the node error.
+fn require_from_app(dir: &Path, spec: &str) -> String {
+    let out = Command::new("node")
+        .args(["-e", &format!("process.stdout.write(require({spec:?}))")])
+        .current_dir(dir.join("packages/app"))
+        .output()
+        .expect("failed to spawn node");
+    if out.status.success() {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    } else {
+        format!("<require failed: {}>", String::from_utf8_lossy(&out.stderr))
+    }
+}
+
+/// `workspace:<member>@<range>` aliases a workspace package under a different
+/// dependency key, and `workspace:<relative-path>` addresses one by directory.
+/// Both are documented pnpm spec forms (nubjs/nub#713) that resolve against the
+/// workspace, never the registry.
+///
+/// The `shadow` case is the one that matters most: the dependency key names a
+/// member too, and the ALIAS TARGET has to win. Real pnpm 10 resolves it to
+/// `lib`; before the fix nub silently linked `shadow` to itself, returned the
+/// wrong package with exit 0, and wrote that wrong answer to the lockfile.
+#[test]
+fn workspace_alias_resolves_the_target_member_not_the_dependency_key() {
+    let dir = workspace_alias_fixture(
+        "ws-alias",
+        r#""lib-alias": "workspace:lib@*",
+           "pinned": "workspace:lib@^1.0.0",
+           "s-alias": "workspace:@acme/scoped@*",
+           "by-path": "workspace:../lib",
+           "shadow": "workspace:lib@*""#,
+    );
+
+    let (stdout, stderr, code) = run_install(&dir, &["install"]);
+    assert_eq!(code, 0, "install must succeed: {stdout}{stderr}");
+
+    for (key, want) in [
+        ("lib-alias", "lib"),
+        ("pinned", "lib"),
+        ("s-alias", "@acme/scoped"),
+        ("by-path", "lib"),
+        ("shadow", "lib"),
+    ] {
+        assert_eq!(
+            require_from_app(&dir, key),
+            want,
+            "`require({key:?})` must load the aliased member `{want}`"
+        );
+    }
+
+    // pnpm records both the plain and the aliased form as `link:<rel>` while
+    // keeping the `workspace:` text as the specifier. Matching that shape is
+    // what keeps the lockfile readable by pnpm.
+    let lock = std::fs::read_to_string(dir.join("nub.lock")).unwrap();
+    for needle in [
+        "specifier: workspace:lib@*",
+        "specifier: workspace:@acme/scoped@*",
+        "specifier: workspace:../lib",
+        "version: link:../lib",
+        "version: link:../scoped",
+    ] {
+        assert!(
+            lock.contains(needle),
+            "nub.lock must contain `{needle}`, got:\n{lock}"
+        );
+    }
+
+    // An aliased member's bins reach the consumer's `.bin/` like any other
+    // workspace dep's — the alias is a rename, not a downgrade.
+    let bin = dir.join("packages/app/node_modules/.bin/lib-cli");
+    assert!(
+        bin.exists(),
+        "`lib-cli` must be shimmed into packages/app/node_modules/.bin, found: {:?}",
+        std::fs::read_dir(dir.join("packages/app/node_modules/.bin"))
+            .map(|d| d.map(|e| e.unwrap().file_name()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+}
+
+/// `workspace:` only ever resolves against the workspace, so a spec naming a
+/// package that is not a member is a hard error — never a silent fall-through
+/// to the registry, which used to report the confusing
+/// `no version of <key> matches range \`workspace:*\``.
+#[test]
+fn workspace_spec_naming_a_non_member_fails_without_reaching_the_registry() {
+    for (deps, expect_code, expect_text) in [
+        // The alias form: the message must name the TARGET, not the key.
+        (
+            r#""lib-alias": "workspace:nosuchpkg@*""#,
+            "ERR_NUB_WORKSPACE_PKG_NOT_FOUND",
+            "nosuchpkg",
+        ),
+        // The plain form, where the key itself is not a member.
+        (
+            r#""ms": "workspace:*""#,
+            "ERR_NUB_WORKSPACE_PKG_NOT_FOUND",
+            "ms",
+        ),
+        // An aliased range the local copy cannot satisfy.
+        (
+            r#""lib-alias": "workspace:lib@^2.0.0""#,
+            "ERR_NUB_NO_MATCHING_VERSION",
+            "^2.0.0",
+        ),
+    ] {
+        let dir = workspace_alias_fixture("ws-alias-err", deps);
+        let (stdout, stderr, code) = run_install(&dir, &["install"]);
+        let all = format!("{stdout}{stderr}");
+        assert_ne!(code, 0, "`{deps}` must fail the install, got 0:\n{all}");
+        assert!(
+            all.contains(expect_code) && all.contains(expect_text),
+            "`{deps}` must fail with {expect_code} mentioning `{expect_text}`, got:\n{all}"
+        );
+    }
 }

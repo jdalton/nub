@@ -151,3 +151,23 @@ common.installTemporalLazyGlobal(__require);
 // compat tier (< 22.8) this is a safe no-op; it benefits 22.8–22.14 users who set
 // NODE_COMPILE_CACHE. See reenableUserCompileCache for the full rationale.
 common.reenableUserCompileCache();
+
+// ── Bounded-cache eviction ──────────────────────────────────────────
+// This tier never swept at all, so a user pinned below Node 22.15 grew both the
+// transpile cache and nub's own V8 compile-cache dir forever. Same shape as the
+// fast tier (preload.cjs): probe cheaply, and schedule the deferred sweep only
+// on the once-a-day run where one is actually due. Main thread only — the core
+// guards on that itself.
+if (core.sweepDue()) {
+  setImmediate(() => {
+    try { core.maybeSweepCache(); } catch {}
+  });
+}
+
+// ── User preloads (`nub.jsonc` `preload`) ───────────────────────────
+// LAST, so the user's entries observe a fully-augmented realm — hooks installed,
+// polyfills in place. Awaited, so a top-level `await` inside an entry settles before
+// the program starts; `require()` could not offer that (ERR_REQUIRE_ASYNC_MODULE).
+// A no-op unless the spawn path put the chainer on nub's own preload rather than its
+// own `--import`. See importUserPreloadChain.
+await common.importUserPreloadChain();

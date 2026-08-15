@@ -51,6 +51,27 @@ impl AddManifestOptions {
     }
 }
 
+fn package_not_found_error_for_registry(
+    client: &aube_registry::client::RegistryClient,
+    name: String,
+) -> miette::Report {
+    let corpus = aube_resolver::popular_package_names_are_ranked()
+        .then(aube_resolver::popular_package_names);
+    package_not_found_error_for_registry_with_corpus(client, name, corpus)
+}
+
+fn package_not_found_error_for_registry_with_corpus(
+    client: &aube_registry::client::RegistryClient,
+    name: String,
+    public_npm_corpus: Option<&str>,
+) -> miette::Report {
+    let corpus = client
+        .uses_default_npm_registry_for(&name)
+        .then_some(public_npm_corpus)
+        .flatten();
+    crate::commands::add_supply_chain::package_not_found_error_with_corpus(name, corpus)
+}
+
 /// Map the paired `--save-workspace-protocol` / `--no-save-workspace-protocol`
 /// flags to a tri-state. `clap`'s `overrides_with` ensures only the
 /// last-typed flag survives, so at most one of the two is `true` at a
@@ -349,7 +370,12 @@ pub(super) async fn update_manifest_for_add(
                 }
                 Err(primary_err) => Err(primary_err),
             }
-            .map_err(|e| miette!("failed to fetch {name}: {e}"))?;
+            .map_err(|e| match e {
+                aube_registry::Error::NotFound(missing) => {
+                    package_not_found_error_for_registry(&client, missing)
+                }
+                error => miette!("failed to fetch {name}: {error}"),
+            })?;
             Ok::<_, miette::Report>((name, packument))
         });
     }
@@ -436,10 +462,12 @@ pub(super) async fn update_manifest_for_add(
         // Resolve non-`latest` dist-tags to their tagged version: like
         // exact pins, they're a deliberate user override (strict mode
         // still refuses a gated one below). `latest` passes through
-        // verbatim — `pick_version_for_add` normalizes it at the API
-        // boundary, steering a gated `latest` to the newest version
-        // clearing the minimumReleaseAge cutoff while keeping the plain
-        // dist-tag preference for a mature one.
+        // verbatim so `pick_version` can widen it (#681): a gated
+        // `latest` steers to the newest release clearing the
+        // minimumReleaseAge cutoff at or below the tag, and a mature one
+        // keeps the plain dist-tag preference. A `latest` pointing at a
+        // prerelease is refused rather than widened, like any other
+        // channel tag.
         let effective_range = if spec.range == "latest" {
             spec.range.clone()
         } else if let Some(tagged_version) = packument.dist_tags.get(&spec.range) {
@@ -488,7 +516,8 @@ pub(super) async fn update_manifest_for_add(
                          to proceed: unset `registry-supports-time-field` if it is on (it \
                          suppresses the full-packument fetch that carries `time`), check the \
                          registry config in .npmrc, add `{}` to `minimumReleaseAgeExclude`, or \
-                         set `minimumReleaseAge=0` to turn the window off for this project",
+                         set `minimumReleaseAge=0` to turn the window off for this project \
+                         (`--minimum-release-age=0` for this run alone)",
                         spec.name
                     ),
                     "cannot check the publish age of {}@{effective_range} — the registry served no publish time for any matching version",
@@ -502,8 +531,24 @@ pub(super) async fn update_manifest_for_add(
                 let (minutes, strict) = minimum_release_age
                     .as_ref()
                     .map_or((0, false), |m| (m.minutes, m.strict));
+                // Same remedies the resolver's `format_age_gate_help` offers on
+                // the install path — `add` used to send the user away with no
+                // way out at all.
                 return Err(miette!(
                     code = aube_codes::errors::ERR_AUBE_NO_MATURE_MATCHING_VERSION,
+                    // `spec.name` is already the REGISTRY identity here — an
+                    // aliased add carries the user-facing key in `spec.alias`
+                    // and writes `npm:{spec.name}@…` to the manifest — so it is
+                    // the right thing to name in an exclude remedy, unlike the
+                    // resolver's `task.name` (see `AgeGateDetails::registry_name`).
+                    help = format!(
+                        "to bypass for this run: `--minimum-release-age=<duration>` to shorten \
+                         the window (`0` turns it off), or \
+                         `--minimum-release-age-exclude={0}` to exempt just this package\n\
+                         to bypass persistently: shorten `minimumReleaseAge` in .npmrc (`0` \
+                         turns it off), or add `{0}` to `minimumReleaseAgeExclude`",
+                        spec.name
+                    ),
                     "no version of {} matching {effective_range} is older than {minutes} minute(s){}",
                     spec.name,
                     if strict {
@@ -1095,6 +1140,30 @@ mod tests {
         assert!(m.dependencies.is_empty());
         assert!(m.peer_dependencies.contains_key("is-odd"));
         assert!(m.dev_dependencies.contains_key("is-odd"));
+    }
+
+    #[test]
+    fn missing_package_hints_use_only_the_registry_the_name_routes_through() {
+        let corpus = Some("react\nlodash\nexpress\n");
+        let public = aube_registry::client::RegistryClient::new("https://registry.npmjs.org");
+        let private = aube_registry::client::RegistryClient::new("https://packages.example.test");
+
+        let public_error = package_not_found_error_for_registry_with_corpus(
+            &public,
+            "lodaszh".to_string(),
+            corpus,
+        );
+        assert_eq!(
+            public_error.to_string(),
+            "package not found: lodaszh; did you mean lodash?"
+        );
+
+        let private_error = package_not_found_error_for_registry_with_corpus(
+            &private,
+            "lodaszh".to_string(),
+            corpus,
+        );
+        assert_eq!(private_error.to_string(), "package not found: lodaszh");
     }
 
     #[tokio::test]

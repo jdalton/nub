@@ -15,21 +15,29 @@
 // on the fast tier; the compat entry passes its already-imported core bindings in
 // (it imported them as ESM), so this module never require()s the core there.
 
-const module_ = require("node:module");
-const { readdirSync, existsSync } = require("node:fs");
-const { fileURLToPath, pathToFileURL } = require("node:url");
-const { join, dirname, extname: pathExtname } = require("node:path");
+const compileBootstrap = process[Symbol.for("nub.compile.bootstrap")];
+const getBuiltin = typeof compileBootstrap?.getBuiltin === "function"
+  ? compileBootstrap.getBuiltin
+  : require;
+const module_ = getBuiltin("node:module");
+const { readdirSync, existsSync } = getBuiltin("node:fs");
+const { fileURLToPath, pathToFileURL } = getBuiltin("node:url");
+const { join, dirname, extname: pathExtname } = getBuiltin("node:path");
 
 // Internal `__NUB_*` plumbing var carrying the running binary's version (set by
 // the Rust spawn layer, coupled to preload injection). Read by installVersionMarker.
 const VERSION_ENV = "__NUB_VERSION";
 
 // Whether this Node natively supports import-text (`--experimental-import-text`,
-// added Node 26.5.0, #62300). Feature-DETECTED via the accepted-flag set rather
-// than version-parsed — the flag is in `allowedNodeEnvironmentFlags` iff Node
-// knows it (26.5+). When true, the load hook steps aside and lets Node's own
-// textStrategy own `type:"text"` imports (nub injects the flag in spawn.rs), per
-// the additive contract; below 26.5 nub polyfills them via `loadTextImport`.
+// added Node 26.5.0 (#62300), backported to 24.19.0). Feature-DETECTED via the
+// accepted-flag set rather than version-parsed — the flag is in
+// `allowedNodeEnvironmentFlags` iff Node knows it. When true, the load hook steps
+// aside and lets Node's own textStrategy own `type:"text"` imports (nub injects the
+// flag in spawn.rs), per the additive contract; where the flag does not exist nub
+// polyfills them via `loadTextImport`. Stepping aside is only safe while the
+// feature-matrix `import-text` bands cover every release that KNOWS the flag: on a
+// version nub steps aside on but does not inject for, the import falls through to
+// Node's default loader and dies with ERR_UNKNOWN_FILE_EXTENSION (#688).
 const NATIVE_IMPORT_TEXT = process.allowedNodeEnvironmentFlags.has("--experimental-import-text");
 
 // ── data: URL unknown-format fidelity helpers ───────────────────────
@@ -258,11 +266,22 @@ function nodeHookComposeBroken() {
 // Both must be scanned. nub's own fast-tier injection is `--require` (never `--import`/
 // `--loader`) on this band, and its compat-tier `--import preload.mjs` lives below 22.15
 // (outside the broken band this gates on), so any such flag here is FOREIGN.
+// nub's OWN preload chainer is not a foreign loader. It rides `--import` like one, so
+// a plain regex over NODE_OPTIONS matches it and nub forces ITSELF onto the async
+// tier — which spawns a loader worker, and Node re-runs every `--require` preload in
+// that worker's realm, so the CJS chain runs twice. Recognise and skip it.
+const NUB_CHAIN_MARKER = /[\\/]\.nub[\\/]preload-chain\./;
+
 function foreignAsyncLoaderFlagPresent() {
   if (cliAsyncLoaderPresent()) return true; // execArgv channel
   const opts = process.env.NODE_OPTIONS;
   if (typeof opts !== "string" || opts === "") return false;
-  return /(?:^|\s)--(?:experimental-)?(?:import|loader)(?:=|\s|$)/.test(opts);
+  const re = /(?:^|\s)--(?:experimental-)?(?:import|loader)(?:=|\s)("[^"]*"|\S*)/g;
+  for (const match of opts.matchAll(re)) {
+    const value = (match[1] || "").replace(/^"|"$/g, "");
+    if (!NUB_CHAIN_MARKER.test(value)) return true;
+  }
+  return false;
 }
 
 // Should nub auto-select its async loader-worker tier at PRELOAD time because a foreign
@@ -534,7 +553,7 @@ function makeHooks(core, watchReporting) {
         if (r) return r;
       }
       if (ext in core.dataExtsFor(url)) return core.loadData(url, ext);
-      const { readFileSync } = require("node:fs");
+      const { readFileSync } = getBuiltin("node:fs");
       const source = readFileSync(path);
       const pkgType = core.getPackageType(dirname(path));
       const format = core.moduleFormatFor(ext, pkgType, path, source.toString("utf8"));
@@ -562,16 +581,18 @@ function makeHooks(core, watchReporting) {
 
     // Import Text (attribute-keyed): honor `with { type: "text" }` on ANY extension,
     // ahead of extension dispatch so `import s from "./c.yaml" with {type:"text"}`
-    // returns raw text, not parsed YAML. On Node 26.5+ (NATIVE_IMPORT_TEXT) step aside
-    // and let Node's own textStrategy own it — nub injects --experimental-import-text,
-    // so the additive "would plain Node + the flag do the same?" test holds and users
-    // get Node's exact semantics. Below 26.5 Node has no text-import support, so nub
+    // returns raw text, not parsed YAML. Where Node knows the flag (NATIVE_IMPORT_TEXT
+    // — 24.19+ on the 24.x line, 26.5+ on 26.x) step aside and let Node's own
+    // textStrategy own it — nub injects --experimental-import-text there, so the
+    // additive "would plain Node + the flag do the same?" test holds and users get
+    // Node's exact semantics. Elsewhere Node has no text-import support, so nub
     // polyfills via loadTextImport (placed after watch reporting so a text file gets
     // the same watch treatment, and before the extension/data dispatch so the attribute
     // wins over the `.txt`/`.yaml`/… data loaders and Node-native JSON; it shortCircuits
     // so Node's own unknown-'text'-attribute validation never runs). The compat-tier
     // hook in preload-async-hooks.mjs always polyfills — that tier tops out at Node
-    // 22.14, below 26.5, so native import-text is never reachable there.
+    // 22.14, below every flag-bearing release, so native import-text is never reachable
+    // there.
     // (Node 18.20+ parses the `with` syntax; the 18.19.x floor cannot.)
     if (context?.importAttributes?.type === "text") {
       return NATIVE_IMPORT_TEXT ? nextLoad(url, context) : core.loadTextImport(url);
@@ -744,7 +765,7 @@ function makeHooks(core, watchReporting) {
       typeof url === "string" && url.startsWith("file:")
     ) {
       try {
-        const { readFileSync } = require("node:fs");
+        const { readFileSync } = getBuiltin("node:fs");
         return { ...r, source: readFileSync(fileURLToPath(url)) };
       } catch { /* fall through with the original result */ }
     }
@@ -1091,16 +1112,44 @@ function preloadPolyfillPackages(reqFromRuntime) {
 // a program inspecting `RegExp.$_` on its first line would otherwise see a leaked
 // path (test-startup-empty-regexp-statics). Deferring the resolve keeps `RegExp.$_`
 // empty at user-code start; the cost is paid only by a program that touches Temporal.
-function installTemporalLazyGlobal(reqFromRuntime) {
-  if (typeof globalThis.Temporal !== "undefined") return;
+const defineTemporal = (value) =>
+  Object.defineProperty(globalThis, "Temporal", {
+    value,
+    configurable: true,
+    writable: true,
+    enumerable: false,
+  });
 
-  const defineTemporal = (value) =>
-    Object.defineProperty(globalThis, "Temporal", {
-      value,
+function installTemporalValue(polyfill) {
+  // @js-temporal/polyfill exports `toTemporalInstant` as a function but does
+  // NOT auto-install it on Date.prototype (you assign it yourself). Install it
+  // here so that on the floor (no native Temporal) `date.toTemporalInstant()`
+  // AND the package clobber's re-export of `Date.prototype.toTemporalInstant`
+  // both work — matching native Node. Guarded so we never replace a native
+  // implementation on a runtime that ships Temporal.
+  if (
+    typeof Date.prototype.toTemporalInstant !== "function" &&
+    typeof polyfill.toTemporalInstant === "function"
+  ) {
+    Object.defineProperty(Date.prototype, "toTemporalInstant", {
+      value: polyfill.toTemporalInstant,
       configurable: true,
       writable: true,
       enumerable: false,
     });
+  }
+  const T = polyfill.Temporal;
+  defineTemporal(T);
+  return T;
+}
+
+function installTemporalGlobal(polyfill) {
+  if (typeof globalThis.Temporal !== "undefined") return globalThis.Temporal;
+  return installTemporalValue(polyfill);
+}
+
+function installTemporalLazyGlobal(reqFromRuntime) {
+  if (typeof globalThis.Temporal !== "undefined") return;
   Object.defineProperty(globalThis, "Temporal", {
     configurable: true,
     enumerable: false,
@@ -1109,26 +1158,7 @@ function installTemporalLazyGlobal(reqFromRuntime) {
       try { temporalPath = reqFromRuntime.resolve("@js-temporal/polyfill"); } catch {}
       if (!temporalPath) return undefined;
       const polyfill = reqFromRuntime(temporalPath);
-      // @js-temporal/polyfill exports `toTemporalInstant` as a function but does
-      // NOT auto-install it on Date.prototype (you assign it yourself). Install it
-      // here so that on the floor (no native Temporal) `date.toTemporalInstant()`
-      // AND the package clobber's re-export of `Date.prototype.toTemporalInstant`
-      // both work — matching native Node. Guarded so we never replace a native
-      // implementation on a runtime that ships Temporal.
-      if (
-        typeof Date.prototype.toTemporalInstant !== "function" &&
-        typeof polyfill.toTemporalInstant === "function"
-      ) {
-        Object.defineProperty(Date.prototype, "toTemporalInstant", {
-          value: polyfill.toTemporalInstant,
-          configurable: true,
-          writable: true,
-          enumerable: false,
-        });
-      }
-      const T = polyfill.Temporal;
-      defineTemporal(T);
-      return T;
+      return installTemporalValue(polyfill);
     },
     set: defineTemporal,
   });
@@ -1188,7 +1218,7 @@ function compileCacheSentinelPath() {
 
 function restoreCompileCacheEnv() {
   try {
-    const { readFileSync, rmSync } = require("node:fs");
+    const { readFileSync, rmSync } = getBuiltin("node:fs");
     const value = readFileSync(compileCacheSentinelPath(), "utf8");
     try { rmSync(compileCacheSentinelPath()); } catch {}
     if (value) process.env.NODE_COMPILE_CACHE = value;
@@ -1217,6 +1247,25 @@ function restoreCompileCacheEnv() {
 // require() has zero added overhead. If the user never requires child_process, the
 // module is never loaded and the builtins stay out of the load list — matching Node.
 let __cpWrapArmed = false;
+// Compiled artifacts spawn children whose NODE_COMPILE_CACHE needs the same R8
+// treatment as an ordinary Nub run. Their fork IDENTITY policy (real executable,
+// bootstrap-first execArgv, private env channel) is NOT here: it has to be armed
+// before the entry chunk's static builtin imports evaluate, so compile-bootstrap.cjs
+// owns it. See the note there before adding fork behavior to this file.
+let __compiledArtifact = false;
+
+function installCompiledChildProcess() {
+  __compiledArtifact = true;
+  // ESM `import { spawn } from "node:child_process"` bypasses Module._load, so a
+  // compiled artifact must eagerly load + patch the builtin and synchronize its
+  // named ESM exports. This startup cost is compiled-only; normal Nub preloads
+  // continue to defer child_process until CommonJS user code requires it.
+  try {
+    wrapChildProcessCompileCache(getBuiltin("node:child_process"));
+    module_.syncBuiltinESMExports();
+  } catch {}
+}
+
 function armChildProcessCompileCacheWrap() {
   if (__cpWrapArmed || __cpWrapped) return;
   __cpWrapArmed = true;
@@ -1246,8 +1295,8 @@ let __cpWrapped = false;
 function wrapChildProcessCompileCache(cp) {
   if (__cpWrapped || !cp) return;
   __cpWrapped = true;
-  const { writeFileSync } = require("node:fs");
-  const { basename } = require("node:path");
+  const { writeFileSync } = getBuiltin("node:fs");
+  const { basename } = getBuiltin("node:path");
 
   const isNodeTarget = (command) => {
     if (typeof command !== "string" || command.length === 0) return false;
@@ -1346,17 +1395,27 @@ function wrapChildProcessCompileCache(cp) {
   cp.execFile = wrapSpawnLike(cp.execFile);
   cp.execFileSync = wrapSpawnLike(cp.execFileSync);
 
-  // fork() always runs `process.execPath`, so it is always a node target. Its
-  // signature is (modulePath, args?, options?); reuse the same options rewrite.
+  // fork() always launches a node target, so the compile-cache rewrite applies to
+  // every (modulePath, args?, options?) shape — but only where the caller passed an
+  // options object, matching what the spawn-like wrappers do. Restricted to compiled
+  // artifacts because an ordinary Nub run reaches fork through the same
+  // `restoreCompileCacheEnv` path its children already use.
   const origFork = cp.fork;
   cp.fork = function (modulePath, ...rest) {
     let optIdx = -1;
-    for (let i = rest.length - 1; i >= 0; i--) {
-      const a = rest[i];
-      if (a && typeof a === "object" && !Array.isArray(a)) { optIdx = i; break; }
-      if (Array.isArray(a)) break;
+    if (rest.length === 1) {
+      const [arg] = rest;
+      if (arg !== null && typeof arg === "object" && !Array.isArray(arg)) optIdx = 0;
+    } else if (rest.length === 2) {
+      const [args, options] = rest;
+      if ((Array.isArray(args) || args == null) &&
+          options !== null && typeof options === "object" && !Array.isArray(options)) {
+        optIdx = 1;
+      }
     }
-    if (optIdx >= 0) rest[optIdx] = stripFromOptions(rest[optIdx]);
+    if (__compiledArtifact && optIdx >= 0) {
+      rest[optIdx] = stripFromOptions(rest[optIdx]);
+    }
     return origFork.call(this, modulePath, ...rest);
   };
 }
@@ -1459,6 +1518,55 @@ function installVersionMarker() {
   } catch {}
 }
 
+// ── User preloads (`nub.jsonc` `preload`) ───────────────────────────
+// nub loads the user's preload entries HERE rather than emitting one NODE_OPTIONS
+// token per entry. Two reasons, and the first is a correctness bug in the wild:
+//
+//  1. Consumers that re-parse NODE_OPTIONS destroy repeated same-name flags. Next.js
+//     parses it into a `Record` keyed by option name and reformats it for every
+//     forked worker, so `--require=a --require=b` becomes `--require=b`, silently
+//     dropping whichever came first — which is nub's OWN preload. Filed upstream as
+//     vercel/next.js#96582. Emitting at most one `--require` and one `--import`
+//     survives that round-trip intact.
+//  2. Loading them here means nub stops GUESSING each entry's module format from its
+//     file extension; Node's own resolver decides at load time.
+//
+// Resolution base is the CWD, not nub's runtime dir. That is what Node does for a
+// `--require`/`--import` specifier (measured: a bare specifier resolves through the
+// node_modules walk-up from the CWD, and fails outside the project), whereas nub's
+// runtime dir would resolve a bare entry against nub's OWN dependencies. Relative
+// entries already arrive absolute from the Rust side; bare ones do not.
+// The chainer path, present only when the spawn path decided nub's OWN preload
+// should load it (no second NODE_OPTIONS token exists in that case). Absent when
+// the chainer got its own `--import` — loading it in both places would run the
+// user's entries twice.
+function userPreloadChain() {
+  try {
+    const chain = JSON.parse(process.env.__NUB_RUNTIME_CONFIG || "{}").preloadChain;
+    return typeof chain === "string" && chain.length > 0 ? chain : null;
+  } catch {
+    return null;
+  }
+}
+
+// Fast tier, `.cjs`-only entries: load the chainer SYNCHRONOUSLY, so `--require`'s
+// synchronous-entry semantics (R1) survive. The chainer's own `require()` calls
+// resolve from ITS directory, which is inside the user's project.
+function requireUserPreloadChain() {
+  const chain = userPreloadChain();
+  if (chain) module.require(chain);
+}
+
+// Compat tier: nub's own preload is an `--import`, so it can await. The chainer is
+// ESM here, and awaiting it lets a user entry with top-level await settle before the
+// program starts — which `require()` could not do (ERR_REQUIRE_ASYNC_MODULE).
+async function importUserPreloadChain() {
+  const chain = userPreloadChain();
+  if (!chain) return;
+  const { pathToFileURL } = require("node:url");
+  await import(pathToFileURL(chain).href);
+}
+
 module.exports = {
   installVersionMarker,
   installWatchReporting,
@@ -1467,7 +1575,11 @@ module.exports = {
   shouldAutoAsyncTierAtPreload,
   installCjsRequireHooks,
   preloadPolyfillPackages,
+  installTemporalGlobal,
   installTemporalLazyGlobal,
   restoreCompileCacheEnv,
+  installCompiledChildProcess,
   reenableUserCompileCache,
+  requireUserPreloadChain,
+  importUserPreloadChain,
 };

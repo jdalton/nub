@@ -115,18 +115,6 @@ if (!requireEsmDisabled && !forceAsyncTier) {
   // ── Watch-mode dependency reporting + hooks ───────────────────────
   const watchReporting = common.installWatchReporting(core);
 
-  // Best-effort bounded-cache eviction (main thread only; the core guards on it).
-  // DEFERRED to setImmediate: maybeSweepCache probes `worker_threads.isMainThread`
-  // and dynamic-imports cache-evict.mjs, which would otherwise pull worker_threads
-  // (and its streams/worker-io transitive set) into the BOOTSTRAP module-load list
-  // on every startup — a cold-start regression (test-bootstrap-modules snapshots
-  // process.moduleLoadList at user code's first line). Running it one turn later
-  // keeps those out of the bootstrap snapshot while preserving the once-a-day sweep.
-  // unref so a purely-synchronous program still exits promptly without waiting on it.
-  setImmediate(() => {
-    try { core.maybeSweepCache(); } catch {}
-  }).unref();
-
   // ── Pre-load clobbered polyfill packages BEFORE hooks register ────
   // Packages in the core's CLOBBER_MAP can't be imported after hooks register (the
   // resolve hook returns a synthetic module instead of the real package), so
@@ -165,6 +153,14 @@ if (!requireEsmDisabled && !forceAsyncTier) {
 
   // ── Compile-cache: re-enable for the USER's modules (R8) ──────────
   common.reenableUserCompileCache();
+
+  // ── User preloads (`nub.jsonc` `preload`) ─────────────────────────
+  // LAST, so the user's entries observe a fully-augmented realm — hooks installed,
+  // polyfills in place. Measured: a `.ts` entry transpiles and its tsconfig `paths`
+  // alias resolves, matching what the old per-entry `--require` token gave by
+  // sitting after nub's own. A no-op unless the spawn path put the chainer on nub's
+  // preload rather than its own `--import`. See requireUserPreloadChain.
+  common.requireUserPreloadChain();
 } else {
   // ── Async loader-worker tier ──────────────────────────────────────
   // Entered when EITHER require(esm) is disabled (`--no-experimental-require-module`,
@@ -196,6 +192,35 @@ if (!requireEsmDisabled && !forceAsyncTier) {
   // user's compile-cache re-enable is independent of require(esm).
   common.installTemporalLazyGlobal(__require);
   common.reenableUserCompileCache();
+
+  // ── User preloads (`nub.jsonc` `preload` + folded NODE_OPTIONS entries) ──
+  // Also loaded on THIS tier. The chainer is carried by nub's own preload on both
+  // tiers, so skipping it here silently dropped every entry whenever the async tier
+  // was selected — which an inherited `--import` triggers on the broken-compose band
+  // (22.15–24.11) via shouldAutoAsyncTierAtPreload.
+  common.requireUserPreloadChain();
+}
+
+// ── Bounded-cache eviction (BOTH branches above) ────────────────────
+// Main thread only; the core guards on that too. Deferred one turn so the
+// dynamic import of cache-evict.mjs and maybeSweepCache's `worker_threads`
+// probe stay out of the BOOTSTRAP module-load list, which test-bootstrap-modules
+// snapshots at user code's first line.
+//
+// SCHEDULED ONLY WHEN A SWEEP IS DUE, and then ref'd. It used to be armed
+// unconditionally and `.unref()`'d, so a purely SYNCHRONOUS program — the common
+// `nub script.ts` — exited before the callback could run: for a user whose runs
+// are all synchronous the cache was never swept at all and grew without bound.
+// `sweepDue()` is one statSync with no mkdir and no worker_threads, so the
+// overwhelmingly common not-due path now schedules NOTHING (strictly cheaper
+// than before), and on the once-a-day run that IS due the process waits for the
+// eviction it asked for. Placed after the tier branches so the async-loader tier
+// sweeps too — it never did; `core` is null there only when require(esm) is off,
+// which is exactly when there is no core to ask.
+if (core && core.sweepDue()) {
+  setImmediate(() => {
+    try { core.maybeSweepCache(); } catch {}
+  });
 }
 
 // ── Lazy ESM-side-effect polyfills (R7) ─────────────────────────────
@@ -223,12 +248,25 @@ if (!requireEsmDisabled && !forceAsyncTier) {
 // worker_threads to exist, and test-bootstrap-modules measures the main thread.
 function installLazyEsmPolyfills() {
   // Cheap main-thread detection that does NOT pull node:worker_threads into the
-  // main-thread bootstrap (requiring it eagerly is exactly the regression we're
-  // fixing): in a worker, worker_threads is already in the module-load list by the
-  // time this preload runs; on the main thread it is not.
-  const inWorkerThread = process.moduleLoadList.some(
+  // main-thread bootstrap (requiring it eagerly is exactly the regression this lazy
+  // path exists to fix). `process.moduleLoadList` alone is NOT an oracle — it says
+  // only that the module is RESIDENT, which anything running earlier in the same
+  // process can make true on the main thread. That false positive shipped: touching
+  // the lazy `MessageEvent` global in installSyncPolyfills loaded worker_threads, so
+  // the main thread took the worker branch below and eagerly loaded the very ESM
+  // polyfills this code defers. So use residency only as a GATE, then ask the
+  // authoritative `isMainThread` — free precisely because we only ask once the
+  // module is already loaded, and unpoisonable because a worker's bootstrap always
+  // loads worker_threads before any preload runs.
+  const workerThreadsResident = process.moduleLoadList.some(
     (m) => m === "NativeModule worker_threads",
   );
+  const inWorkerThread =
+    workerThreadsResident &&
+    !(process.getBuiltinModule
+      ? process.getBuiltinModule("node:worker_threads")
+      : __require("node:worker_threads")
+    ).isMainThread;
 
   const loadEsmSideEffect = (specifier) => {
     try {
@@ -279,6 +317,20 @@ function installLazyEsmPolyfills() {
     __require("./worker-blob-url.cjs").installBlobUrlSupport();
   } catch {
     // blob: worker support is best-effort; never block startup on it.
+  }
+
+  // Laziness below depends on being able to load an ES module SYNCHRONOUSLY on
+  // first access — a getter cannot await. Under `--no-experimental-require-module`
+  // loadEsmSideEffect can only fall back to a dynamic `import()`, which resolves a
+  // tick too late: the getter would hand user code `undefined` instead of the
+  // constructor. Load eagerly there and accept the startup cost; the user opted out
+  // of require(esm), which is the mechanism the lazy path is built on.
+  if (requireEsmDisabled) {
+    loadEsmSideEffect("./worker-polyfill.mjs");
+    if (typeof globalThis.navigator?.locks === "undefined") {
+      loadEsmSideEffect("./navigator-locks.mjs");
+    }
+    return;
   }
 
   // Main thread: lazy Worker global. Defined NON-ENUMERABLE so it stays invisible

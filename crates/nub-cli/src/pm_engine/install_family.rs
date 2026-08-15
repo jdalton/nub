@@ -188,9 +188,19 @@ pub(crate) fn run_verb(
 
 // ───────────────────────── parse plumbing ──────────────────────────
 
-// The subset of aube's *global* clap flags nub honors on engine verbs,
-// parsed at the verb position (nub has no pre-verb engine flag surface).
-// Spellings mirror `vendor/aube/crates/aube/src/lib.rs::Cli` exactly.
+// What nub augments onto every install-family verb, parsed at the verb
+// position (nub has no pre-verb engine flag surface). TWO groups, and the
+// distinction matters when adding a field:
+//
+//  1. The subset of aube's *global* clap flags nub honors. These mirror
+//     `vendor/aube/crates/aube/src/lib.rs::Cli` exactly — `--dir`, the
+//     workspace selectors, and the output flags below.
+//  2. NUB-OWN flags with no aube `Cli` counterpart: the `age_gate` group.
+//     aube exposes `minimumReleaseAge` only through config and its generic
+//     `--config.<key>` extractor (which is dead under nub, living in aube's
+//     unused `cli_main`), so these spellings come from pnpm's CLI type map
+//     rather than from aube.
+//
 // Deliberately absent: `--workspace-root` (aube chdirs to the workspace
 // root pre-dispatch; the helper is crate-private, and half-honoring the
 // flag as filter-only would silently run against the wrong directory —
@@ -224,6 +234,38 @@ struct EngineGlobals {
     /// forwarded to the engine's text-mode renderers.
     #[command(flatten)]
     output: super::output::OutputFlags,
+
+    /// Per-invocation `minimumReleaseAge` overrides — a NUB-OWN group, not an
+    /// aube `Cli` mirror (see the note above the struct).
+    ///
+    /// This rides on `EngineGlobals`, so it reaches EVERY verb in the family —
+    /// all ~20 `run_verb` arms, verified by sweeping `--help`, not estimated.
+    /// Only a minority actually consult it: `add`/`update`/`dedupe`/`import`
+    /// resolve from the registry directly, and `dlx`/`create` through their
+    /// transient install. The rest accept it and ignore it — `remove` and
+    /// `prune` only re-resolve or trim what is already there, and the
+    /// local-state verbs (`link`/`unlink`, `approve-builds`/`ignored-builds`,
+    /// the `patch*` trio, `rebuild`) never resolve at all.
+    ///
+    /// Carried anyway rather than split per-verb: the cost is an inert `--help`
+    /// line on those verbs, and threading a second args group through the
+    /// family would be more machinery than that is worth. The read-only verbs
+    /// (`why`, `list`, `licenses`, `outdated`, `audit`) are unaffected either
+    /// way — they parse through `info_family`'s own `parse_verb` and never see
+    /// this struct.
+    #[command(flatten)]
+    age_gate: super::min_release_age::AgeGateFlags,
+
+    /// Per-invocation platform selection (`--os`/`--cpu`/`--libc`) — the same
+    /// three flags pnpm carries on `install`/`add`/`dlx`.
+    ///
+    /// Rides `EngineGlobals` for the reason `age_gate` does: the verbs that
+    /// consult it are exactly the ones that resolve (`add`, `update`,
+    /// `dedupe`, `import`, and `dlx`/`create` through their transient
+    /// install), and threading a second args group per-verb costs more than an
+    /// inert `--help` line on the rest.
+    #[command(flatten)]
+    platform: super::platform_flags::PlatformFlags,
 }
 
 impl EngineGlobals {
@@ -267,10 +309,15 @@ fn verb_command<A: ClapArgs>(typed: &str) -> clap::Command {
 fn parse_verb<A: ClapArgs>(typed: &str, args: &[String]) -> Result<ParsedVerb<A>> {
     let argv = std::iter::once(format!("nub {typed}")).chain(args.iter().cloned());
     match verb_command::<A>(typed).try_get_matches_from(argv) {
-        Ok(matches) => Ok(ParsedVerb::Run(
-            EngineGlobals::from_arg_matches(&matches)?,
-            A::from_arg_matches(&matches)?,
-        )),
+        Ok(matches) => {
+            let globals = EngineGlobals::from_arg_matches(&matches)?;
+            // Publish before the verb runs: the engine reads the age gate and
+            // the platform selection through process-global state, not through
+            // anything threaded into the verb's own args.
+            globals.age_gate.apply();
+            globals.platform.apply();
+            Ok(ParsedVerb::Run(globals, A::from_arg_matches(&matches)?))
+        }
         Err(err) => {
             let text = present::rewrite_help(err.render().to_string().trim_end());
             if matches!(
@@ -1251,7 +1298,7 @@ fn stamp_if_virgin(session: &EngineSession, code: i32) {
 }
 
 /// Write `devEngines.packageManager = {name:"nub", version:"^<x.y.z>",
-/// onFail:"warn"}` into the project manifest of a VIRGIN install — the
+/// onFail:"ignore"}` into the project manifest of a VIRGIN install — the
 /// non-locking cross-tool PM signal (see the call-site comment). Best-effort: a
 /// successful install must not fail on a manifest the stamp can't reach (no
 /// `package.json` — nub never scaffolds one — or an unwritable file).
@@ -1301,7 +1348,7 @@ fn stamp_virgin_dev_engines(cwd: &Path) {
             // a virgin lockfile state — and clobbering it would impose nub's
             // brand over another PM's declaration (the symmetric brand boundary).
             dev.entry("packageManager").or_insert_with(
-                || serde_json::json!({ "name": "nub", "version": range, "onFail": "warn" }),
+                || serde_json::json!({ "name": "nub", "version": range, "onFail": "ignore" }),
             );
         }
     });
@@ -1710,6 +1757,7 @@ mod tests {
         let actual = dlx_separate_value_flags();
         let expected = [
             "--cd",
+            "--cpu",
             "--dir",
             "--fetch-retries",
             "--fetch-retry-factor",
@@ -1718,7 +1766,11 @@ mod tests {
             "--fetch-timeout",
             "--filter",
             "--filter-prod",
+            "--libc",
             "--loglevel",
+            "--minimum-release-age",
+            "--minimum-release-age-exclude",
+            "--os",
             "--package",
             "--prefix",
             "--registry",
@@ -2200,7 +2252,7 @@ mod tests {
             Some(&serde_json::json!({
                 "name": "nub",
                 "version": format!("^{}", env!("CARGO_PKG_VERSION")),
-                "onFail": "warn"
+                "onFail": "ignore"
             })),
             "value must be the non-locking caret range on the running nub version"
         );

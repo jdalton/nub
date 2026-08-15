@@ -19,10 +19,12 @@ mod resolve;
 mod semver_util;
 mod trust;
 mod types;
+mod workspace_spec;
 
 pub use direct_dep_info::DirectDepInfo;
 pub use error::{
     AgeGateDetails, CatalogDetails, Error, ExoticSubdepDetails, NoMatchDetails, UndatedDetails,
+    WorkspacePkgNotFoundDetails, WorkspaceVersionMismatchDetails,
 };
 pub use local_source::resolve_exec_script_path;
 pub use package_ext::is_deprecation_allowed;
@@ -32,7 +34,8 @@ pub use peer_context::{
 };
 pub use platform::{SupportedArchitectures, is_supported};
 pub use primer::{
-    PruneStats as PrimerPruneStats, popular_package_names, prune_cache as prune_primer_cache,
+    PruneStats as PrimerPruneStats, popular_package_names, popular_package_names_are_ranked,
+    prune_cache as prune_primer_cache,
 };
 pub use semver_util::{AgeGateCause, PickResult, pick_version_for_add};
 pub use trust::{
