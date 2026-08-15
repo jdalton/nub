@@ -277,11 +277,10 @@ pub(crate) fn open_store(cwd: &std::path::Path) -> miette::Result<aube_store::St
 /// then expands `~` and makes relative paths absolute against `cwd`.
 /// The returned path is the user-facing store root *without* the
 /// `v1/files` schema suffix — callers append it where needed (see
-/// [`open_store`]). `pub` so an embedder's store-adjacent tiers can
-/// follow the same override the engine's store handle resolves.
-/// Anchor-sensitive: prefer [`resolved_project_store_dir`] unless you
-/// already hold the walked-up project root.
-pub fn resolved_store_dir(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+/// [`open_store`]). Stays crate-internal, and deliberately: the answer
+/// is only as good as `cwd`, so the export an embedder gets is
+/// [`resolved_project_store_dir`], which picks the anchor itself.
+pub(crate) fn resolved_store_dir(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     with_settings_ctx(cwd, |ctx| {
         let raw = aube_settings::resolved::store_dir(ctx)?;
         expand_setting_path(&raw, cwd)
