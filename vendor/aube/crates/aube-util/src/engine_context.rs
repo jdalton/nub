@@ -397,6 +397,25 @@ pub struct EngineContext {
     /// [`embedder_overrides`]: Self::embedder_overrides
     pub embedder_package_extensions: Option<BTreeMap<String, serde_json::Value>>,
 
+    /// Bundled ecosystem `packageExtensions` defaults (Yarn ∪ pnpm ∪
+    /// nub-phantom), applied as the LOWEST-precedence layer on top of the
+    /// user/project extensions. Additive only — `apply_package_extensions`
+    /// uses `extend_missing`, so a dependency a package already declares is
+    /// never overwritten, and user extensions (parsed first in
+    /// `resolve_dependency_policy`) win per-key over bundled ones.
+    ///
+    /// Deliberately SEPARATE from [`embedder_package_extensions`]: that seam
+    /// is a *replacement* source that also feeds the lockfile
+    /// `packageExtensionsChecksum` (via `effective_package_extensions`). Routing
+    /// bundled defaults through it would make every bundled-list bump change
+    /// the checksum, drift every existing lockfile, and abort
+    /// `--frozen-lockfile` under `enforce_package_extensions_checksum`. This
+    /// field is read ONLY by `resolve_dependency_policy`, never by the
+    /// checksum path — so a bundled-list update is a no-op for existing
+    /// lockfiles (it only affects freshly-resolved packages). Same shape as
+    /// the replacement seam (`selector -> body`, npm/yarn camelCase bodies).
+    pub bundled_package_extensions: Option<BTreeMap<String, serde_json::Value>>,
+
     /// Whether the embedder treats `packageExtensions` as a checksummed,
     /// drift-enforced config like pnpm does. `false` (default) preserves
     /// upstream behavior: aube stamps `packageExtensionsChecksum` only onto
@@ -444,6 +463,7 @@ impl Default for EngineContext {
             npm_save_prefix_on_bare_exact: false,
             named_registries_enabled: false,
             embedder_package_extensions: None,
+            bundled_package_extensions: None,
             enforce_package_extensions_checksum: false,
         }
     }

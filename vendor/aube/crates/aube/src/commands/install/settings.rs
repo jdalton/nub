@@ -488,7 +488,24 @@ pub(crate) fn resolve_dependency_policy(
     let mut policy = aube_resolver::DependencyPolicy::default();
 
     let package_extensions = effective_package_extensions(manifest, ctx);
-    policy.package_extensions = parse_package_extensions(package_extensions);
+    // User/project extensions first, then bundled ecosystem defaults
+    // (Yarn ∪ pnpm ∪ nub-phantom) appended LAST. `apply_package_extensions`
+    // iterates this Vec in order and `extend_missing` is first-write-wins per
+    // dependency key, so this ordering gives user extensions precedence over
+    // bundled ones for free. The bundled map is read from the
+    // `bundled_package_extensions` embedder seam — NEVER from
+    // `effective_package_extensions`, which feeds the lockfile
+    // `packageExtensionsChecksum`: routing bundled defaults through the
+    // checksum would drift every existing lockfile on each bundled-list bump
+    // and abort `--frozen-lockfile` under `enforce_package_extensions_checksum`.
+    let mut extensions = parse_package_extensions(package_extensions);
+    if let Some(bundled) = aube_util::engine_context()
+        .bundled_package_extensions
+        .as_ref()
+    {
+        extensions.extend(parse_package_extensions(bundled.clone()));
+    }
+    policy.package_extensions = extensions;
 
     let mut allowed_deprecated = manifest.allowed_deprecated_versions();
     merge_string_map_setting(ctx, "allowedDeprecatedVersions", &mut allowed_deprecated);
