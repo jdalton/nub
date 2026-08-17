@@ -269,6 +269,19 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
         };
     let read_package_hook: Option<Box<dyn aube_resolver::ReadPackageHook>> =
         read_package_host.map(|h| Box::new(h) as Box<dyn aube_resolver::ReadPackageHook>);
+    // Signal packageExtensions drift to the resolver so it skips lockfile
+    // reuse for extension-targeted packages (forcing a fresh fetch + extension
+    // application). Without this, an edited extension's injected dep silently
+    // misses on a warm re-resolve that reuses the stale locked subgraph.
+    let dependency_policy_for_resolver = dependency_policy.clone().with_package_extensions_drifted(
+        match &parsed {
+            Ok((g, _)) => !matches!(
+                package_extensions_drift(*g, effective_package_extensions_checksum.as_deref()),
+                DriftStatus::Fresh
+            ),
+            Err(_) => false,
+        },
+    );
     let mut resolver = configure_resolver(
         aube_resolver::Resolver::new(client.clone()),
         cwd,
@@ -289,7 +302,7 @@ pub(super) async fn run_lockfile_only(input: LockfileOnlyInput<'_>) -> miette::R
                 source_kind_before
                     .unwrap_or_else(|| crate::commands::default_lockfile_kind(settings_ctx))
             }),
-            dependency_policy: Some(dependency_policy.clone()),
+            dependency_policy: Some(dependency_policy_for_resolver),
             cache_full_packuments: true,
             ignore_scripts,
         },
@@ -457,7 +470,7 @@ pub(super) struct SelectLockfileInput<'a> {
 /// packageExtensions drift, gated on the embedder posture. Returns `Fresh`
 /// when the embedder doesn't enforce the checksum (standalone aube), so the
 /// check is a nub-only layer that never fires on aube's default path.
-fn package_extensions_drift(
+pub(super) fn package_extensions_drift(
     graph: &LockfileGraph,
     effective_checksum: Option<&str>,
 ) -> DriftStatus {

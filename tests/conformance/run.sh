@@ -69,6 +69,16 @@ mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 # Clear any PM env that could steer lockfile format decisions.
 unset npm_config_default_lockfile_format NPM_CONFIG_DEFAULT_LOCKFILE_FORMAT 2>/dev/null || true
 
+# When the offline Verdaccio registry is active (NUB_TEST_REGISTRY set, via
+# `source tests/registry/start.bash`), bypass any inherited HTTP_PROXY for the
+# loopback connection — reqwest (nub) and the PMs' HTTP clients all honor
+# NO_PROXY, without which a fleet proxy intercepts the loopback request and
+# returns 405.
+if [ -n "${NUB_TEST_REGISTRY:-}" ]; then
+  export NO_PROXY="localhost,127.0.0.1"
+  export no_proxy="localhost,127.0.0.1"
+fi
+
 echo "=== nub drop-in PM conformance ==="
 echo "nub:      $NUB ($NUB_VERSION)"
 echo "npm:      $NPM_VERSION  (HAVE=$HAVE_NPM)"
@@ -76,6 +86,11 @@ echo "pnpm:     $PNPM_VERSION  (HAVE=$HAVE_PNPM)"
 echo "yarn:     $YARN_VERSION  (HAVE=$HAVE_YARN)"
 echo "bun:      $BUN_VERSION  (HAVE=$HAVE_BUN)"
 echo "sandbox:  $SANDBOX_ROOT"
+if [ -n "${NUB_TEST_REGISTRY:-}" ]; then
+  echo "registry: $NUB_TEST_REGISTRY (offline Verdaccio — zero registry.npmjs.org calls)"
+else
+  echo "registry: registry.npmjs.org (live — set NUB_TEST_REGISTRY for offline)"
+fi
 echo ""
 
 # step <log> <label> <cmd...> — append output to log, return exit code.
@@ -90,11 +105,32 @@ wipe_node_modules() {
   find "$1" -name node_modules -type d -prune -exec rm -rf {} +
 }
 
+# configure_offline_registry <proj> — when NUB_TEST_REGISTRY is set, write
+# .npmrc (npm/pnpm/yarn-v1 all read it) + bunfig.toml (bun ignores .npmrc
+# registry= and honors ONLY bunfig.toml [install] registry) so every PM in the
+# tight set resolves from the offline Verdaccio instead of registry.npmjs.org.
+# nub itself reads .npmrc registry= too (same path the Rust integration tests
+# use via apply_test_registry), so Direction B (nub writes the lockfile) is
+# steered to the offline registry by the same .npmrc. NO_PROXY is exported
+# once at the top of the script for the loopback connection.
+configure_offline_registry() {
+  local proj="$1"
+  [ -z "${NUB_TEST_REGISTRY:-}" ] && return 0
+  cat >>"$proj/.npmrc" <<EOF
+registry=${NUB_TEST_REGISTRY}
+EOF
+  cat >>"$proj/bunfig.toml" <<EOF
+[install]
+registry = "${NUB_TEST_REGISTRY}"
+EOF
+}
+
 stage_fixture() {
   local fixture="$1" proj="$2"
   rm -rf "$proj"
   mkdir -p "$proj"
   cp -R "$HERE/fixtures/$fixture/." "$proj/"
+  configure_offline_registry "$proj"
 }
 
 # assert_node_modules <proj> <log> — every direct dep from package.json must exist
