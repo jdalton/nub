@@ -368,6 +368,7 @@ fn print_report_human(r: &PackageReport) {
         let tag = match f.verdict {
             Verdict::HardPhantom => "PHANTOM  ",
             Verdict::SoftPhantom => "soft     ",
+            Verdict::TypeOnly => "type-only",
             Verdict::DeclaredOptionalPeer => "opt-peer ",
             Verdict::DeclaredPeer => "peer     ",
             Verdict::Declared => "ok       ",

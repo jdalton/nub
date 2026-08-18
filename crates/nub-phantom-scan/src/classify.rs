@@ -22,6 +22,12 @@ pub enum Verdict {
     /// Undeclared but only ever loaded under a try/catch — a soft/optional load,
     /// not a hard break.
     SoftPhantom,
+    /// Undeclared and reachable ONLY from the `.d.ts` type surface — a
+    /// type-position import, satisfied by a declared `@types/<pkg>` twin rather
+    /// than a runtime package. NOT a phantom; excluded from compat targets. This
+    /// is the class that flagged `estree` (pnpm#13981): a type-only import is not
+    /// a runtime dependency.
+    TypeOnly,
     /// Declared as an OPTIONAL peer (`peerDependenciesMeta.<x>.optional`). NOT a
     /// phantom — the pick-your-plugin pattern. Tracked so the report can show how
     /// much a naive scan over-counts.
@@ -97,7 +103,21 @@ pub fn classify(manifest: &Manifest, references: &[Reference]) -> Vec<Finding> {
     by_pkg
         .into_iter()
         .map(|(package, agg)| {
-            let verdict = verdict_for(manifest, &package, agg.all_soft);
+            let base = verdict_for(manifest, &package, agg.all_soft);
+            // A TYPE-surface import of a package whose `@types/<pkg>` twin is
+            // declared is a satisfied type-only import (the estree case), not a
+            // runtime phantom — reclassify it TypeOnly so it never becomes a
+            // compat target. An UNSATISFIED type import (no @types declared) stays
+            // a phantom target, since a consumer install can't resolve its types.
+            let type_surface_only = agg.from_types && !agg.from_main && !agg.from_subpath;
+            let verdict = if type_surface_only
+                && types_satisfied(manifest, &package)
+                && matches!(base, Verdict::HardPhantom | Verdict::SoftPhantom)
+            {
+                Verdict::TypeOnly
+            } else {
+                base
+            };
             Finding {
                 package,
                 verdict,
@@ -139,6 +159,31 @@ fn verdict_for(manifest: &Manifest, package: &str, all_soft: bool) -> Verdict {
 /// package's own `exports`), never a phantom.
 fn is_self(manifest: &Manifest, package: &str) -> bool {
     package == manifest.name
+}
+
+/// Whether a TYPE-surface import of `package` has its declarations available —
+/// its `@types/<package>` twin is declared anywhere in the published manifest
+/// (dependencies, bundledDependencies, peerDependencies, devDependencies). The
+/// scan checks the published package's manifest, not the consumer's install
+/// tree, so a type twin in any of these counts — `eslint` declares
+/// `@types/estree` in `dependencies`, and that is what keeps `estree` from
+/// being mis-flagged a runtime phantom. A type import needs types, not a
+/// runtime package. The
+/// package itself is NOT checked here — a package declared on the runtime
+/// surface is already `Declared` before reaching the phantom branch.
+fn types_satisfied(manifest: &Manifest, package: &str) -> bool {
+    // DefinitelyTyped mangles scoped packages: `@babel/types` →
+    // `@types/babel__types` (the `__` separator). Mirror
+    // `phantom_closure.rs::types_package_name` so the two agree.
+    let types = match package.strip_prefix('@').and_then(|r| r.split_once('/')) {
+        Some((scope, name)) => format!("@types/{scope}__{name}"),
+        None => format!("@types/{package}"),
+    };
+    manifest.deps.contains(&types)
+        || manifest.bundled.contains(&types)
+        || manifest.optional_peers.contains(&types)
+        || manifest.required_peers.contains(&types)
+        || manifest.dev_deps.contains(&types)
 }
 
 #[cfg(test)]
@@ -201,6 +246,60 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].verdict, Verdict::HardPhantom);
         assert!(!f[0].soft);
+    }
+
+    #[test]
+    fn type_surface_only_is_type_only_not_a_phantom() {
+        // eslint/`estree` (pnpm#13981): `estree` is referenced only from a `.d.ts`
+        // type surface (from_types, not from_main/from_subpath), is undeclared,
+        // but its `@types/estree` twin is declared. It must be TypeOnly, not a
+        // HardPhantom, so it never becomes a compat target. A runtime import of an
+        // undeclared package stays a hard phantom.
+        let m =
+            Manifest::parse(br#"{"name":"eslint","dependencies":{"@types/estree":"*"}}"#).unwrap();
+        let estree = Reference {
+            package: "estree".into(),
+            raw: "estree".into(),
+            soft: false,
+            from_main: false,
+            from_subpath: false,
+            from_types: true,
+        };
+        let ghost = Reference {
+            package: "ghost".into(),
+            raw: "ghost".into(),
+            soft: false,
+            from_main: true,
+            from_subpath: false,
+            from_types: false,
+        };
+        let f = classify(&m, &[estree, ghost]);
+        let estree_v = f.iter().find(|x| x.package == "estree").unwrap();
+        let ghost_v = f.iter().find(|x| x.package == "ghost").unwrap();
+        assert_eq!(estree_v.verdict, Verdict::TypeOnly);
+        assert_eq!(ghost_v.verdict, Verdict::HardPhantom);
+    }
+
+    #[test]
+    fn scoped_type_only_import_mangles_the_types_twin_name() {
+        // DefinitelyTyped mangles `@babel/types` to `@types/babel__types` (the
+        // `__` separator). A type-surface-only import of `@babel/types` whose
+        // mangled `@types/babel__types` twin is declared must be TypeOnly —
+        // without the mangling the lookup hits the non-existent
+        // `@types/@babel/types` and the import stays a HardPhantom.
+        let m = Manifest::parse(br#"{"name":"pkg","dependencies":{"@types/babel__types":"*"}}"#)
+            .unwrap();
+        let scoped = Reference {
+            package: "@babel/types".into(),
+            raw: "@babel/types".into(),
+            soft: false,
+            from_main: false,
+            from_subpath: false,
+            from_types: true,
+        };
+        let f = classify(&m, &[scoped]);
+        let v = f.iter().find(|x| x.package == "@babel/types").unwrap();
+        assert_eq!(v.verdict, Verdict::TypeOnly);
     }
 
     #[test]

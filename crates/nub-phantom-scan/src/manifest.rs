@@ -26,6 +26,11 @@ pub struct Manifest {
     pub(crate) optional_peers: BTreeSet<String>,
     /// `bundledDependencies` / `bundleDependencies` — shipped inside the tarball.
     pub(crate) bundled: BTreeSet<String>,
+    /// `devDependencies` — NOT part of the runtime-resolvable surface (kept out of
+    /// `deps` for that reason), but tracked separately ONLY so a TYPE-surface
+    /// import of `<pkg>` can be considered satisfied when `@types/<pkg>` is
+    /// declared here. It never counts toward runtime resolution.
+    pub(crate) dev_deps: BTreeSet<String>,
     /// Published entry files (relative paths from the package root) — the roots
     /// of the reachable-module walk, each tagged by whether it is the main entry
     /// or a non-`.` `exports` subpath (the adapter surface).
@@ -71,6 +76,7 @@ impl Manifest {
         collect_keys(&v, "dependencies", &mut m.deps);
         collect_keys(&v, "optionalDependencies", &mut m.deps);
         collect_keys(&v, "peerDependencies", &mut m.required_peers);
+        collect_keys(&v, "devDependencies", &mut m.dev_deps);
 
         // Move any peer flagged optional out of required_peers into optional_peers.
         if let Some(meta) = v.get("peerDependenciesMeta").and_then(Value::as_object) {
