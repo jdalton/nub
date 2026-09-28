@@ -17,6 +17,7 @@ mod finalize;
 mod frozen;
 mod git_prepare;
 mod gvs;
+mod index_remap;
 mod layout;
 mod lifecycle;
 mod link;
@@ -53,13 +54,10 @@ pub use control::{
 pub(crate) use default_trust::DefaultTrustFloor;
 pub use dep_selection::DepSelection;
 pub(super) use fetch::fetch_packages;
-use index_remap::{remap_indices_to_contextualized, strip_peer_context_suffix};
-use fetch::{
-    fetch_packages_with_root, import_local_source,
-    version_from_dep_path,
-};
+use fetch::{fetch_packages_with_root, import_local_source, version_from_dep_path};
 pub use frozen::{FrozenMode, FrozenOverride, GlobalVirtualStoreFlags};
 pub(crate) use gvs::detect_existing_global_virtual_store;
+use index_remap::{remap_indices_to_contextualized, strip_peer_context_suffix};
 pub(crate) use lifecycle::{
     JailBuildPolicy, build_policy_from_manifest_sources, build_policy_from_sources,
     run_dep_lifecycle_scripts,
