@@ -7,7 +7,6 @@ mod cas;
 mod git;
 mod index;
 mod integrity;
-mod package_index;
 mod phantom_hook;
 mod tarball;
 
