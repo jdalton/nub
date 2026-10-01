@@ -1787,15 +1787,25 @@ function installVersionMarker() {
 //     10). Measured on 16 vCPU beside twelve busy processes: the neighbours keep
 //     98.6% of their CPU instead of 92.5%, the server still gains 20% over four
 //     threads, and an idle box loses nothing. libuv creates every worker
-//     synchronously inside the first pool submit, so one `fs.access` call makes
-//     them all exist (`access` never takes the io_uring path that lets stat, read
-//     and open skip the pool); the new thread ids (or the `libuv-worker` name) name
-//     them, and `os.setPriority(tid)` targets one thread on Linux. The thread ids
-//     are exact only across the call that builds the pool: the fast tier's
-//     `--require` preload runs before any pool use and builds it here, but the
-//     compat tier's `--import` preload is itself read through the pool, so the
-//     launcher `--require`s threadpool-snapshot.cjs ahead of it to build the pool
-//     and record its threads there.
+//     synchronously inside the first pool submit, so one submit makes them all
+//     exist; the new thread ids (or the `libuv-worker` name) name them, and
+//     `os.setPriority(tid)` targets one thread on Linux. The thread ids are exact
+//     only across the call that builds the pool: the fast tier's `--require`
+//     preload runs before any pool use and builds it here, but the compat tier's
+//     `--import` preload is itself read through the pool, so the launcher
+//     `--require`s threadpool-snapshot.cjs ahead of it to build the pool and
+//     record its threads there.
+//
+// The submit is the addon's `warmThreadpool`: one no-op task on a private libuv
+// loop, run to completion inside the call, so nothing is left on Node's loop for
+// user code to see. A JS submit (`fs.access`) completes AFTER user code has
+// started: its callback is a `before` for an id `async_hooks` never saw born,
+// `process.getActiveResourcesInfo()` lists it, and the loop stays alive one turn
+// longer than plain Node's, which fires an unref'd `setImmediate`. Node's own
+// suite asserts on all three (49 files). `fs.access` remains the fallback when
+// the addon is absent, because it never takes libuv's io_uring path, which stat,
+// read and open do where io_uring is on (Node 20.3–20.11.0 by default, opt-in
+// since), building no pool at all.
 const THREADPOOL_ENV = "UV_THREADPOOL_SIZE";
 const THREADPOOL_MARK_ENV = "__NUB_AUGMENTED_UV_THREADPOOL_SIZE";
 const COMPAT_PRESENT_ENV = "__NUB_COMPAT_PRESENT";
@@ -1803,6 +1813,28 @@ const THREADPOOL_PRESENT_BIT = 1 << 5;
 const THREADPOOL_NODE_DEFAULT = 4;
 const THREADPOOL_EXTRA_NICE = 10;
 const THREADPOOL_WORKERS = Symbol.for("nub.threadpool.workers");
+
+// The addon that owns the submit, or null where it cannot be loaded. It is the
+// sibling transform-core loads moments later, through the same filename, so Node's
+// module cache hands out one instance. Loaded BEFORE the thread-id snapshot around
+// the submit: loading it starts threads of its own (a native runtime's pool), and a
+// snapshot that spans the load counts those among the pool's workers — measured on
+// an 8-core Linux box as every worker demoted, and its first four spared instead.
+function loadNativeAddon() {
+  try {
+    const addon = require(require("node:path").join(__dirname, "addons", "nub-native.node"));
+    return typeof addon.warmThreadpool === "function" ? addon : null;
+  } catch {
+    return null;
+  }
+}
+
+// One pool submit, and nothing else: the addon's private-loop task, or `fs.access`
+// when the addon is missing.
+function buildThreadpool(addon) {
+  if (addon !== null && addon.warmThreadpool()) return;
+  require("node:fs").access("/", () => {});
+}
 
 function installThreadpoolPolicy() {
   const size = process.env[THREADPOOL_ENV];
@@ -1823,8 +1855,9 @@ function installThreadpoolPolicy() {
     const tids = () => fs.readdirSync("/proc/self/task").map(Number).filter(Boolean);
     let workers = linux ? process[THREADPOOL_WORKERS] : undefined;
     if (workers === undefined) {
+      const addon = loadNativeAddon();
       const before = linux ? new Set(tids()) : null;
-      fs.access("/", () => {});
+      buildThreadpool(addon);
       const isWorker = (t) => {
         if (!before.has(t)) return true;
         try {
@@ -1906,11 +1939,25 @@ function claimServeEntry() {
 // the additivity guarantee this feature is supposed to preserve. So the pass runs on
 // three triggers, none of which can get there first:
 //
-//   1. A `setImmediate`, which reads a CommonJS entry straight off `process.mainModule`
-//      and imports NOTHING. `Module.runMain` is synchronous, so a CommonJS entry has
-//      finished by the check phase. It may only `import()` when no preload can still
-//      follow nub's own (`anotherPreloadMayFollow`), or when a hook has already seen
-//      Node start loading the entry.
+//   1. The first pass, which reads a CommonJS entry straight off `process.mainModule`
+//      and imports NOTHING. It may only `import()` when no preload can still follow
+//      nub's own (`anotherPreloadMayFollow`), or when a hook has already seen Node
+//      start loading the entry. WHEN it runs differs by tier, and the difference is
+//      what user code can see of it. A `--require` preload runs before Node calls
+//      `Module.runMain`, which loads a CommonJS entry synchronously, so the fast tier
+//      wraps that call once and runs the pass as it returns: a CommonJS entry is
+//      inspected in the same tick, with no timer, request or promise left for the
+//      program to observe — `async_hooks` sees no `before` it never saw an `init` for,
+//      `process.getActiveResourcesInfo()` is empty as under plain Node, and the loop
+//      does not turn an extra time (which ran an unref'd `setImmediate` plain Node
+//      never would; Node's own suite asserts on each). An ES module entry has only
+//      been started by then, so its pass is a microtask, which Node's own loader
+//      already leaves such an entry a dozen of. The compat tier's `--import` preload
+//      runs inside `runMain`, after it, so a `setImmediate` still carries its pass:
+//      a microtask queued there would run ahead of Node's own import of the entry.
+//      Neither is `.unref()`d or skippable: a synchronous script must still reach
+//      the pass, or a server whose module body does nothing asynchronous would exit
+//      before binding.
 //   2. The load hook seeing the entry (`noteEntryLoad`): Node imports the entry only
 //      after awaiting the last `--import`, so by then every preload has run and an
 //      `import()` can only join the job Node already made. This fires whatever the
@@ -1930,7 +1977,7 @@ function claimServeEntry() {
 // Declining to serve remains the right side to fail on where none of the three can
 // fire: reordering a user's preloads is a correctness break, and not binding a port
 // is not.
-function installServeEntry() {
+function installServeEntry(beforeMain) {
   const entry = serveEntry;
   if (entry === null) return;
   const report = (err) => {
@@ -1945,9 +1992,7 @@ function installServeEntry() {
     process.removeListener("beforeExit", late);
     return serveEntryIfHandler(entry, true).then(() => closeEntryChannel(entry)).catch(report);
   };
-  // Not `.unref()`d: a synchronous script must still reach this pass, or a server
-  // whose module body does nothing asynchronous would exit before binding.
-  setImmediate(() => {
+  const pass = () =>
     serveEntryIfHandler(entry, entry.loadSeen || !entry.mayFollow)
       .then((deferred) => {
         if (!deferred) {
@@ -1964,7 +2009,32 @@ function installServeEntry() {
         process.once("beforeExit", late);
       })
       .catch(report);
-  });
+  if (!beforeMain) {
+    setImmediate(pass);
+    return;
+  }
+  const runMain = module_.runMain;
+  if (typeof runMain !== "function") return;
+  // Node reads `Module.runMain` at the call, for exactly this kind of wrap. Restored
+  // as it runs: one entry, one pass. An entry that throws propagates out of the call
+  // as it would have, uninspected. A later preload that REPLACES the property rather
+  // than wrapping it withdraws the pass with it, and the entry goes unserved: the
+  // declining side, by the rule above, and the only alternative would be a resource
+  // every ordinary run carried.
+  module_.runMain = function (...args) {
+    module_.runMain = runMain;
+    const result = runMain.apply(this, args);
+    let served;
+    try {
+      served = serveMainModuleIfHandler(entry);
+    } catch (err) {
+      report(err);
+      return result;
+    }
+    if (served) closeEntryChannel(entry);
+    else Promise.resolve().then(pass);
+    return result;
+  };
 }
 
 // The URLs a load hook may see the entry under, matched without query or fragment.
@@ -2017,8 +2087,12 @@ function fireEntryLoad(entry) {
   if (onLoad === null) return;
   entry.onLoad = null;
   // Out of the hook's own stack: the sync hook runs INSIDE Node's load of the entry,
-  // and an `import()` issued from there would re-enter the loader.
-  setImmediate(onLoad);
+  // and an `import()` issued from there would re-enter the loader. A microtask, not
+  // an immediate: Node has the entry's job by the time the stack unwinds, so the
+  // `import()` joins it, and this is only ever reached after the first pass declined
+  // to import — an entry on the ES-module loader's path, which Node's own loader
+  // already leaves promise reactions of its own behind on.
+  Promise.resolve().then(onLoad);
 }
 
 // For `registerLoaderWorker`, on the tiers whose hooks run in a loader worker: the
@@ -2160,12 +2234,7 @@ function anotherPreloadMayFollow() {
 // 20.19 and 22.14, which is what plain Node reports on each.
 async function serveEntryIfHandler(entry, mayImport) {
   if (entry.taken) return false;
-  const main = process.mainModule;
-  if (main && main.loaded && main.filename === entry.file) {
-    entry.taken = true;
-    serveIfHandler(main.exports);
-    return false;
-  }
+  if (serveMainModuleIfHandler(entry)) return false;
   if (!mayImport) return true;
   entry.taken = true;
   let ns;
@@ -2179,6 +2248,17 @@ async function serveEntryIfHandler(entry, mayImport) {
   }
   serveIfHandler(ns.default);
   return false;
+}
+
+// The synchronous half: a CommonJS entry Node has already run is inspected off
+// `process.mainModule`, with nothing imported and nothing deferred. True once the
+// entry has been taken this way.
+function serveMainModuleIfHandler(entry) {
+  const main = process.mainModule;
+  if (!(main && main.loaded && main.filename === entry.file)) return false;
+  entry.taken = true;
+  serveIfHandler(main.exports);
+  return true;
 }
 
 function serveIfHandler(exported) {
