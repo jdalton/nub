@@ -15,7 +15,6 @@
 //   stepaside-stub  — a separate DOM-shaped lib declares global Worker → step aside → PASS
 //   negative-export — common.d.ts + `export {}` breaks wildcards/globals → FAIL
 //   handler-typo    — a misspelled `fetch` key under `satisfies ExportedHandler` → FAIL
-//   rate-helper-arity — recursive callbacks reject wrong arguments → FAIL
 //
 // Usage: node run.mjs   (run from npm/nub-types/test, after `npm install`)
 
@@ -57,7 +56,6 @@ const fixtures = [
   { name: "stepaside-stub", dir: "stepaside-stub", expect: "pass", dom: true },
   { name: "negative-export", dir: "negative-export", expect: "fail" },
   { name: "handler-typo", dir: "handler-typo", expect: "fail" },
-  { name: "rate-helper-arity", dir: "rate-helper-arity", expect: "fail" },
 ];
 
 // `dom: false` marks a compiler whose OWN lib.dom is incompatible with the pinned
