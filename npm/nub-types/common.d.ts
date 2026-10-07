@@ -84,13 +84,32 @@ declare module "node:util" {
     readonly pendingCount: number;
     readonly activeCount: number;
   }
+  export interface NubDebounceCallbackContext {
+    (...args: unknown[]): Promise<unknown>;
+    cancel(reason?: unknown): void;
+    flush(): void;
+    ref(): NubDebounceCallbackContext;
+    unref(): NubDebounceCallbackContext;
+    readonly pending: Promise<unknown> | null;
+    readonly pendingCount: number;
+  }
+  export interface NubThrottleCallbackContext {
+    (...args: unknown[]): Promise<unknown>;
+    cancel(reason?: unknown): void;
+    hasImmediateCapacity(): boolean;
+    ref(): NubThrottleCallbackContext;
+    unref(): NubThrottleCallbackContext;
+    readonly pending: Promise<unknown> | null;
+    readonly pendingCount: number;
+    readonly activeCount: number;
+  }
   export function debounce<Args extends unknown[], Result>(
-    fn: (this: NubDebouncedFunction<Args, Result>, ...args: Args) => Result,
+    fn: (this: NubDebounceCallbackContext, ...args: Args) => Result,
     wait: number,
     options?: { signal?: AbortSignal; leading?: boolean; rejectOnCancel?: boolean },
   ): NubDebouncedFunction<Args, Result>;
   export function throttle<Args extends unknown[], Result>(
-    fn: (this: NubThrottledFunction<Args, Result>, ...args: Args) => Result,
+    fn: (this: NubThrottleCallbackContext, ...args: Args) => Result,
     limit: number,
     interval: number,
     options?: {
