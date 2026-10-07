@@ -23,13 +23,13 @@ const aliasDebouncedResult: Promise<number> = aliasDebounce((value: number) => v
 const aliasThrottledResult: Promise<number> = aliasThrottle((value: number) => value, 1, 1)(1);
 const debouncedWithThis = debounce(function (value: string) {
   const pendingCount: number = this.pendingCount;
-  const recursiveCall: Promise<unknown> = this(value);
+  const recursiveCall: Promise<number> = this(value);
   void recursiveCall;
   return value.length + pendingCount;
 }, 1);
 const throttledWithThis = throttle(function (value: number) {
   const activeCount: number = this.activeCount;
-  const recursiveCall: Promise<unknown> = this(value);
+  const recursiveCall: Promise<number> = this(value);
   void recursiveCall;
   return value + activeCount;
 }, 1, 1);
