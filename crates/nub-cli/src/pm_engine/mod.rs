@@ -1421,7 +1421,9 @@ fn apply_config_scope(
         // the separate `bundled_package_extensions` seam.
         let mut bundled = c.bundled_package_extensions.take().unwrap_or_default();
         if matches!(role, config_scope::Role::Nub | config_scope::Role::Pnpm) {
-            bundled.extend(bundled_package_extensions_defaults());
+            for (selector, extension) in bundled_package_extensions_defaults() {
+                bundled.entry(selector).or_insert(extension);
+            }
         }
         c.bundled_package_extensions = (!bundled.is_empty()).then_some(bundled);
     });
@@ -5687,6 +5689,11 @@ mod tests {
                 bundled_for_kind(kind).expect("nub identity / pnpm must receive the bundled set");
             assert!(bundled.contains_key("reactcss@*"));
             assert!(bundled.contains_key("@angular/build@*"));
+            assert_eq!(
+                bundled.get("@volar/typescript@*"),
+                compat_db::bundled_package_extensions().get("@volar/typescript@*"),
+                "the shared extension must take precedence over the supplemental catalog"
+            );
         }
     }
 }
