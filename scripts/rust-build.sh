@@ -3,6 +3,7 @@
 #
 # Usage (drop-in for cargo, from inside any worktree or the main tree):
 #   scripts/rust-build.sh build -p nub-cli --profile fast
+#   NUB_CARGO_COMMAND=mbx scripts/rust-build.sh build -p nub-cli
 #   scripts/rust-build.sh test  -p nub-cli
 #   NUB_ALLOW_INCOMPLETE_RUNTIME=1 scripts/rust-build.sh clippy --all-targets --all-features -- -D warnings
 #
@@ -348,6 +349,8 @@ fi
 # NUB_* vars are routing input for this wrapper, not part of the command's
 # environment. In particular, tests must not expose them to spawned user code.
 unset NUB_SHARED_TARGET NUB_BUILD_JOBS NUB_BUILD_FG NUB_BUILD_TARGET_OUT
+cargo_command=${NUB_CARGO_COMMAND:-cargo}
+unset NUB_CARGO_COMMAND
 # $qos and $wrapper_off word-split deliberately (each empty, or one assignment).
 # shellcheck disable=SC2086
 # nub-cli's build script bakes site/content/docs into the binary and records an
@@ -363,4 +366,4 @@ __NUB_DOCS_KEY=$(cd "$root" && find site/content/docs -type f -print0 2>/dev/nul
   | xargs -0 "$digest" 2>/dev/null | "$digest" 2>/dev/null | cut -c1-12 || true)
 export __NUB_DOCS_KEY
 
-exec env CARGO_TARGET_DIR="$target" $wrapper_off $qos cargo "$@"
+exec env CARGO_TARGET_DIR="$target" $wrapper_off $qos "$cargo_command" "$@"
