@@ -177,10 +177,10 @@ verify:
 	@tests/target-gc/run.sh
 	NUB_SHARED_TARGET="$(CURDIR)/target" "$(RUST_BUILD)" test
 
-# Apply clippy's machine-applicable autofixes across the root workspace AND the
-# nub-native workspace (the separate one `verify` lints from inside the crate).
-# Run on a dirty tree is intended (--allow-dirty --allow-staged); review the
-# diff before committing.
+# Apply Clippy's machine-applicable autofixes in the root and nub-native
+# workspaces, matching `verify`. The separate nub-launcher workspace is out of
+# scope, as it is for `verify`; its CI clippy gate remains independent. Run on
+# a dirty tree is intended; review the diff before committing.
 fix:
 	@# `--all-features` activates `embed-runtime`, whose build.rs reads
 	@# runtime/addons/nub-native.node for integrity hashing and panics when
