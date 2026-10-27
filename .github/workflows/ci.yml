@@ -282,12 +282,12 @@ jobs:
           curl -fsSL https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-x86_64-unknown-linux-gnu.tar.gz -o "$RUNNER_TEMP/mbx.tar.gz"
           echo '50ce9360221d9274a73d70c9d2d5285dc2d8353a101de0845e3da5bb0083bcfb  '"$RUNNER_TEMP/mbx.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/mbx.tar.gz" -C "$tools"
-          curl -fsSL https://github.com/indexable-inc/blaze/releases/download/8b15e4b406f010f98eb456ec867e16e0a9ebb0d5/ra-jit-x86_64-unknown-linux-gnu.tar.gz -o "$RUNNER_TEMP/blaze.tar.gz"
+          curl -fsSL -H 'Accept: application/octet-stream' https://api.github.com/repos/indexable-inc/blaze/releases/assets/659530386 -o "$RUNNER_TEMP/blaze.tar.gz"
           echo 'c5202bfb3c29920831149db9b7060c58e9876972aba3cbcd73e9e4ccaf818330  '"$RUNNER_TEMP/blaze.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/blaze.tar.gz" -C "$tools/blaze" --strip-components=1
-          install "$tools/blaze/ra-jit-x86_64-unknown-linux-gnu/ra-jit" "$tools/ra-jit"
-          install "$tools/blaze/ra-jit-x86_64-unknown-linux-gnu/ra-jit-rustc" "$tools/ra-jit-rustc"
-          install "$tools/blaze/ra-jit-x86_64-unknown-linux-gnu/cargo-ra-jit" "$tools/cargo-ra-jit"
+          install "$tools/blaze/ra-jit" "$tools/ra-jit"
+          install "$tools/blaze/ra-jit-rustc" "$tools/ra-jit-rustc"
+          install "$tools/blaze/cargo-ra-jit" "$tools/cargo-ra-jit"
           echo "$tools" >> "$GITHUB_PATH"
           export PATH="$tools:$PATH"
           mbx setup --yes
