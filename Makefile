@@ -57,6 +57,8 @@ addon:
 # iteration settings. This plain build command lets MBX route it through Blaze;
 # release builds retain their separate LTO profile. MBX caches compiler work,
 # while Blaze keeps the active workspace ready for quick rebuilds after edits.
+# Blaze v0.20261027.0 requires its pinned nightly toolchain. Regular builds and
+# project checks remain on the repository's stable Rust 1.99.0 toolchain.
 # Builds through scripts/rust-build.sh and symlinks to the target dir IT picked.
 # Hardcoding $(CURDIR)/target left nub-dev pointing at a stale binary: every
 # documented rebuild path (the post-merge refresh, the dev-loop) goes through the
@@ -75,7 +77,7 @@ install-dev: blaze-ready addon-dev qos-global
 	  ra_jit_dir=$$(dirname "$$ra_jit_bin"); \
 	  tf=$$(mktemp); \
 	  mkdir -p "$(BIN_DIR)" && \
-	  PATH="$$ra_jit_dir:$$PATH" NUB_CARGO_COMMAND="$$cargo_shim" NUB_CARGO_WRAPPER="$${CARGO_HOME:-$$HOME/.cargo}/rustc-qos.sh" NUB_BUILD_GOVERNOR="$${CARGO_HOME:-$$HOME/.cargo}/rustc-gov.sh" MBX_BLAZE=1 BLAZE_OTHER_TOOLCHAIN=1 RUSTUP_TOOLCHAIN=1.99.0 \
+	  PATH="$$ra_jit_dir:$$PATH" NUB_CARGO_COMMAND="$$cargo_shim" NUB_CARGO_WRAPPER="$${CARGO_HOME:-$$HOME/.cargo}/rustc-qos.sh" NUB_BUILD_GOVERNOR="$${CARGO_HOME:-$$HOME/.cargo}/rustc-gov.sh" MBX_BLAZE=1 BLAZE_OTHER_TOOLCHAIN=1 RUSTUP_TOOLCHAIN=nightly-2026-10-27 \
 	  CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_DEV_CODEGEN_UNITS=256 \
 	  CARGO_PROFILE_DEV_INCREMENTAL=true NUB_BUILD_TARGET_OUT=$$tf \
 	  scripts/rust-build.sh build -p nub-cli || { rm -f $$tf; exit 1; }; \
@@ -107,7 +109,7 @@ addon-dev: blaze-ready qos-global
 	  ra_jit_bin=$$(command -v ra-jit 2>/dev/null || printf '%s' "$${CARGO_HOME:-$$HOME/.cargo}/bin/ra-jit"); \
 	  ra_jit_dir=$$(dirname "$$ra_jit_bin"); \
 	  cd crates/nub-native && PATH="$$ra_jit_dir:$$PATH" CARGO_TARGET_DIR="$(CURDIR)/target" \
-	  RUSTUP_TOOLCHAIN=1.99.0 MBX_BLAZE=1 BLAZE_OTHER_TOOLCHAIN=1 \
+	  RUSTUP_TOOLCHAIN=nightly-2026-10-27 MBX_BLAZE=1 BLAZE_OTHER_TOOLCHAIN=1 \
 	  CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_DEV_CODEGEN_UNITS=256 \
 	  CARGO_PROFILE_DEV_INCREMENTAL=true NUB_BUILD_FG="$${NUB_BUILD_FG:-}" \
 	  NUB_RUSTC_QOS_WRAPPER="$${CARGO_HOME:-$$HOME/.cargo}/rustc-qos.sh" NUB_RUSTC_GOVERNOR="$${CARGO_HOME:-$$HOME/.cargo}/rustc-gov.sh" \

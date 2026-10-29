@@ -247,14 +247,14 @@ jobs:
       - run: cd crates/nub-native && cargo check --locked --all-targets --all-features --profile fast
 
   blaze-dev:
-    name: Blaze dev build (stable 1.99.0)
+    name: Blaze dev build (nightly-2026-10-27)
     needs: matrix-plan
     if: (github.event_name != 'pull_request' || github.event.label.name == 'ci') && (needs.matrix-plan.outputs.run_rust == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
-      RUSTUP_TOOLCHAIN: "1.99.0"
+      RUSTUP_TOOLCHAIN: "nightly-2026-10-27"
       MBX_BLAZE: "1"
       MBX_LOG: mbx::cli::blaze=debug
       BLAZE_OTHER_TOOLCHAIN: "1"
@@ -266,8 +266,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7  # 1.99.0 # zizmor: ignore[impostor-commit,ref-version-mismatch] dtolnay force-pushes its version tags, so pinned SHAs go unreachable; commit verified genuine upstream
+      - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: nightly-2026-10-27
           components: rust-src
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
@@ -304,7 +305,7 @@ jobs:
           cargo_shim=$(mbx setup --status 2>&1 | sed -n 's/^mbx setup is installed and current: //p')
           NUB_CARGO_COMMAND="$cargo_shim" scripts/rust-build.sh build -p nub-cli 2>&1 | tee -a "$build_log"
           grep -E 'sending `cargo build.*through .*ra-jit' "$build_log"
-          grep -F '[ra-jit]' "$build_log"
+          grep -F '[blaze]' "$build_log"
       # Real Windows compile + test coverage is the windows-latest leg of the
       # `test` job. The previous fast `x86_64-pc-windows-gnu` cross-check needed
       # mingw-w64 + ring's C build, which was fragile on the runner; the native
